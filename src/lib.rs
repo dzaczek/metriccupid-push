@@ -1,0 +1,48 @@
+//! MetricCupid Push Relay: a signed HTTP relay from the MetricCupid macOS app
+//! to the Pushover API.
+#![forbid(unsafe_code)]
+
+pub mod api;
+pub mod auth;
+pub mod client_ip;
+pub mod config;
+pub mod limits;
+pub mod pushover;
+
+use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::TcpListener;
+
+pub use api::{router, AppState};
+
+/// How often bounded maps are swept for expired entries.
+pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Spawn the periodic cleanup task.
+pub fn spawn_cleanup(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            state.cleanup();
+        }
+    })
+}
+
+/// Serve the API on `listener` until `shutdown` resolves.
+pub async fn serve(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+}

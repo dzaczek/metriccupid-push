@@ -1,0 +1,63 @@
+# MetricCupid Push Relay
+#
+#   cp .env.example .env   # fill in your keys
+#   docker compose up -d                     # relay only, on 127.0.0.1:8080
+#   docker compose --profile tunnel up -d    # + Cloudflare Tunnel, no public port
+
+services:
+  relay:
+    image: ghcr.io/dzaczek/metriccupid-push:latest
+    build: .
+    env_file: .env
+    ports:
+      # Loopback only. Expose publicly only behind a reverse proxy / Cloudflare.
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/metriccupid-push", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [relay]
+
+  # Optional: Cloudflare Tunnel (outbound-only, no open port needed).
+  # Create a tunnel in Cloudflare Zero Trust, point its public hostname at
+  # http://relay:8080 and put the token in .env as TUNNEL_TOKEN.
+  cloudflared:
+    profiles: [tunnel]
+    # Pin a specific release tag in production.
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    restart: unless-stopped
+    depends_on:
+      relay:
+        condition: service_healthy
+    networks: [relay]
+
+networks:
+  relay:
+    # Fixed subnet so TRUST_PROXY can trust the cloudflared container
+    # (see README, "Cloudflare Tunnel").
+    ipam:
+      config:
+        - subnet: 172.30.53.0/24
