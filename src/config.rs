@@ -4,12 +4,17 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ipnet::IpNet;
 
 pub const MIN_SECRET_LEN: usize = 32;
 const DEFAULT_PUSHOVER_API_URL: &str = "https://api.pushover.net/1/messages.json";
+pub const DEFAULT_GATEWAY_URL: &str = "https://push.metriccupid.sysop.cat";
+pub const DEFAULT_APNS_TOPIC: &str = "cat.sysop.MetricCupid";
+pub const APNS_PRODUCTION_URL: &str = "https://api.push.apple.com";
+pub const APNS_SANDBOX_URL: &str = "https://api.sandbox.push.apple.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -26,6 +31,60 @@ pub enum TrustProxy {
     Cloudflare { refresh: bool, extra: Vec<IpNet> },
     /// Trust `X-Forwarded-For` hops added by these proxies (rightmost untrusted hop wins).
     Xff(Vec<IpNet>),
+}
+
+/// How v2 pushes reach APNs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApnsMode {
+    /// HTTP/2 to Apple with our own provider key.
+    Direct,
+    /// Record pushes in memory (tests, local development).
+    Mock,
+    /// Forward push jobs to a hosted gateway (`GATEWAY_URL`).
+    Gateway,
+}
+
+/// APNs provider key (`.p8`, PKCS#8 PEM). `Debug` never prints the key.
+#[derive(Clone)]
+pub struct ApnsKey {
+    pub pem: String,
+    pub key_id: String,
+    pub team_id: String,
+}
+
+impl fmt::Debug for ApnsKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApnsKey")
+            .field("pem", &"<redacted>")
+            .field("key_id", &self.key_id)
+            .field("team_id", &self.team_id)
+            .finish()
+    }
+}
+
+/// A token bucket refilled per hour (used for group registration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HourlyRate {
+    pub per_hour: NonZeroU32,
+    pub burst: NonZeroU32,
+}
+
+/// Settings for the v2 end-to-end encrypted mailbox (see PROTOCOL.md).
+#[derive(Debug, Clone)]
+pub struct V2Config {
+    pub data_dir: PathBuf,
+    pub apns_mode: ApnsMode,
+    pub apns_key: Option<ApnsKey>,
+    pub apns_topic: String,
+    pub apns_production_url: String,
+    pub apns_sandbox_url: String,
+    pub gateway_url: String,
+    pub hosted_open_registration: bool,
+    pub rate_messages: Rate,
+    pub rate_commands: Rate,
+    pub rate_gateway: Rate,
+    pub rate_groups: HourlyRate,
+    pub ws_ping: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +141,9 @@ pub struct Config {
     pub limits: Limits,
     pub log_format: LogFormat,
     pub log_level: tracing::Level,
+    /// `false` when none of the v1 variables are set: `/v1/notify` is then 404.
+    pub v1_enabled: bool,
+    pub v2: V2Config,
 }
 
 impl fmt::Debug for Config {
@@ -100,6 +162,8 @@ impl fmt::Debug for Config {
             .field("limits", &self.limits)
             .field("log_format", &self.log_format)
             .field("log_level", &self.log_level)
+            .field("v1_enabled", &self.v1_enabled)
+            .field("v2", &self.v2)
             .finish()
     }
 }
@@ -139,9 +203,13 @@ impl Config {
             Some(_) => return err("MODE must be `selfhosted` or `hosted`"),
         };
 
+        // v1 (Pushover relay) is optional: it is enabled when any of its
+        // variables is set, and then all of them are required.
+        const V1_VARS: [&str; 3] = ["PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY", "RELAY_SECRETS"];
+        let v1_enabled = mode == Mode::SelfHosted && V1_VARS.iter().any(|k| get(k).is_some());
         let required = |k: &str| match get(k) {
             Some(v) => Ok(v),
-            None if mode == Mode::Hosted => Ok(String::new()),
+            None if !v1_enabled => Ok(String::new()),
             None => err(format!("{k} is required")),
         };
         let pushover_app_token = required("PUSHOVER_APP_TOKEN")?;
@@ -155,7 +223,7 @@ impl Config {
             }
         }
 
-        let secrets = parse_secrets(get("RELAY_SECRETS"), mode)?;
+        let secrets = parse_secrets(get("RELAY_SECRETS"), v1_enabled)?;
 
         let bind = match get("BIND") {
             None => SocketAddr::from(([0, 0, 0, 0], 8080)),
@@ -222,6 +290,8 @@ impl Config {
                 .map_err(|_| ConfigError("LOG_LEVEL must be error|warn|info|debug|trace".into()))?,
         };
 
+        let v2 = parse_v2(&get, mode)?;
+
         Ok(Config {
             pushover_app_token,
             pushover_user_key,
@@ -236,13 +306,124 @@ impl Config {
             limits,
             log_format,
             log_level,
+            v1_enabled,
+            v2,
         })
     }
 }
 
-fn parse_secrets(raw: Option<String>, mode: Mode) -> Result<Vec<Secret>, ConfigError> {
+fn parse_rate(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    per_sec: u32,
+    burst: u32,
+) -> Result<Rate, ConfigError> {
+    let p = format!("RATE_{name}_PER_SEC");
+    let b = format!("RATE_{name}_BURST");
+    Ok(Rate {
+        per_sec: parse_nonzero(&p, get(&p), per_sec)?,
+        burst: parse_nonzero(&b, get(&b), burst)?,
+    })
+}
+
+fn parse_url(var: &str, v: String) -> Result<String, ConfigError> {
+    if !(v.starts_with("https://") || v.starts_with("http://")) {
+        return err(format!("{var} must start with http:// or https://"));
+    }
+    Ok(v.trim_end_matches('/').to_string())
+}
+
+fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Config, ConfigError> {
+    let apns_mode = match get("APNS_MODE").as_deref() {
+        None if mode == Mode::Hosted => ApnsMode::Direct,
+        None => ApnsMode::Gateway,
+        Some("direct") => ApnsMode::Direct,
+        Some("mock") => ApnsMode::Mock,
+        Some("gateway") => ApnsMode::Gateway,
+        Some(_) => return err("APNS_MODE must be `direct`, `mock` or `gateway`"),
+    };
+    if mode == Mode::Hosted && apns_mode == ApnsMode::Gateway {
+        return err(
+            "APNS_MODE=gateway is not allowed with MODE=hosted (the hosted server is the gateway)",
+        );
+    }
+
+    let apns_key = if apns_mode == ApnsMode::Direct {
+        let raw = get("APNS_KEY_P8")
+            .ok_or_else(|| ConfigError("APNS_KEY_P8 is required with APNS_MODE=direct".into()))?;
+        let pem = if raw.contains("-----BEGIN") {
+            // Allow a PEM squashed into one line with literal "\n".
+            raw.replace("\\n", "\n")
+        } else {
+            std::fs::read_to_string(&raw)
+                .map_err(|e| ConfigError(format!("APNS_KEY_P8: cannot read file: {e}")))?
+        };
+        let id = |k: &str| -> Result<String, ConfigError> {
+            let v = get(k)
+                .ok_or_else(|| ConfigError(format!("{k} is required with APNS_MODE=direct")))?;
+            if v.len() != 10 || !v.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return err(format!("{k} must be 10 alphanumeric characters"));
+            }
+            Ok(v)
+        };
+        Some(ApnsKey {
+            pem,
+            key_id: id("APNS_KEY_ID")?,
+            team_id: id("APNS_TEAM_ID")?,
+        })
+    } else {
+        None
+    };
+
+    let apns_topic = get("APNS_TOPIC").unwrap_or_else(|| DEFAULT_APNS_TOPIC.to_string());
+    if apns_topic.len() > 255
+        || !apns_topic
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return err("APNS_TOPIC must be a bundle id like cat.sysop.MetricCupid");
+    }
+
+    Ok(V2Config {
+        data_dir: PathBuf::from(get("DATA_DIR").unwrap_or_else(|| "/data".to_string())),
+        apns_mode,
+        apns_key,
+        apns_topic,
+        apns_production_url: parse_url(
+            "APNS_PRODUCTION_URL",
+            get("APNS_PRODUCTION_URL").unwrap_or_else(|| APNS_PRODUCTION_URL.into()),
+        )?,
+        apns_sandbox_url: parse_url(
+            "APNS_SANDBOX_URL",
+            get("APNS_SANDBOX_URL").unwrap_or_else(|| APNS_SANDBOX_URL.into()),
+        )?,
+        gateway_url: parse_url(
+            "GATEWAY_URL",
+            get("GATEWAY_URL").unwrap_or_else(|| DEFAULT_GATEWAY_URL.into()),
+        )?,
+        hosted_open_registration: parse_bool(
+            "HOSTED_OPEN_REGISTRATION",
+            get("HOSTED_OPEN_REGISTRATION"),
+            false,
+        )?,
+        rate_messages: parse_rate(get, "V2_MESSAGES", 2, 60)?,
+        rate_commands: parse_rate(get, "V2_COMMANDS", 1, 20)?,
+        rate_gateway: parse_rate(get, "V2_GATEWAY", 5, 50)?,
+        rate_groups: HourlyRate {
+            per_hour: parse_nonzero("RATE_V2_GROUPS_PER_HOUR", get("RATE_V2_GROUPS_PER_HOUR"), 6)?,
+            burst: parse_nonzero("RATE_V2_GROUPS_BURST", get("RATE_V2_GROUPS_BURST"), 3)?,
+        },
+        ws_ping: Duration::from_secs(
+            parse_nonzero("WS_PING_SECS", get("WS_PING_SECS"), 30)?
+                .get()
+                .into(),
+        ),
+    })
+}
+
+fn parse_secrets(raw: Option<String>, v1_enabled: bool) -> Result<Vec<Secret>, ConfigError> {
     let Some(raw) = raw else {
-        return if mode == Mode::Hosted {
+        return if !v1_enabled {
             Ok(Vec::new())
         } else {
             err("RELAY_SECRETS is required (comma-separated, each at least 32 characters)")
@@ -368,13 +549,79 @@ mod tests {
 
     #[test]
     fn missing_required() {
-        let e = Config::from_lookup(|_| None).unwrap_err();
+        // Any v1 variable enables v1, which then needs all of them.
+        let e = Config::from_lookup(|k| (k == "RELAY_SECRETS").then(|| SECRET.to_string()))
+            .unwrap_err();
         assert!(e.0.contains("PUSHOVER_APP_TOKEN"), "{e}");
     }
 
     #[test]
-    fn hosted_mode_needs_no_keys() {
-        let c = Config::from_lookup(|k| (k == "MODE").then(|| "hosted".to_string())).unwrap();
+    fn v1_disabled_when_unconfigured() {
+        let c = Config::from_lookup(|_| None).unwrap();
+        assert!(!c.v1_enabled);
+        assert!(c.secrets.is_empty());
+        assert!(cfg(&[]).unwrap().v1_enabled);
+    }
+
+    #[test]
+    fn v2_defaults() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!(c.v2.apns_mode, ApnsMode::Gateway);
+        assert_eq!(c.v2.gateway_url, DEFAULT_GATEWAY_URL);
+        assert_eq!(c.v2.apns_topic, DEFAULT_APNS_TOPIC);
+        assert_eq!(c.v2.data_dir, PathBuf::from("/data"));
+        assert!(!c.v2.hosted_open_registration);
+        assert_eq!(c.v2.rate_messages.per_sec.get(), 2);
+        assert_eq!(c.v2.rate_messages.burst.get(), 60);
+        assert_eq!(c.v2.rate_commands.burst.get(), 20);
+        assert_eq!(c.v2.ws_ping, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn v2_apns_modes() {
+        let e = cfg(&[("APNS_MODE", "direct")]).unwrap_err();
+        assert!(e.0.contains("APNS_KEY_P8"), "{e}");
+        let pem = "-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----";
+        let c = cfg(&[
+            ("APNS_MODE", "direct"),
+            ("APNS_KEY_P8", pem),
+            ("APNS_KEY_ID", "ABCDE12345"),
+            ("APNS_TEAM_ID", "TEAM123456"),
+        ])
+        .unwrap();
+        let key = c.v2.apns_key.unwrap();
+        assert!(key.pem.contains("\nabc\n"));
+        assert!(!format!("{key:?}").contains("abc"));
+        assert!(cfg(&[
+            ("APNS_MODE", "direct"),
+            ("APNS_KEY_P8", pem),
+            ("APNS_KEY_ID", "short"),
+            ("APNS_TEAM_ID", "TEAM123456"),
+        ])
+        .is_err());
+        assert!(cfg(&[("APNS_MODE", "carrier-pigeon")]).is_err());
+        assert!(cfg(&[("MODE", "hosted"), ("APNS_MODE", "gateway")]).is_err());
+        let c = Config::from_lookup(|k| match k {
+            "MODE" => Some("hosted".into()),
+            "APNS_MODE" => Some("mock".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.v2.apns_mode, ApnsMode::Mock);
+        assert!(!c.v1_enabled, "v1 stays off in hosted mode");
+        assert!(cfg(&[("GATEWAY_URL", "ftp://x")]).is_err());
+        assert!(cfg(&[("APNS_TOPIC", "bad topic")]).is_err());
+        assert!(cfg(&[("WS_PING_SECS", "0")]).is_err());
+    }
+
+    #[test]
+    fn hosted_mode_needs_no_pushover_keys() {
+        let c = Config::from_lookup(|k| match k {
+            "MODE" => Some("hosted".into()),
+            "APNS_MODE" => Some("mock".into()),
+            _ => None,
+        })
+        .unwrap();
         assert_eq!(c.mode, Mode::Hosted);
     }
 

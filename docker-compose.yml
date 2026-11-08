@@ -13,6 +13,11 @@ services:
       # Loopback only. Expose publicly only behind a reverse proxy / Cloudflare.
       - "127.0.0.1:8080:8080"
     read_only: true
+    volumes:
+      # v2 SQLite database: the only writable path.
+      - data:/data
+      # APNS_MODE=direct: mount your key read-only and set APNS_KEY_P8=/run/secrets/apns.p8
+      # - ./AuthKey_ABCDE12345.p8:/run/secrets/apns.p8:ro
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
@@ -53,6 +58,9 @@ services:
       relay:
         condition: service_healthy
     networks: [relay]
+
+volumes:
+  data:
 
 networks:
   relay:

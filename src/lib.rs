@@ -1,5 +1,6 @@
-//! MetricCupid Push Relay: a signed HTTP relay from the MetricCupid macOS app
-//! to the Pushover API.
+//! MetricCupid Push: a signed HTTP relay from the MetricCupid macOS app to the
+//! Pushover API (v1) and an end-to-end encrypted mailbox + APNs sender for
+//! two-way Mac <-> iPhone communication (v2, see PROTOCOL.md).
 #![forbid(unsafe_code)]
 
 pub mod api;
@@ -8,6 +9,7 @@ pub mod client_ip;
 pub mod config;
 pub mod limits;
 pub mod pushover;
+pub mod v2;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -29,6 +31,7 @@ pub fn spawn_cleanup(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
         loop {
             tick.tick().await;
             state.cleanup();
+            state.cleanup_storage().await;
         }
     })
 }

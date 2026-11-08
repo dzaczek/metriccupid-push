@@ -18,6 +18,10 @@ Only the latest release receives security fixes.
 In scope: authentication bypass, replay, rate-limit/ban bypass, client IP
 spoofing, leaking of secrets or message contents (responses or logs),
 memory-exhaustion or crash bugs reachable by unauthenticated clients.
+For v2 also: access to another group's mailbox, queue, devices or stream;
+anything that lets the server or a network observer read or forge sealed
+content; leaking APNs tokens, sealed blobs or keys in responses or logs;
+abuse of the gateway to send notifications with arbitrary text.
 
 Out of scope: volumetric DDoS against an origin exposed without a proxy
 (put Cloudflare or a Tunnel in front, see README), and issues that require

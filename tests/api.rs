@@ -25,6 +25,7 @@ impl Clock for TestClock {
 }
 
 struct Relay {
+    _data: tempfile::TempDir,
     base: String,
     pushover: MockServer,
     clock: Arc<TestClock>,
@@ -33,6 +34,7 @@ struct Relay {
 
 async fn relay(overrides: &[(&str, &str)]) -> Relay {
     let pushover = MockServer::start().await;
+    let data = tempfile::tempdir().unwrap();
     let mut env: HashMap<String, String> = HashMap::from([
         ("PUSHOVER_APP_TOKEN".into(), "apptoken123".into()),
         ("PUSHOVER_USER_KEY".into(), "userkey456".into()),
@@ -41,6 +43,7 @@ async fn relay(overrides: &[(&str, &str)]) -> Relay {
             "PUSHOVER_API_URL".into(),
             format!("{}/1/messages.json", pushover.uri()),
         ),
+        ("DATA_DIR".into(), data.path().display().to_string()),
     ]);
     for (k, v) in overrides {
         env.insert(k.to_string(), v.to_string());
@@ -53,6 +56,7 @@ async fn relay(overrides: &[(&str, &str)]) -> Relay {
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(serve(listener, state, std::future::pending()));
     Relay {
+        _data: data,
         base,
         pushover,
         clock,
@@ -367,7 +371,8 @@ async fn quota_guard_blocks_low_priority() {
 
 #[tokio::test]
 async fn hosted_mode_is_501() {
-    let r = relay(&[("MODE", "hosted")]).await;
+    // v2 needs an APNs mode in hosted mode; v1 behaviour is unchanged.
+    let r = relay(&[("MODE", "hosted"), ("APNS_MODE", "mock")]).await;
     mock_ok(&r, 0).await;
     let res = r.post(r#"{"message":"m"}"#).await;
     assert_eq!(res.status, 501);

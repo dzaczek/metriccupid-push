@@ -1,6 +1,8 @@
 //! HMAC request signing.
 //!
-//! signature = lowercase_hex(HMAC-SHA256(secret, "{ts}\n{METHOD}\n{path}\n{raw body}"))
+//! v1: signature = lowercase_hex(HMAC-SHA256(secret, "{ts}\n{METHOD}\n{path}\n{raw body}"))
+//! v2: signature = lowercase_hex(HMAC-SHA256(auth_key,
+//!         "{ts}\n{METHOD}\n{target}\n{group_id}\n{device_id}\n{raw body}"))
 //! sent as `X-MC-Timestamp: <unix seconds>` and `X-MC-Signature: <hex>`.
 
 use std::sync::Mutex;
@@ -36,6 +38,39 @@ fn mac(secret: &[u8], ts: &str, method: &str, path: &str, body: &[u8]) -> [u8; 3
     m.update(b"\n");
     m.update(body);
     m.finalize().into_bytes().into()
+}
+
+fn mac_v2(
+    key: &[u8],
+    ts: &str,
+    method: &str,
+    target: &str,
+    group: &str,
+    device: &str,
+    body: &[u8],
+) -> [u8; 32] {
+    let mut m = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
+    for part in [ts, method, target, group, device] {
+        m.update(part.as_bytes());
+        m.update(b"\n");
+    }
+    m.update(body);
+    m.finalize().into_bytes().into()
+}
+
+/// v2 signature (PROTOCOL.md): binds the group and device ids, so identical
+/// requests from two devices never share a signature. `device` is empty for
+/// requests without `X-MC-Device` (gateway push).
+pub fn sign_v2(
+    key: &[u8],
+    ts: &str,
+    method: &str,
+    target: &str,
+    group: &str,
+    device: &str,
+    body: &[u8],
+) -> String {
+    hex::encode(mac_v2(key, ts, method, target, group, device, body))
 }
 
 /// Compute the lowercase hex signature for a request.
@@ -87,25 +122,7 @@ impl Authenticator {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<usize, AuthError> {
-        let ts = headers.get(TIMESTAMP_HEADER).and_then(|v| v.to_str().ok());
-        let sig = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
-        let (Some(ts), Some(sig)) = (ts, sig) else {
-            return Err(AuthError::MissingHeaders);
-        };
-
-        if ts.is_empty() || ts.len() > 12 || !ts.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(AuthError::BadTimestamp);
-        }
-        let ts_num: u64 = ts.parse().map_err(|_| AuthError::BadTimestamp)?;
-        if now.abs_diff(ts_num) > MAX_SKEW_SECS {
-            return Err(AuthError::StaleTimestamp);
-        }
-
-        if sig.len() != 64 || !sig.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(AuthError::BadSignature);
-        }
-        let mut provided = [0u8; 32];
-        hex::decode_to_slice(sig, &mut provided).map_err(|_| AuthError::BadSignature)?;
+        let (ts, provided) = parse_headers(now, headers)?;
 
         // Check every secret (no early exit) with a constant-time compare.
         let mut matched = None;
@@ -116,14 +133,40 @@ impl Authenticator {
             }
         }
         let index = matched.ok_or(AuthError::BadSignature)?;
+        self.remember(provided, now)?;
+        Ok(index)
+    }
 
-        // Only remember signatures that verified, so unauthenticated traffic
-        // cannot fill the cache.
+    /// Verify a v2 request signed with the group's `auth_key`.
+    /// Shares the replay cache with [`Authenticator::verify`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_v2(
+        &self,
+        now: u64,
+        key: &[u8],
+        method: &str,
+        target: &str,
+        group: &str,
+        device: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<(), AuthError> {
+        let (ts, provided) = parse_headers(now, headers)?;
+        let expected = mac_v2(key, ts, method, target, group, device, body);
+        if !bool::from(expected.ct_eq(&provided)) {
+            return Err(AuthError::BadSignature);
+        }
+        self.remember(provided, now)
+    }
+
+    /// Only remember signatures that verified, so unauthenticated traffic
+    /// cannot fill the cache.
+    fn remember(&self, sig: [u8; 32], now: u64) -> Result<(), AuthError> {
         let mut replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
-        if !replay.insert_if_absent(provided, now) {
+        if !replay.insert_if_absent(sig, now) {
             return Err(AuthError::Replay);
         }
-        Ok(index)
+        Ok(())
     }
 
     pub fn cleanup(&self, now: u64) {
@@ -132,6 +175,30 @@ impl Authenticator {
             .unwrap_or_else(|e| e.into_inner())
             .purge(now);
     }
+}
+
+/// Check presence and format of the timestamp and signature headers.
+fn parse_headers(now: u64, headers: &HeaderMap) -> Result<(&str, [u8; 32]), AuthError> {
+    let ts = headers.get(TIMESTAMP_HEADER).and_then(|v| v.to_str().ok());
+    let sig = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
+    let (Some(ts), Some(sig)) = (ts, sig) else {
+        return Err(AuthError::MissingHeaders);
+    };
+
+    if ts.is_empty() || ts.len() > 12 || !ts.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(AuthError::BadTimestamp);
+    }
+    let ts_num: u64 = ts.parse().map_err(|_| AuthError::BadTimestamp)?;
+    if now.abs_diff(ts_num) > MAX_SKEW_SECS {
+        return Err(AuthError::StaleTimestamp);
+    }
+
+    if sig.len() != 64 || !sig.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(AuthError::BadSignature);
+    }
+    let mut provided = [0u8; 32];
+    hex::decode_to_slice(sig, &mut provided).map_err(|_| AuthError::BadSignature)?;
+    Ok((ts, provided))
 }
 
 #[cfg(test)]
@@ -247,5 +314,34 @@ mod tests {
         );
         // Failures did not poison the replay cache.
         assert_eq!(verify(&a, now + 300, &h), Ok(0));
+    }
+
+    #[test]
+    fn verify_v2_binds_group_and_device_and_shares_replay_cache() {
+        let a = Authenticator::new(Vec::new());
+        let key = [7u8; 32];
+        let sig = sign_v2(&key, "1700000000", "GET", "/v2/stream", "g", "d1", b"");
+        let h = headers("1700000000", &sig);
+        let now = 1_700_000_000;
+        let v =
+            |k: &[u8], g: &str, d: &str| a.verify_v2(now, k, "GET", "/v2/stream", g, d, &h, b"");
+        assert_eq!(v(&[8u8; 32], "g", "d1"), Err(AuthError::BadSignature));
+        assert_eq!(
+            v(&key, "g", "d2"),
+            Err(AuthError::BadSignature),
+            "device bound"
+        );
+        assert_eq!(
+            v(&key, "h", "d1"),
+            Err(AuthError::BadSignature),
+            "group bound"
+        );
+        assert_eq!(v(&key, "g", "d1"), Ok(()));
+        assert_eq!(v(&key, "g", "d1"), Err(AuthError::Replay));
+        // Another device's identical request has a different signature.
+        assert_ne!(
+            sig,
+            sign_v2(&key, "1700000000", "GET", "/v2/stream", "g", "d2", b"")
+        );
     }
 }

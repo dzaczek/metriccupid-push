@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metriccupid_push::client_ip::ClientIpResolver;
-use metriccupid_push::config::{Config, LogFormat, Mode, TrustProxy};
+use metriccupid_push::config::{ApnsMode, Config, LogFormat, Mode, TrustProxy};
 use metriccupid_push::limits::SystemClock;
 use metriccupid_push::{serve, spawn_cleanup, AppState};
 
@@ -98,12 +98,25 @@ async fn async_main(config: Config) -> Result<(), String> {
         TrustProxy::Cloudflare { .. } => "cloudflare",
         TrustProxy::Xff(_) => "xff",
     };
+    let apns_mode = match config.v2.apns_mode {
+        ApnsMode::Direct => "direct",
+        ApnsMode::Mock => "mock",
+        ApnsMode::Gateway => "gateway",
+    };
+    if config.v2.apns_mode == ApnsMode::Mock {
+        tracing::warn!(
+            "APNS_MODE=mock: no real pushes, GET /v2/debug/pushes is open. Development only."
+        );
+    }
     tracing::info!(
         bind = %config.bind,
         mode = if config.mode == Mode::Hosted { "hosted" } else { "selfhosted" },
         trust_proxy,
+        v1 = config.v1_enabled,
         secrets = config.secrets.len(),
         allow_emergency = config.allow_emergency,
+        apns_mode,
+        data_dir = %config.v2.data_dir.display(),
         version = env!("CARGO_PKG_VERSION"),
         "metriccupid-push listening"
     );

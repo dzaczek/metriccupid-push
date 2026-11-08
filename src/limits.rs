@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use governor::clock::{Clock as _, DefaultClock};
 use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
 
-use crate::config::{Limits, Rate};
+use crate::config::{HourlyRate, Limits, Rate, V2Config};
 
 /// Wall clock in unix seconds. Injectable so tests control time.
 pub trait Clock: Send + Sync + 'static {
@@ -246,6 +246,61 @@ impl RateLimits {
 
     pub fn tracked_ips(&self) -> usize {
         self.per_ip.len()
+    }
+}
+
+/// v2 limits: per-group buckets for messages, commands and gateway pushes,
+/// and a per-IP bucket for group registration.
+pub struct V2Limits {
+    messages: DefaultKeyedRateLimiter<String>,
+    commands: DefaultKeyedRateLimiter<String>,
+    gateway: DefaultKeyedRateLimiter<String>,
+    groups: DefaultKeyedRateLimiter<IpAddr>,
+}
+
+fn hourly(r: HourlyRate) -> Quota {
+    Quota::per_hour(r.per_hour).allow_burst(r.burst)
+}
+
+impl V2Limits {
+    pub fn new(c: &V2Config) -> Self {
+        Self {
+            messages: RateLimiter::keyed(quota(c.rate_messages)),
+            commands: RateLimiter::keyed(quota(c.rate_commands)),
+            gateway: RateLimiter::keyed(quota(c.rate_gateway)),
+            groups: RateLimiter::keyed(hourly(c.rate_groups)),
+        }
+    }
+
+    pub fn check_messages(&self, group: &str) -> Result<(), RetryAfter> {
+        self.messages
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
+    pub fn check_commands(&self, group: &str) -> Result<(), RetryAfter> {
+        self.commands
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
+    pub fn check_gateway(&self, group: &str) -> Result<(), RetryAfter> {
+        self.gateway
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
+    pub fn check_group_registration(&self, ip: IpAddr) -> Result<(), RetryAfter> {
+        self.groups.check_key(&ip).map_err(retry_after)
+    }
+
+    pub fn cleanup(&self) {
+        for l in [&self.messages, &self.commands, &self.gateway] {
+            l.retain_recent();
+            l.shrink_to_fit();
+        }
+        self.groups.retain_recent();
+        self.groups.shrink_to_fit();
     }
 }
 

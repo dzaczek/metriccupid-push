@@ -1,0 +1,1186 @@
+//! v2 "MetricCupid Push": end-to-end encrypted mailbox, command queue and
+//! APNs fan-out for a group of devices. The normative spec is PROTOCOL.md.
+//!
+//! The server only ever handles ciphertext (`sealed`), opaque ids and APNs
+//! tokens. Never log sealed blobs, tokens or keys.
+
+// Handlers return `Result<_, Outcome>` where the error is the finished HTTP
+// response; it is only built on the cold path, so its size does not matter.
+#![allow(clippy::result_large_err)]
+
+pub mod apns;
+pub mod licence;
+pub mod store;
+pub mod stream;
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Bytes;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::task::JoinSet;
+
+use self::apns::{
+    build_payload, ApnsEnv, ApnsSender, GatewayApns, GatewayPush, GatewayRegistration, McEnvelope,
+    MessageType, MockApns, PushError, PushJob, Urgency, DEVICE_HEADER, GROUP_HEADER,
+    MAX_PAYLOAD_BYTES,
+};
+use self::licence::Licence;
+use self::store::{CreateGroup, Device, Insert, NewMessage, Store, StoreError, Upsert};
+use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME, MAX_STREAMS};
+use crate::api::{error, invalid, json_error, precheck, too_many, AppState, Outcome};
+use crate::config::Mode;
+use crate::limits::{ip_key, V2Limits};
+
+/// Max request body for v2 routes.
+pub const MAX_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_TTL_SECS: u64 = 86_400;
+/// Max length (base64 characters) of a command's `sealed`.
+pub const MAX_COMMAND_SEALED: usize = 8 * 1024;
+/// nonce (12) + tag (16): the smallest valid sealed box.
+pub const MIN_SEALED_BYTES: usize = 28;
+
+/// v2 part of the application state.
+pub struct V2State {
+    pub store: Store,
+    pub hub: Hub,
+    pub limits: V2Limits,
+    pub sender: Arc<dyn ApnsSender>,
+    pub mock: Option<Arc<MockApns>>,
+    /// Set in `APNS_MODE=gateway`: group registrations are forwarded too.
+    pub gateway: Option<Arc<GatewayApns>>,
+    pub licence: Box<dyn Licence>,
+    pub ws_ping: Duration,
+}
+
+pub fn routes(mode: Mode, mock: bool) -> Router<Arc<AppState>> {
+    let mut r = Router::new()
+        .route("/v2/groups", post(create_group))
+        .route("/v2/devices", get(list_devices))
+        .route(
+            "/v2/devices/{device_id}",
+            put(put_device).delete(delete_device),
+        )
+        .route("/v2/messages", post(post_message).get(get_messages))
+        .route("/v2/commands", post(post_command).get(get_commands))
+        .route("/v2/commands/ack", post(ack_command))
+        .route("/v2/stream", get(open_stream));
+    if mode == Mode::Hosted {
+        r = r.route(apns::GATEWAY_PUSH_PATH, post(gateway_push));
+    }
+    if mock {
+        r = r.route("/v2/debug/pushes", get(debug_pushes));
+    }
+    r
+}
+
+// ------------------------------------------------------------ validation ---
+
+/// 16 random bytes, base64url without padding (exactly 22 characters).
+pub fn is_id128(s: &str) -> bool {
+    s.len() == 22
+        && URL_SAFE_NO_PAD
+            .decode(s)
+            .map(|b| b.len() == 16)
+            .unwrap_or(false)
+}
+
+/// Message / command id or collapse id: 1..=64 of `[A-Za-z0-9_-]`.
+pub fn is_token_id(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Standard base64 (with padding) of at least nonce + tag.
+pub fn is_sealed(s: &str, max_len: usize) -> bool {
+    s.len() <= max_len
+        && STANDARD
+            .decode(s)
+            .map(|b| b.len() >= MIN_SEALED_BYTES)
+            .unwrap_or(false)
+}
+
+/// APNs device token: lowercase hex, 64..=200 characters, even length.
+pub fn normalize_apns_token(s: &str) -> Option<String> {
+    let ok = (64..=200).contains(&s.len())
+        && s.len() % 2 == 0
+        && s.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then(|| s.to_ascii_lowercase())
+}
+
+fn is_name(s: &str) -> bool {
+    let n = s.chars().count();
+    (1..=64).contains(&n) && !s.chars().any(char::is_control)
+}
+
+// ------------------------------------------------------------------ auth ---
+
+/// Which device the request must come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceRule {
+    /// No `X-MC-Device` needed (gateway push).
+    None,
+    /// Valid `X-MC-Device` header, device need not exist yet (registration).
+    Header,
+    /// A registered device, optionally of a given kind.
+    Registered(Option<&'static str>),
+}
+
+struct Authed {
+    group: String,
+    key: [u8; 32],
+    device_id: Option<String>,
+    device: Option<Device>,
+}
+
+fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    h.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn storage_error(e: StoreError) -> Outcome {
+    tracing::error!(error = %e, "storage error");
+    (
+        error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
+        "storage_error",
+    )
+}
+
+/// The signed request target: path plus `?query` when present.
+fn target(uri: &Uri) -> &str {
+    uri.path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or_else(|| uri.path())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn authenticate(
+    state: &AppState,
+    ip: IpAddr,
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    rule: DeviceRule,
+) -> Result<Authed, Outcome> {
+    let now = state.now();
+    precheck(state, ip, now)?;
+
+    let group = header(headers, GROUP_HEADER).filter(|g| is_id128(g));
+    let device_id = header(headers, DEVICE_HEADER).filter(|d| is_id128(d));
+    let Some(group) = group else {
+        return Err(state.auth_failed(ip, now, "bad_group_header"));
+    };
+    if rule != DeviceRule::None && device_id.is_none() {
+        return Err(state.auth_failed(ip, now, "bad_device_header"));
+    }
+    let v2 = state.v2();
+    let g = group.to_string();
+    let key = match v2.store.call(move |c| store::group_key(c, &g)).await {
+        Ok(Some(k)) => k,
+        Ok(None) => return Err(state.auth_failed(ip, now, "unknown_group")),
+        Err(e) => return Err(storage_error(e)),
+    };
+    let device_for_sig = if rule == DeviceRule::None {
+        ""
+    } else {
+        device_id.unwrap_or_default()
+    };
+    if let Err(e) = state.auth().verify_v2(
+        now,
+        &key,
+        method,
+        target(uri),
+        group,
+        device_for_sig,
+        headers,
+        body,
+    ) {
+        return Err(state.auth_failed(ip, now, e.as_str()));
+    }
+
+    let mut authed = Authed {
+        group: group.to_string(),
+        key,
+        device_id: device_id.map(str::to_string),
+        device: None,
+    };
+    if let DeviceRule::Registered(kind) = rule {
+        let (g, d) = (
+            authed.group.clone(),
+            authed.device_id.clone().unwrap_or_default(),
+        );
+        let dev = match v2.store.call(move |c| store::device(c, &g, &d)).await {
+            Ok(Some(dev)) => dev,
+            Ok(None) => {
+                return Err((
+                    error(StatusCode::FORBIDDEN, "unknown_device"),
+                    "unknown_device",
+                ))
+            }
+            Err(e) => return Err(storage_error(e)),
+        };
+        if kind.is_some_and(|k| k != dev.kind) {
+            return Err((
+                error(StatusCode::FORBIDDEN, "wrong_device_kind"),
+                "wrong_device_kind",
+            ));
+        }
+        authed.device = Some(dev);
+    }
+    Ok(authed)
+}
+
+fn finish(
+    route: &'static str,
+    ip: IpAddr,
+    started: Instant,
+    group: Option<&str>,
+    (response, outcome): Outcome,
+) -> Response {
+    // Never log sealed blobs, tokens or keys.
+    tracing::info!(
+        route,
+        client_ip = %ip,
+        group = group.unwrap_or("-"),
+        status = response.status().as_u16(),
+        outcome,
+        latency_ms = started.elapsed().as_millis() as u64,
+        "v2"
+    );
+    response
+}
+
+fn ok(status: StatusCode, body: serde_json::Value, outcome: &'static str) -> Outcome {
+    ((status, Json(body)).into_response(), outcome)
+}
+
+fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Outcome> {
+    serde_json::from_slice(body).map_err(|e| (invalid(json_error(&e)), "invalid_json"))
+}
+
+fn bad(detail: &str) -> Outcome {
+    (invalid(detail), "invalid_request")
+}
+
+// ---------------------------------------------------------------- groups ---
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateGroupReq {
+    group_id: String,
+    auth_key: String,
+    #[serde(default)]
+    licence: Option<String>,
+}
+
+async fn create_group(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let r = handle_create_group(&state, ip, &body).await;
+    finish("groups", ip, started, None, r)
+}
+
+async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outcome {
+    let now = state.now();
+    if let Err(o) = precheck(state, ip, now) {
+        return o;
+    }
+    let v2 = state.v2();
+    if let Err(ra) = v2.limits.check_group_registration(ip_key(ip)) {
+        return (too_many(ra), "rate_limited_registration");
+    }
+    let req: CreateGroupReq = match parse(body) {
+        Ok(r) => r,
+        Err(o) => return o,
+    };
+    if !is_id128(&req.group_id) {
+        return bad("group_id must be 16 bytes, base64url without padding");
+    }
+    let key: [u8; 32] = match STANDARD
+        .decode(&req.auth_key)
+        .ok()
+        .and_then(|k| k.try_into().ok())
+    {
+        Some(k) => k,
+        None => return bad("auth_key must be 32 bytes, standard base64"),
+    };
+    if req.licence.as_ref().is_some_and(|l| l.len() > 12 * 1024) {
+        return bad("licence too long");
+    }
+    if state.mode() == Mode::Hosted && !v2.licence.allows(req.licence.as_deref()) {
+        return (
+            error(StatusCode::PAYMENT_REQUIRED, "licence_required"),
+            "licence_required",
+        );
+    }
+
+    let g = req.group_id.clone();
+    let created = match v2
+        .store
+        .call(move |c| store::create_group(c, &g, &key, now))
+        .await
+    {
+        Ok(CreateGroup::Conflict) => {
+            return (
+                error(StatusCode::CONFLICT, "group_exists"),
+                "group_conflict",
+            )
+        }
+        Ok(c) => c,
+        Err(e) => return storage_error(e),
+    };
+
+    // Self-hosted with the hosted gateway: the gateway must know the group to
+    // accept our signed push jobs. Idempotent, so a client retry after a
+    // gateway failure is safe.
+    if let Some(gw) = &v2.gateway {
+        let mut fwd = json!({ "group_id": req.group_id, "auth_key": req.auth_key });
+        if let Some(l) = &req.licence {
+            fwd["licence"] = json!(l);
+        }
+        match gw.register_group(&fwd).await {
+            GatewayRegistration::Ok => {}
+            GatewayRegistration::Status(402) => {
+                return (
+                    error(StatusCode::PAYMENT_REQUIRED, "licence_required"),
+                    "gateway_licence_required",
+                )
+            }
+            GatewayRegistration::Status(409) => {
+                return (
+                    error(StatusCode::CONFLICT, "group_exists"),
+                    "gateway_conflict",
+                )
+            }
+            other => {
+                tracing::warn!(?other, "gateway group registration failed");
+                return (
+                    error(StatusCode::BAD_GATEWAY, "gateway_error"),
+                    "gateway_error",
+                );
+            }
+        }
+    }
+
+    match created {
+        CreateGroup::Created => ok(StatusCode::CREATED, json!({"status": "created"}), "created"),
+        _ => ok(StatusCode::OK, json!({"status": "exists"}), "exists"),
+    }
+}
+
+// --------------------------------------------------------------- devices ---
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceReq {
+    kind: String,
+    name: String,
+    #[serde(default)]
+    apns_token: Option<String>,
+    #[serde(default)]
+    apns_env: Option<String>,
+}
+
+async fn put_device(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(device_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(&state, ip, "PUT", &uri, &headers, &body, DeviceRule::Header).await?;
+        group = Some(a.group.clone());
+        if a.device_id.as_deref() != Some(device_id.as_str()) {
+            return Err(bad("X-MC-Device must match the device id in the path"));
+        }
+        let req: DeviceReq = parse(&body)?;
+        if !matches!(req.kind.as_str(), "mac" | "ios") {
+            return Err(bad("kind must be mac or ios"));
+        }
+        if !is_name(&req.name) {
+            return Err(bad(
+                "name must be 1 to 64 characters without control characters",
+            ));
+        }
+        let env = match req.apns_env.as_deref() {
+            None => ApnsEnv::Production,
+            Some(e) => {
+                ApnsEnv::parse(e).ok_or_else(|| bad("apns_env must be sandbox or production"))?
+            }
+        };
+        let token = match &req.apns_token {
+            None => None,
+            Some(_) if req.kind != "ios" => {
+                return Err(bad("apns_token is only allowed for ios devices"))
+            }
+            Some(t) => Some(
+                normalize_apns_token(t)
+                    .ok_or_else(|| bad("apns_token must be 64 to 200 hex characters"))?,
+            ),
+        };
+        let dev = Device {
+            device_id: device_id.clone(),
+            kind: req.kind,
+            name: req.name,
+            apns_token: token,
+            apns_env: env.as_str().to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let now = state.now();
+        let g = a.group.clone();
+        match state
+            .v2()
+            .store
+            .call(move |c| store::upsert_device(c, &g, &dev, now))
+            .await
+        {
+            Ok(Upsert::Created) => Ok(ok(
+                StatusCode::CREATED,
+                json!({"status": "created"}),
+                "created",
+            )),
+            Ok(Upsert::Updated) => Ok(ok(StatusCode::OK, json!({"status": "updated"}), "updated")),
+            Ok(Upsert::LimitReached) => {
+                Ok((error(StatusCode::CONFLICT, "device_limit"), "device_limit"))
+            }
+            Err(e) => Err(storage_error(e)),
+        }
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("devices.put", ip, started, group.as_deref(), r)
+}
+
+async fn delete_device(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(device_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "DELETE",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(None),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let (g, d) = (a.group.clone(), device_id.clone());
+        match state
+            .v2()
+            .store
+            .call(move |c| store::delete_device(c, &g, &d))
+            .await
+        {
+            Ok(true) => {
+                state.v2().hub.remove_device(&a.group, &device_id);
+                Ok((StatusCode::NO_CONTENT.into_response(), "deleted"))
+            }
+            Ok(false) => Ok((error(StatusCode::NOT_FOUND, "not_found"), "not_found")),
+            Err(e) => Err(storage_error(e)),
+        }
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("devices.delete", ip, started, group.as_deref(), r)
+}
+
+async fn list_devices(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "GET",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(None),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let g = a.group.clone();
+        let devices = state
+            .v2()
+            .store
+            .call(move |c| store::list_devices(c, &g))
+            .await
+            .map_err(storage_error)?;
+        let hub = &state.v2().hub;
+        let list: Vec<_> = devices
+            .iter()
+            .map(|d| {
+                let mut v = json!({
+                    "device_id": d.device_id,
+                    "kind": d.kind,
+                    "name": d.name,
+                    "apns_env": d.apns_env,
+                    "has_token": d.apns_token.is_some(),
+                    "created_at": d.created_at,
+                    "updated_at": d.updated_at,
+                });
+                if d.kind == "mac" {
+                    v["online"] = json!(hub.is_online(&a.group, &d.device_id));
+                }
+                v
+            })
+            .collect();
+        Ok(ok(StatusCode::OK, json!({ "devices": list }), "listed"))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("devices.list", ip, started, group.as_deref(), r)
+}
+
+// -------------------------------------------------------------- messages ---
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageReq {
+    id: String,
+    #[serde(rename = "type")]
+    kind: MessageType,
+    sealed: String,
+    #[serde(default)]
+    collapse_id: Option<String>,
+    urgency: Urgency,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+async fn post_message(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "POST",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("mac")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        if let Err(ra) = state.v2().limits.check_messages(&a.group) {
+            return Err((too_many(ra), "rate_limited_group"));
+        }
+        let req: MessageReq = parse(&body)?;
+        if !is_token_id(&req.id) {
+            return Err(bad("id must be 1 to 64 characters of A-Z a-z 0-9 _ -"));
+        }
+        if !is_sealed(&req.sealed, MAX_BODY_BYTES) {
+            return Err(bad(
+                "sealed must be standard base64 of nonce|ciphertext|tag",
+            ));
+        }
+        if req.collapse_id.as_deref().is_some_and(|c| !is_token_id(c)) {
+            return Err(bad(
+                "collapse_id must be 1 to 64 characters of A-Z a-z 0-9 _ -",
+            ));
+        }
+        let ttl = req.ttl_secs.unwrap_or(MAX_TTL_SECS);
+        if ttl > MAX_TTL_SECS {
+            return Err(bad("ttl_secs must be at most 86400"));
+        }
+        let mc = McEnvelope {
+            id: req.id.clone(),
+            t: req.kind,
+            s: req.sealed.clone(),
+        };
+        if build_payload(&mc, req.urgency).len() > MAX_PAYLOAD_BYTES {
+            return Err((
+                error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+                "payload_too_large",
+            ));
+        }
+
+        let now = state.now();
+        let new = NewMessage {
+            id: req.id,
+            kind: req.kind.as_str().into(),
+            sealed: req.sealed,
+            urgency: req.urgency.as_str().into(),
+            collapse_id: req.collapse_id.clone(),
+        };
+        let g = a.group.clone();
+        let cursor = match state
+            .v2()
+            .store
+            .call(move |c| store::insert_message(c, &g, &new, now))
+            .await
+        {
+            Ok(Insert::Stored(c)) => c,
+            Ok(Insert::Duplicate(c)) => {
+                return Ok(ok(
+                    StatusCode::OK,
+                    json!({"status": "duplicate", "cursor": c}),
+                    "duplicate",
+                ))
+            }
+            Ok(Insert::Full) => unreachable!("the mailbox evicts instead of filling up"),
+            Err(e) => return Err(storage_error(e)),
+        };
+
+        let expiration = if ttl == 0 { 0 } else { now + ttl };
+        let (pushed, failed, unregistered) =
+            fan_out(&state, &a, mc, req.urgency, req.collapse_id, expiration).await?;
+        Ok(ok(
+            StatusCode::OK,
+            json!({
+                "status": "stored",
+                "cursor": cursor,
+                "pushed": pushed,
+                "failed": failed,
+                "unregistered": unregistered,
+            }),
+            "stored",
+        ))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("messages.post", ip, started, group.as_deref(), r)
+}
+
+/// Push to every iOS device of the group concurrently; forget dead tokens.
+async fn fan_out(
+    state: &Arc<AppState>,
+    a: &Authed,
+    mc: McEnvelope,
+    urgency: Urgency,
+    collapse_id: Option<String>,
+    expiration: u64,
+) -> Result<(usize, usize, usize), Outcome> {
+    let v2 = state.v2();
+    let g = a.group.clone();
+    let targets = v2
+        .store
+        .call(move |c| store::push_targets(c, &g))
+        .await
+        .map_err(storage_error)?;
+    let mut set = JoinSet::new();
+    for d in targets {
+        let Some(token) = d.apns_token.clone() else {
+            continue;
+        };
+        let job = PushJob {
+            group_id: a.group.clone(),
+            auth_key: a.key,
+            device_token: token,
+            env: ApnsEnv::parse(&d.apns_env).unwrap_or(ApnsEnv::Production),
+            mc: mc.clone(),
+            urgency,
+            collapse_id: collapse_id.clone(),
+            expiration,
+        };
+        let sender = v2.sender.clone();
+        set.spawn(async move {
+            let r = sender.send(&job).await;
+            (d.device_id, job.device_token, r)
+        });
+    }
+    let (mut pushed, mut failed, mut unregistered) = (0, 0, 0);
+    while let Some(res) = set.join_next().await {
+        let Ok((device_id, token, r)) = res else {
+            failed += 1;
+            continue;
+        };
+        match r {
+            Ok(()) => pushed += 1,
+            Err(PushError::Unregistered) => {
+                unregistered += 1;
+                let g = a.group.clone();
+                if let Err(e) = v2
+                    .store
+                    .call(move |c| store::clear_token(c, &g, &device_id, &token))
+                    .await
+                {
+                    tracing::error!(error = %e, "cannot clear APNs token");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                match e {
+                    PushError::Rejected { status, reason } => {
+                        tracing::warn!(group = %a.group, status, reason, "APNs rejected push")
+                    }
+                    _ => tracing::warn!(group = %a.group, "APNs transport error"),
+                }
+            }
+        }
+    }
+    Ok((pushed, failed, unregistered))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SinceQuery {
+    #[serde(default)]
+    since: u64,
+    /// Client nonce, ignored: lets identical polls in the same second carry
+    /// different signatures (replay cache).
+    #[serde(default, rename = "n")]
+    _n: Option<String>,
+}
+
+fn since(uri: &Uri) -> Result<u64, Outcome> {
+    Query::<SinceQuery>::try_from_uri(uri)
+        .map(|q| q.0.since)
+        .map_err(|_| bad("query must be ?since=<cursor>[&n=<nonce>]"))
+}
+
+async fn get_messages(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "GET",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(None),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let since = since(&uri)?;
+        let now = state.now();
+        let g = a.group.clone();
+        let (rows, more) = state
+            .v2()
+            .store
+            .call(move |c| store::messages_since(c, &g, since, now))
+            .await
+            .map_err(storage_error)?;
+        let cursor = rows.last().map_or(since, |m| m.cursor);
+        let list: Vec<_> = rows
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "cursor": m.cursor,
+                    "id": m.id,
+                    "type": m.kind,
+                    "sealed": m.sealed,
+                    "urgency": m.urgency,
+                    "collapse_id": m.collapse_id,
+                    "received_at": m.received_at,
+                })
+            })
+            .collect();
+        Ok(ok(
+            StatusCode::OK,
+            json!({ "messages": list, "cursor": cursor, "more": more }),
+            "listed",
+        ))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("messages.get", ip, started, group.as_deref(), r)
+}
+
+// -------------------------------------------------------------- commands ---
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandReq {
+    id: String,
+    sealed: String,
+}
+
+async fn post_command(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "POST",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("ios")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        if let Err(ra) = state.v2().limits.check_commands(&a.group) {
+            return Err((too_many(ra), "rate_limited_group"));
+        }
+        let req: CommandReq = parse(&body)?;
+        if !is_token_id(&req.id) {
+            return Err(bad("id must be 1 to 64 characters of A-Z a-z 0-9 _ -"));
+        }
+        if !is_sealed(&req.sealed, MAX_COMMAND_SEALED) {
+            return Err(bad(
+                "sealed must be standard base64 of nonce|ciphertext|tag, at most 8192 characters",
+            ));
+        }
+        let now = state.now();
+        let (g, id, sealed) = (a.group.clone(), req.id.clone(), req.sealed.clone());
+        match state
+            .v2()
+            .store
+            .call(move |c| store::insert_command(c, &g, &id, &sealed, now))
+            .await
+        {
+            Ok(Insert::Stored(cursor)) => {
+                let frame = CommandFrame {
+                    cursor,
+                    id: req.id,
+                    sealed: req.sealed,
+                };
+                let delivered = state.v2().hub.deliver(&a.group, &frame);
+                let status = if delivered { "delivered" } else { "queued" };
+                Ok(ok(
+                    StatusCode::OK,
+                    json!({ "status": status, "delivered": delivered, "cursor": cursor }),
+                    status,
+                ))
+            }
+            Ok(Insert::Duplicate(cursor)) => Ok(ok(
+                StatusCode::OK,
+                json!({ "status": "duplicate", "delivered": false, "cursor": cursor }),
+                "duplicate",
+            )),
+            Ok(Insert::Full) => Ok((
+                error(StatusCode::TOO_MANY_REQUESTS, "queue_full"),
+                "queue_full",
+            )),
+            Err(e) => Err(storage_error(e)),
+        }
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("commands.post", ip, started, group.as_deref(), r)
+}
+
+async fn get_commands(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(&state, ip, "GET", &uri, &headers, &body, DeviceRule::Registered(Some("mac"))).await?;
+        group = Some(a.group.clone());
+        let since = since(&uri)?;
+        let now = state.now();
+        let g = a.group.clone();
+        let (rows, more) = state
+            .v2()
+            .store
+            .call(move |c| store::commands_since(c, &g, since, now, store::PAGE))
+            .await
+            .map_err(storage_error)?;
+        let cursor = rows.last().map_or(since, |m| m.cursor);
+        let list: Vec<_> = rows
+            .into_iter()
+            .map(|c| json!({ "cursor": c.cursor, "id": c.id, "sealed": c.sealed, "received_at": c.received_at }))
+            .collect();
+        Ok(ok(
+            StatusCode::OK,
+            json!({ "commands": list, "cursor": cursor, "more": more }),
+            "listed",
+        ))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("commands.get", ip, started, group.as_deref(), r)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckReq {
+    cursor: u64,
+}
+
+async fn ack_command(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "POST",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("mac")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let req: AckReq = parse(&body)?;
+        let g = a.group.clone();
+        let removed = state
+            .v2()
+            .store
+            .call(move |c| store::ack_command(c, &g, req.cursor))
+            .await
+            .map_err(storage_error)?;
+        Ok(ok(StatusCode::OK, json!({ "removed": removed }), "acked"))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("commands.ack", ip, started, group.as_deref(), r)
+}
+
+// ---------------------------------------------------------------- stream ---
+
+async fn open_stream(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let started = Instant::now();
+    let (mut parts, _body) = req.into_parts();
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0)
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let ip = state.client_ip(peer, &parts.headers);
+    let mut group = None;
+    let r = async {
+        // The upgrade request is signed like any GET: empty body.
+        let a = authenticate(
+            &state,
+            ip,
+            "GET",
+            &parts.uri,
+            &parts.headers,
+            b"",
+            DeviceRule::Registered(Some("mac")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        if state.v2().hub.len() >= MAX_STREAMS {
+            return Err((
+                error(StatusCode::SERVICE_UNAVAILABLE, "too_many_streams"),
+                "too_many_streams",
+            ));
+        }
+        let ws = WebSocketUpgrade::from_request_parts(&mut parts, &state)
+            .await
+            .map_err(|rej| (rej.into_response(), "not_websocket"))?;
+        let device = a.device_id.clone().unwrap_or_default();
+        let st = state.clone();
+        let resp = ws
+            .max_message_size(MAX_CLIENT_FRAME)
+            .max_frame_size(MAX_CLIENT_FRAME)
+            .on_upgrade(move |socket| async move {
+                let v2 = st.v2();
+                match v2.hub.register(&a.group, &device) {
+                    Ok((id, rx)) => stream::run(socket, st.clone(), a.group, device, id, rx).await,
+                    Err(_) => {
+                        let mut socket = socket;
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Close(Some(
+                                axum::extract::ws::CloseFrame {
+                                    code: 1013,
+                                    reason: "too many streams".into(),
+                                },
+                            )))
+                            .await;
+                    }
+                }
+            });
+        Ok((resp, "upgraded"))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("stream", ip, started, group.as_deref(), r)
+}
+
+// --------------------------------------------------------------- gateway ---
+
+async fn gateway_push(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(&state, ip, "POST", &uri, &headers, &body, DeviceRule::None).await?;
+        group = Some(a.group.clone());
+        if let Err(ra) = state.v2().limits.check_gateway(&a.group) {
+            return Err((too_many(ra), "rate_limited_gateway"));
+        }
+        let req: GatewayPush = parse(&body)?;
+        let token = normalize_apns_token(&req.device_token)
+            .ok_or_else(|| bad("device_token must be 64 to 200 hex characters"))?;
+        if !is_token_id(&req.message.id) || !is_sealed(&req.message.s, MAX_PAYLOAD_BYTES) {
+            return Err(bad(
+                "message must be {id, t, s} with a valid id and sealed box",
+            ));
+        }
+        if req.collapse_id.as_deref().is_some_and(|c| !is_token_id(c)) {
+            return Err(bad(
+                "collapse_id must be 1 to 64 characters of A-Z a-z 0-9 _ -",
+            ));
+        }
+        let now = state.now();
+        if req.expiration != 0 && req.expiration > now + MAX_TTL_SECS {
+            return Err(bad("expiration must be 0 or at most 24 h ahead"));
+        }
+        // The gateway builds the payload itself, so it cannot be used to send
+        // arbitrary notification text.
+        if build_payload(&req.message, req.urgency).len() > MAX_PAYLOAD_BYTES {
+            return Err((
+                error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+                "payload_too_large",
+            ));
+        }
+        let job = PushJob {
+            group_id: a.group.clone(),
+            auth_key: a.key,
+            device_token: token,
+            env: req.env,
+            mc: req.message,
+            urgency: req.urgency,
+            collapse_id: req.collapse_id,
+            expiration: req.expiration,
+        };
+        match state.v2().sender.send(&job).await {
+            Ok(()) => Ok(ok(StatusCode::OK, json!({"status": "sent"}), "sent")),
+            Err(PushError::Unregistered) => {
+                Ok((error(StatusCode::GONE, "unregistered"), "unregistered"))
+            }
+            Err(PushError::Rejected { status, reason }) => {
+                tracing::warn!(status, reason, "gateway: APNs rejected push");
+                Ok((
+                    error(StatusCode::BAD_GATEWAY, "upstream_error"),
+                    "upstream_error",
+                ))
+            }
+            Err(PushError::Transport) => Ok((
+                error(StatusCode::BAD_GATEWAY, "upstream_error"),
+                "upstream_error",
+            )),
+        }
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("gateway.push", ip, started, group.as_deref(), r)
+}
+
+// ----------------------------------------------------------------- debug ---
+
+/// `APNS_MODE=mock` only: the recorded pushes. Unauthenticated, local dev.
+async fn debug_pushes(State(state): State<Arc<AppState>>) -> Response {
+    match &state.v2().mock {
+        Some(m) => Json(json!({ "pushes": m.pushes() })).into_response(),
+        None => error(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_validation() {
+        assert!(is_id128("AAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(is_id128("_-_-_-_-_-_-_-_-_-_-_w"));
+        assert!(
+            !is_id128("AAAAAAAAAAAAAAAAAAAAAB"),
+            "non-canonical trailing bits"
+        );
+        assert!(!is_id128("AAAAAAAAAAAAAAAAAAAAA"));
+        assert!(!is_id128("AAAAAAAAAAAAAAAAAAAAAA=="));
+        assert!(!is_id128("AAAAAAAAAAAAAAAAAAAA+/"));
+        assert!(is_token_id("abc-_9"));
+        assert!(!is_token_id(""));
+        assert!(!is_token_id(&"a".repeat(65)));
+        assert!(!is_token_id("a b"));
+    }
+
+    #[test]
+    fn sealed_and_token_validation() {
+        let min = STANDARD.encode([0u8; 28]);
+        assert!(is_sealed(&min, 100));
+        assert!(!is_sealed(&STANDARD.encode([0u8; 27]), 100));
+        assert!(!is_sealed(&min, 10));
+        assert!(!is_sealed("not base64!", 100));
+        assert_eq!(
+            normalize_apns_token(&"AB".repeat(32)),
+            Some("ab".repeat(32))
+        );
+        assert_eq!(normalize_apns_token(&"a".repeat(63)), None);
+        assert_eq!(normalize_apns_token(&"g".repeat(64)), None);
+        assert!(is_name("Jacek's iPhone"));
+        assert!(!is_name(""));
+        assert!(!is_name("a\nb"));
+    }
+}

@@ -1,4 +1,5 @@
-//! HTTP API: `POST /v1/notify`, `GET /healthz`, everything else 404.
+//! HTTP API: `POST /v1/notify`, the v2 routes (see `v2`), `GET /healthz`,
+//! everything else 404.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -20,9 +21,14 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::Authenticator;
 use crate::client_ip::ClientIpResolver;
-use crate::config::{Config, Mode};
-use crate::limits::{ip_key, AuthBans, Clock, ExpiringSet, RateLimits, RetryAfter};
+use crate::config::{ApnsMode, Config, Mode};
+use crate::limits::{ip_key, AuthBans, Clock, ExpiringSet, RateLimits, RetryAfter, V2Limits};
 use crate::pushover::{Message, PushoverClient, SendError};
+use crate::v2::apns::{ApnsSender, DirectApns, GatewayApns, MockApns};
+use crate::v2::licence::OpenRegistration;
+use crate::v2::store::{self, Store};
+use crate::v2::stream::Hub;
+use crate::v2::{self as v2, V2State};
 
 pub const NOTIFY_PATH: &str = "/v1/notify";
 pub const MAX_BODY_BYTES: usize = 8 * 1024;
@@ -30,8 +36,12 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CONCURRENCY: usize = 64;
 const DEDUP_CAP: usize = 10_000;
 
+/// A finished response plus a short outcome label for the log line.
+pub type Outcome = (Response, &'static str);
+
 pub struct AppState {
     mode: Mode,
+    v1_enabled: bool,
     allow_emergency: bool,
     quota_reserve: u64,
     resolver: ClientIpResolver,
@@ -41,6 +51,7 @@ pub struct AppState {
     dedup: Mutex<ExpiringSet<(usize, String)>>,
     pushover: PushoverClient,
     clock: Arc<dyn Clock>,
+    v2: V2State,
 }
 
 impl AppState {
@@ -56,8 +67,10 @@ impl AppState {
         )
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
         let l = &config.limits;
+        let v2 = build_v2(config, clock.clone())?;
         Ok(Self {
             mode: config.mode,
+            v1_enabled: config.v1_enabled,
             allow_emergency: config.allow_emergency,
             quota_reserve: config.quota_reserve,
             resolver,
@@ -67,13 +80,65 @@ impl AppState {
             dedup: Mutex::new(ExpiringSet::new(config.dedup_window, DEDUP_CAP)),
             pushover,
             clock,
+            v2,
         })
+    }
+
+    pub fn now(&self) -> u64 {
+        self.clock.now()
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn v2(&self) -> &V2State {
+        &self.v2
+    }
+
+    pub fn auth(&self) -> &Authenticator {
+        &self.auth
+    }
+
+    /// The in-memory APNs recorder when `APNS_MODE=mock`.
+    pub fn mock_apns(&self) -> Option<Arc<MockApns>> {
+        self.v2.mock.clone()
+    }
+
+    pub fn client_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+        self.resolver.resolve(peer.ip(), headers)
+    }
+
+    /// Record an auth failure for `ip` and build the generic 401.
+    pub fn auth_failed(&self, ip: IpAddr, now: u64, reason: &str) -> Outcome {
+        if self.bans.record_failure(ip_key(ip), now) {
+            tracing::warn!(client_ip = %ip, "auth failure threshold reached, IP banned");
+        }
+        tracing::debug!(client_ip = %ip, reason, "auth failed");
+        // Generic body: do not tell the client which check failed.
+        (
+            error(StatusCode::UNAUTHORIZED, "unauthorized"),
+            "unauthorized",
+        )
+    }
+
+    /// Delete expired v2 messages and commands.
+    pub async fn cleanup_storage(&self) {
+        let now = self.clock.now();
+        match self.v2.store.call(move |c| store::cleanup(c, now)).await {
+            Ok((m, c)) if m + c > 0 => {
+                tracing::debug!(messages = m, commands = c, "retention cleanup")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "retention cleanup failed"),
+        }
     }
 
     /// Periodic housekeeping: drop expired entries so every map stays bounded.
     pub fn cleanup(&self) {
         let now = self.clock.now();
         self.limits.cleanup();
+        self.v2.limits.cleanup();
         self.bans.cleanup(now);
         self.auth.cleanup(now);
         self.dedup
@@ -83,15 +148,65 @@ impl AppState {
     }
 }
 
+fn build_v2(config: &Config, clock: Arc<dyn Clock>) -> Result<V2State, String> {
+    let c = &config.v2;
+    let store = Store::open(&c.data_dir).map_err(|e| format!("DATA_DIR: {e}"))?;
+    let mut mock = None;
+    let mut gateway = None;
+    let sender: Arc<dyn ApnsSender> = match c.apns_mode {
+        ApnsMode::Direct => {
+            let key = c
+                .apns_key
+                .as_ref()
+                .ok_or("APNS_MODE=direct needs APNS_KEY_P8")?;
+            Arc::new(DirectApns::new(
+                key,
+                c.apns_topic.clone(),
+                c.apns_production_url.clone(),
+                c.apns_sandbox_url.clone(),
+                clock.clone(),
+            )?)
+        }
+        ApnsMode::Mock => {
+            let m = Arc::new(MockApns::new());
+            mock = Some(m.clone());
+            m
+        }
+        ApnsMode::Gateway => {
+            let g = Arc::new(GatewayApns::new(c.gateway_url.clone(), clock.clone())?);
+            gateway = Some(g.clone());
+            g
+        }
+    };
+    Ok(V2State {
+        store,
+        hub: Hub::new(),
+        limits: V2Limits::new(c),
+        sender,
+        mock,
+        gateway,
+        licence: Box::new(OpenRegistration {
+            open: c.hosted_open_registration,
+        }),
+        ws_ping: c.ws_ping,
+    })
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route(NOTIFY_PATH, post(notify).fallback(not_found))
+        .route(
+            NOTIFY_PATH,
+            post(notify)
+                .fallback(not_found)
+                .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES)),
+        )
         .route("/healthz", get(healthz).fallback(not_found))
+        .merge(v2::routes(state.mode, state.v2.mock.is_some()))
         .fallback(not_found)
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+                .layer(RequestBodyLimitLayer::new(v2::MAX_BODY_BYTES))
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::REQUEST_TIMEOUT,
                     REQUEST_TIMEOUT,
@@ -109,11 +224,11 @@ async fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not_found")
 }
 
-fn error(status: StatusCode, code: &str) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
 
-fn invalid(detail: impl Into<String>) -> Response {
+pub(crate) fn invalid(detail: impl Into<String>) -> Response {
     let detail: String = detail.into();
     (
         StatusCode::BAD_REQUEST,
@@ -122,7 +237,7 @@ fn invalid(detail: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn too_many(RetryAfter(secs): RetryAfter) -> Response {
+pub(crate) fn too_many(RetryAfter(secs): RetryAfter) -> Response {
     let mut r = error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
         r.headers_mut().insert(header::RETRY_AFTER, v);
@@ -244,33 +359,18 @@ async fn handle_notify(
             "hosted_unavailable",
         );
     }
+    if !state.v1_enabled {
+        return (error(StatusCode::NOT_FOUND, "not_found"), "v1_disabled");
+    }
 
     let now = state.clock.now();
-    let key = ip_key(ip);
-
-    if let Some(secs) = state.bans.banned_for(key, now) {
-        return (too_many(RetryAfter(secs)), "banned");
-    }
-    if let Err(ra) = state.limits.check_ip(key) {
-        return (too_many(ra), "rate_limited_ip");
-    }
-    if let Err(ra) = state.limits.check_global() {
-        return (too_many(ra), "rate_limited_global");
+    if let Err(o) = precheck(state, ip, now) {
+        return o;
     }
 
     let secret = match state.auth.verify(now, "POST", NOTIFY_PATH, headers, body) {
         Ok(i) => i,
-        Err(e) => {
-            if state.bans.record_failure(key, now) {
-                tracing::warn!(client_ip = %ip, "auth failure threshold reached, IP banned");
-            }
-            tracing::debug!(client_ip = %ip, reason = e.as_str(), "auth failed");
-            // Generic body: do not tell the client which check failed.
-            return (
-                error(StatusCode::UNAUTHORIZED, "unauthorized"),
-                "unauthorized",
-            );
-        }
+        Err(e) => return state.auth_failed(ip, now, e.as_str()),
     };
 
     if let Err(ra) = state.limits.check_secret(secret) {
@@ -343,8 +443,25 @@ async fn handle_notify(
     }
 }
 
+/// Ban, per-IP and global checks, done before any authentication work.
+// The error is the finished HTTP response; it is only built on the cold path.
+#[allow(clippy::result_large_err)]
+pub(crate) fn precheck(state: &AppState, ip: IpAddr, now: u64) -> Result<(), Outcome> {
+    let key = ip_key(ip);
+    if let Some(secs) = state.bans.banned_for(key, now) {
+        return Err((too_many(RetryAfter(secs)), "banned"));
+    }
+    if let Err(ra) = state.limits.check_ip(key) {
+        return Err((too_many(ra), "rate_limited_ip"));
+    }
+    if let Err(ra) = state.limits.check_global() {
+        return Err((too_many(ra), "rate_limited_global"));
+    }
+    Ok(())
+}
+
 /// Describe a JSON error without echoing request contents.
-fn json_error(e: &serde_json::Error) -> String {
+pub(crate) fn json_error(e: &serde_json::Error) -> String {
     let msg = e.to_string();
     // serde messages for unknown/missing fields name the field, which is fine;
     // strip the " at line X column Y" suffix.

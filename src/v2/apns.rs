@@ -1,0 +1,671 @@
+//! APNs delivery: payload construction and three senders.
+//!
+//! - [`DirectApns`]: HTTP/2 to Apple with an ES256 provider token.
+//! - [`MockApns`]: records pushes in memory (tests, `APNS_MODE=mock`).
+//! - [`GatewayApns`]: forwards push jobs to a hosted gateway, signed with the
+//!   group's own `auth_key` (PROTOCOL.md, "Gateway").
+//!
+//! Never log tokens or payloads.
+
+use std::collections::HashSet;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use ring::rand::SystemRandom;
+use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::auth::{sign_v2, SIGNATURE_HEADER, TIMESTAMP_HEADER};
+use crate::config::ApnsKey;
+use crate::limits::Clock;
+
+/// APNs rejects payloads larger than this (bytes of the JSON body).
+pub const MAX_PAYLOAD_BYTES: usize = 4096;
+/// Apple accepts provider tokens for up to 1 h and throttles refreshes more
+/// often than every 20 min.
+pub const TOKEN_REFRESH_SECS: u64 = 50 * 60;
+pub const GROUP_HEADER: &str = "x-mc-group";
+pub const DEVICE_HEADER: &str = "x-mc-device";
+pub const GATEWAY_PUSH_PATH: &str = "/v2/gateway/push";
+pub const GROUPS_PATH: &str = "/v2/groups";
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApnsEnv {
+    Sandbox,
+    Production,
+}
+
+impl ApnsEnv {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApnsEnv::Sandbox => "sandbox",
+            ApnsEnv::Production => "production",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sandbox" => Some(ApnsEnv::Sandbox),
+            "production" => Some(ApnsEnv::Production),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Urgency {
+    Critical,
+    Normal,
+    Silent,
+}
+
+impl Urgency {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Urgency::Critical => "critical",
+            Urgency::Normal => "normal",
+            Urgency::Silent => "silent",
+        }
+    }
+
+    /// `apns-priority`: 10 = immediate, 5 = power-friendly.
+    pub fn priority(self) -> u8 {
+        match self {
+            Urgency::Silent => 5,
+            _ => 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageType {
+    Alert,
+    Result,
+}
+
+impl MessageType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageType::Alert => "alert",
+            MessageType::Result => "result",
+        }
+    }
+
+    pub fn category(self) -> &'static str {
+        match self {
+            MessageType::Alert => "MC_ALERT",
+            MessageType::Result => "MC_RESULT",
+        }
+    }
+
+    /// Placeholder body shown if the Notification Service Extension cannot
+    /// decrypt in time. Never contains alert data.
+    pub fn fallback_body(self) -> &'static str {
+        match self {
+            MessageType::Alert => "New alert",
+            MessageType::Result => "Command result",
+        }
+    }
+}
+
+/// The `mc` object of the APNs payload: everything the phone needs to decrypt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McEnvelope {
+    pub id: String,
+    pub t: MessageType,
+    pub s: String,
+}
+
+/// Build the APNs JSON payload (PROTOCOL.md, "APNs payload").
+pub fn build_payload(mc: &McEnvelope, urgency: Urgency) -> String {
+    let mut aps = json!({
+        "alert": { "title": "MetricCupid", "body": mc.t.fallback_body() },
+        "mutable-content": 1,
+        "category": mc.t.category(),
+        "thread-id": "mc",
+    });
+    if urgency != Urgency::Silent {
+        aps["sound"] = json!("default");
+    }
+    if urgency == Urgency::Critical {
+        aps["interruption-level"] = json!("time-sensitive");
+    }
+    json!({ "aps": aps, "mc": mc }).to_string()
+}
+
+/// One push to one device.
+#[derive(Clone)]
+pub struct PushJob {
+    pub group_id: String,
+    /// Group HMAC key; only the gateway sender uses it (to sign the job).
+    pub auth_key: [u8; 32],
+    pub device_token: String,
+    pub env: ApnsEnv,
+    pub mc: McEnvelope,
+    pub urgency: Urgency,
+    pub collapse_id: Option<String>,
+    /// Unix seconds; 0 = deliver once, do not store.
+    pub expiration: u64,
+}
+
+impl fmt::Debug for PushJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushJob")
+            .field("group_id", &self.group_id)
+            .field("env", &self.env)
+            .field("type", &self.mc.t)
+            .field("urgency", &self.urgency)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushError {
+    /// The token is no longer valid (410, or 400 BadDeviceToken): forget it.
+    Unregistered,
+    /// APNs (or the gateway) rejected the push.
+    Rejected { status: u16, reason: String },
+    /// Network error or timeout.
+    Transport,
+}
+
+pub trait ApnsSender: Send + Sync + 'static {
+    fn send<'a>(&'a self, job: &'a PushJob) -> BoxFuture<'a, Result<(), PushError>>;
+}
+
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("metriccupid-push/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("cannot build HTTP client: {e}"))
+}
+
+#[derive(Deserialize)]
+struct ApnsErrorBody {
+    reason: String,
+}
+
+// ---------------------------------------------------------------- direct ---
+
+pub struct DirectApns {
+    http: reqwest::Client,
+    key: EcdsaKeyPair,
+    rng: SystemRandom,
+    key_id: String,
+    team_id: String,
+    topic: String,
+    production_url: String,
+    sandbox_url: String,
+    clock: Arc<dyn Clock>,
+    token: Mutex<Option<(u64, String)>>,
+}
+
+/// Decode a PEM block (e.g. an Apple `.p8` file) to DER.
+pub fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+        .collect();
+    STANDARD
+        .decode(body)
+        .map_err(|_| "APNS_KEY_P8 is not valid PEM".to_string())
+}
+
+impl DirectApns {
+    pub fn new(
+        key: &ApnsKey,
+        topic: String,
+        production_url: String,
+        sandbox_url: String,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, String> {
+        let rng = SystemRandom::new();
+        let der = pem_to_der(&key.pem)?;
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &der, &rng)
+            .map_err(|_| "APNS_KEY_P8 is not a PKCS#8 P-256 private key".to_string())?;
+        let http = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .http2_keep_alive_interval(Duration::from_secs(60))
+            .http2_keep_alive_while_idle(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("metriccupid-push/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| format!("cannot build HTTP/2 client: {e}"))?;
+        Ok(Self {
+            http,
+            key: pair,
+            rng,
+            key_id: key.key_id.clone(),
+            team_id: key.team_id.clone(),
+            topic,
+            production_url,
+            sandbox_url,
+            clock,
+            token: Mutex::new(None),
+        })
+    }
+
+    /// ES256 provider JWT: `{"alg":"ES256","kid":KEY_ID}.{"iss":TEAM_ID,"iat":now}`.
+    pub fn make_jwt(&self, iat: u64) -> Result<String, PushError> {
+        let header = URL_SAFE_NO_PAD.encode(
+            json!({ "alg": "ES256", "kid": self.key_id })
+                .to_string()
+                .as_bytes(),
+        );
+        let claims = URL_SAFE_NO_PAD.encode(
+            json!({ "iss": self.team_id, "iat": iat })
+                .to_string()
+                .as_bytes(),
+        );
+        let signing_input = format!("{header}.{claims}");
+        let sig = self
+            .key
+            .sign(&self.rng, signing_input.as_bytes())
+            .map_err(|_| PushError::Transport)?;
+        Ok(format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(sig.as_ref())
+        ))
+    }
+
+    /// The cached provider token, refreshed every [`TOKEN_REFRESH_SECS`].
+    pub fn provider_token(&self) -> Result<String, PushError> {
+        let now = self.clock.now();
+        let mut cached = self.token.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((iat, t)) = cached.as_ref() {
+            if now.saturating_sub(*iat) < TOKEN_REFRESH_SECS && *iat <= now {
+                return Ok(t.clone());
+            }
+        }
+        let t = self.make_jwt(now)?;
+        *cached = Some((now, t.clone()));
+        Ok(t)
+    }
+
+    fn invalidate_token(&self) {
+        *self.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    async fn send_inner(&self, job: &PushJob) -> Result<(), PushError> {
+        let base = match job.env {
+            ApnsEnv::Production => &self.production_url,
+            ApnsEnv::Sandbox => &self.sandbox_url,
+        };
+        let token = self.provider_token()?;
+        let mut req = self
+            .http
+            .post(format!("{base}/3/device/{}", job.device_token))
+            .header("authorization", format!("bearer {token}"))
+            .header("apns-topic", &self.topic)
+            .header("apns-push-type", "alert")
+            .header("apns-priority", job.urgency.priority().to_string())
+            .header("apns-expiration", job.expiration.to_string())
+            .header("content-type", "application/json")
+            .body(build_payload(&job.mc, job.urgency));
+        if let Some(c) = &job.collapse_id {
+            req = req.header("apns-collapse-id", c);
+        }
+        let resp = req.send().await.map_err(|_| PushError::Transport)?;
+        let status = resp.status().as_u16();
+        if status == 200 {
+            return Ok(());
+        }
+        let reason = resp
+            .bytes()
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<ApnsErrorBody>(&b).ok())
+            .map(|b| b.reason)
+            .unwrap_or_default();
+        if status == 410 || (status == 400 && reason == "BadDeviceToken") {
+            return Err(PushError::Unregistered);
+        }
+        if status == 403 && reason == "ExpiredProviderToken" {
+            self.invalidate_token();
+        }
+        Err(PushError::Rejected { status, reason })
+    }
+}
+
+impl ApnsSender for DirectApns {
+    fn send<'a>(&'a self, job: &'a PushJob) -> BoxFuture<'a, Result<(), PushError>> {
+        Box::pin(self.send_inner(job))
+    }
+}
+
+// ------------------------------------------------------------------ mock ---
+
+/// A push recorded by [`MockApns`].
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordedPush {
+    pub group_id: String,
+    pub device_token: String,
+    pub env: ApnsEnv,
+    pub priority: u8,
+    pub push_type: &'static str,
+    pub collapse_id: Option<String>,
+    pub expiration: u64,
+    pub payload: Value,
+    /// `sent` or `unregistered`.
+    pub outcome: &'static str,
+}
+
+/// Keeps at most this many recorded pushes (oldest dropped).
+pub const MOCK_CAP: usize = 1000;
+
+#[derive(Default)]
+pub struct MockApns {
+    pushes: Mutex<Vec<RecordedPush>>,
+    unregistered: Mutex<HashSet<String>>,
+}
+
+impl MockApns {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make every later push to `token` fail like APNs 410 Unregistered.
+    pub fn mark_unregistered(&self, token: &str) {
+        self.unregistered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(token.to_ascii_lowercase());
+    }
+
+    pub fn pushes(&self) -> Vec<RecordedPush> {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn clear(&self) {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+impl ApnsSender for MockApns {
+    fn send<'a>(&'a self, job: &'a PushJob) -> BoxFuture<'a, Result<(), PushError>> {
+        Box::pin(async move {
+            let gone = self
+                .unregistered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&job.device_token);
+            let payload: Value =
+                serde_json::from_str(&build_payload(&job.mc, job.urgency)).unwrap_or(Value::Null);
+            let mut pushes = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
+            if pushes.len() >= MOCK_CAP {
+                pushes.remove(0);
+            }
+            pushes.push(RecordedPush {
+                group_id: job.group_id.clone(),
+                device_token: job.device_token.clone(),
+                env: job.env,
+                priority: job.urgency.priority(),
+                push_type: "alert",
+                collapse_id: job.collapse_id.clone(),
+                expiration: job.expiration,
+                payload,
+                outcome: if gone { "unregistered" } else { "sent" },
+            });
+            if gone {
+                Err(PushError::Unregistered)
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+// --------------------------------------------------------------- gateway ---
+
+/// Body of `POST /v2/gateway/push`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayPush {
+    pub device_token: String,
+    pub env: ApnsEnv,
+    pub message: McEnvelope,
+    pub urgency: Urgency,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapse_id: Option<String>,
+    pub expiration: u64,
+}
+
+/// Outcome of forwarding a group registration to the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayRegistration {
+    /// 200 or 201.
+    Ok,
+    /// Any other HTTP status from the gateway.
+    Status(u16),
+    Transport,
+}
+
+pub struct GatewayApns {
+    http: reqwest::Client,
+    base_url: String,
+    clock: Arc<dyn Clock>,
+}
+
+impl GatewayApns {
+    pub fn new(base_url: String, clock: Arc<dyn Clock>) -> Result<Self, String> {
+        Ok(Self {
+            http: http_client()?,
+            base_url,
+            clock,
+        })
+    }
+
+    /// Register the group (`group_id` + `auth_key`) with the gateway so it
+    /// accepts our signed push jobs.
+    pub async fn register_group(&self, body: &Value) -> GatewayRegistration {
+        let resp = self
+            .http
+            .post(format!("{}{GROUPS_PATH}", self.base_url))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await;
+        match resp {
+            Ok(r) if matches!(r.status().as_u16(), 200 | 201) => GatewayRegistration::Ok,
+            Ok(r) => GatewayRegistration::Status(r.status().as_u16()),
+            Err(_) => GatewayRegistration::Transport,
+        }
+    }
+
+    async fn send_inner(&self, job: &PushJob) -> Result<(), PushError> {
+        let body = serde_json::to_string(&GatewayPush {
+            device_token: job.device_token.clone(),
+            env: job.env,
+            message: job.mc.clone(),
+            urgency: job.urgency,
+            collapse_id: job.collapse_id.clone(),
+            expiration: job.expiration,
+        })
+        .map_err(|_| PushError::Transport)?;
+        let ts = self.clock.now().to_string();
+        // Server-to-server: no device, so the device line is empty.
+        let sig = sign_v2(
+            &job.auth_key,
+            &ts,
+            "POST",
+            GATEWAY_PUSH_PATH,
+            &job.group_id,
+            "",
+            body.as_bytes(),
+        );
+        let resp = self
+            .http
+            .post(format!("{}{GATEWAY_PUSH_PATH}", self.base_url))
+            .header("content-type", "application/json")
+            .header(TIMESTAMP_HEADER, ts)
+            .header(SIGNATURE_HEADER, sig)
+            .header(GROUP_HEADER, &job.group_id)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| PushError::Transport)?;
+        match resp.status().as_u16() {
+            200 => Ok(()),
+            410 => Err(PushError::Unregistered),
+            status => Err(PushError::Rejected {
+                status,
+                reason: "gateway".into(),
+            }),
+        }
+    }
+}
+
+impl ApnsSender for GatewayApns {
+    fn send<'a>(&'a self, job: &'a PushJob) -> BoxFuture<'a, Result<(), PushError>> {
+        Box::pin(self.send_inner(job))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mc(t: MessageType) -> McEnvelope {
+        McEnvelope {
+            id: "m1".into(),
+            t,
+            s: "c2VhbGVk".into(),
+        }
+    }
+
+    #[test]
+    fn payload_shape_alert_critical() {
+        let p: Value =
+            serde_json::from_str(&build_payload(&mc(MessageType::Alert), Urgency::Critical))
+                .unwrap();
+        assert_eq!(
+            p,
+            json!({
+                "aps": {
+                    "alert": {"title": "MetricCupid", "body": "New alert"},
+                    "mutable-content": 1,
+                    "category": "MC_ALERT",
+                    "sound": "default",
+                    "interruption-level": "time-sensitive",
+                    "thread-id": "mc"
+                },
+                "mc": {"id": "m1", "t": "alert", "s": "c2VhbGVk"}
+            })
+        );
+    }
+
+    #[test]
+    fn payload_shape_result_silent() {
+        let p: Value =
+            serde_json::from_str(&build_payload(&mc(MessageType::Result), Urgency::Silent))
+                .unwrap();
+        assert_eq!(p["aps"]["category"], "MC_RESULT");
+        assert!(p["aps"].get("sound").is_none());
+        assert!(p["aps"].get("interruption-level").is_none());
+        assert_eq!(Urgency::Silent.priority(), 5);
+        assert_eq!(Urgency::Normal.priority(), 10);
+    }
+
+    struct FixedClock(u64);
+    impl Clock for FixedClock {
+        fn now(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// A throwaway P-256 key generated with
+    /// `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`.
+    pub const TEST_P8: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgK3+wXOj+qYgmDXHT
+dXDtSfYRru5XrivdGSaIelKtBIihRANCAATny1mZsG6/AJ9r8YVdLlKrMJ4CpQzB
+qH5wknmWfGBuaGI8bgJl7LXE1/fX2hgWgqlvm8qTWphAY+IOe7CMedwq
+-----END PRIVATE KEY-----";
+
+    fn direct() -> DirectApns {
+        DirectApns::new(
+            &ApnsKey {
+                pem: TEST_P8.into(),
+                key_id: "ABCDE12345".into(),
+                team_id: "TEAM123456".into(),
+            },
+            "cat.sysop.MetricCupid".into(),
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn jwt_is_es256_and_verifies() {
+        let d = direct();
+        let jwt = d.make_jwt(1_700_000_000).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let header: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header, json!({"alg": "ES256", "kid": "ABCDE12345"}));
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(
+            claims,
+            json!({"iss": "TEAM123456", "iat": 1_700_000_000u64})
+        );
+        let sig = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        assert_eq!(sig.len(), 64, "JWS ES256 is raw r||s");
+        use ring::signature::{KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+        let pk = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, d.key.public_key().as_ref());
+        pk.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_token_is_cached() {
+        let d = direct();
+        let a = d.provider_token().unwrap();
+        assert_eq!(a, d.provider_token().unwrap());
+        d.invalidate_token();
+        // ECDSA signatures are randomized, so a fresh token differs.
+        assert_ne!(a, d.provider_token().unwrap());
+    }
+
+    #[test]
+    fn bad_key_rejected() {
+        let r = DirectApns::new(
+            &ApnsKey {
+                pem: "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----".into(),
+                key_id: "ABCDE12345".into(),
+                team_id: "TEAM123456".into(),
+            },
+            "t".into(),
+            "http://x".into(),
+            "http://x".into(),
+            Arc::new(FixedClock(0)),
+        );
+        assert!(r.is_err());
+    }
+}
