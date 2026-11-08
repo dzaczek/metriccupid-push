@@ -267,7 +267,7 @@ See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
 ## MetricCupid setup
 
-In MetricCupid (DevOps mode): **Settings -> Notifications & Popups -> Pushover -> Relay**.
+Requires MetricCupid 1.30.0 or later. In MetricCupid: **Settings -> Notifications & Popups -> Pushover -> Delivery: Via relay server**.
 
 - **Relay URL**: e.g. `https://push.example.com` (the app appends `/v1/notify`).
 - **Secret**: one of the values in `RELAY_SECRETS`. It is stored in the macOS Keychain.
