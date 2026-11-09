@@ -51,6 +51,21 @@ pub fn spawn_presence(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// How often coalesced Live Activity states are flushed.
+pub const ACTIVITY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Spawn the task that sends coalesced Live Activity updates.
+pub fn spawn_activities(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(ACTIVITY_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            v2::activity_tick(&state).await;
+        }
+    })
+}
+
 /// Serve the API on `listener` until `shutdown` resolves.
 pub async fn serve(
     listener: TcpListener,

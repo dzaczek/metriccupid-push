@@ -71,6 +71,19 @@ CREATE INDEX commands_created ON commands(created_at);
     r#"
 ALTER TABLE devices ADD COLUMN last_seen INTEGER;
 "#,
+    r#"
+CREATE TABLE activity_tokens (
+    group_id   TEXT NOT NULL,
+    device_id  TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    push_token TEXT NOT NULL,
+    apns_env   TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, device_id, kind),
+    FOREIGN KEY (group_id, device_id) REFERENCES devices(group_id, device_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+"#,
 ];
 
 #[derive(Debug)]
@@ -99,6 +112,18 @@ pub struct Device {
     pub updated_at: u64,
     /// Macs: last time the server heard from its stream (Unix seconds).
     pub last_seen: Option<u64>,
+}
+
+/// A Live Activity push token of a phone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityToken {
+    pub device_id: String,
+    /// `update` (one running activity) or `start` (push-to-start).
+    pub kind: String,
+    pub push_token: String,
+    pub apns_env: String,
+    /// When the activity started (`update`) or the token was registered (`start`).
+    pub started_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +437,14 @@ pub fn insert_message(
         "DELETE FROM messages WHERE group_id = ?1 AND msg_id = ?2",
         [group_id, &m.id],
     )?;
+    // Only the newest summary matters: older ones would push alerts out of
+    // the mailbox.
+    if m.kind == "summary" {
+        tx.execute(
+            "DELETE FROM messages WHERE group_id = ?1 AND type = 'summary'",
+            [group_id],
+        )?;
+    }
     let seq = next_seq(&tx, group_id, "next_msg_seq")?;
     tx.execute(
         "INSERT INTO messages (group_id, seq, msg_id, type, sealed, urgency, collapse_id, created_at)
@@ -548,6 +581,97 @@ pub fn ack_command(c: &mut Connection, group_id: &str, cursor: u64) -> Result<bo
     )? > 0)
 }
 
+/// Register or replace a phone's activity token (`kind` = `update` or `start`).
+/// Returns true if it was new.
+#[allow(clippy::too_many_arguments)]
+pub fn put_activity_token(
+    c: &mut Connection,
+    group_id: &str,
+    device_id: &str,
+    kind: &str,
+    token: &str,
+    env: &str,
+    started_at: u64,
+    now: u64,
+) -> Result<bool, StoreError> {
+    let n = c.execute(
+        "INSERT INTO activity_tokens (group_id, device_id, kind, push_token, apns_env, started_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (group_id, device_id, kind) DO NOTHING",
+        params![group_id, device_id, kind, token, env, started_at as i64, now as i64],
+    )?;
+    if n == 0 {
+        c.execute(
+            "UPDATE activity_tokens SET push_token = ?4, apns_env = ?5, started_at = ?6, updated_at = ?7
+             WHERE group_id = ?1 AND device_id = ?2 AND kind = ?3",
+            params![group_id, device_id, kind, token, env, started_at as i64, now as i64],
+        )?;
+    }
+    Ok(n > 0)
+}
+
+pub fn delete_activity_token(
+    c: &mut Connection,
+    group_id: &str,
+    device_id: &str,
+    kind: &str,
+) -> Result<bool, StoreError> {
+    Ok(c.execute(
+        "DELETE FROM activity_tokens WHERE group_id = ?1 AND device_id = ?2 AND kind = ?3",
+        [group_id, device_id, kind],
+    )? > 0)
+}
+
+/// Forget a token APNs refused, unless it was replaced meanwhile.
+pub fn clear_activity_token(
+    c: &mut Connection,
+    group_id: &str,
+    device_id: &str,
+    kind: &str,
+    token: &str,
+) -> Result<bool, StoreError> {
+    Ok(c.execute(
+        "DELETE FROM activity_tokens WHERE group_id = ?1 AND device_id = ?2 AND kind = ?3 AND push_token = ?4",
+        [group_id, device_id, kind, token],
+    )? > 0)
+}
+
+/// Drop every `update` token of the group (after an `end`), or only those
+/// whose activity started at or before `started_before` (ended by iOS).
+pub fn delete_update_tokens(
+    c: &mut Connection,
+    group_id: &str,
+    started_before: Option<u64>,
+) -> Result<usize, StoreError> {
+    let cut = started_before.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64);
+    Ok(c.execute(
+        "DELETE FROM activity_tokens WHERE group_id = ?1 AND kind = 'update' AND started_at <= ?2",
+        params![group_id, cut],
+    )?)
+}
+
+/// Activity tokens of the group's phones.
+pub fn activity_tokens(
+    c: &mut Connection,
+    group_id: &str,
+) -> Result<Vec<ActivityToken>, StoreError> {
+    let mut st = c.prepare(
+        "SELECT a.device_id, a.kind, a.push_token, a.apns_env, a.started_at
+         FROM activity_tokens a JOIN devices d ON d.group_id = a.group_id AND d.device_id = a.device_id
+         WHERE a.group_id = ?1 AND d.kind = 'ios' ORDER BY a.device_id, a.kind",
+    )?;
+    let rows = st.query_map([group_id], |r| {
+        Ok(ActivityToken {
+            device_id: r.get(0)?,
+            kind: r.get(1)?,
+            push_token: r.get(2)?,
+            apns_env: r.get(3)?,
+            started_at: ts(r.get(4)?),
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Delete expired messages and commands; returns (messages, commands) removed.
 pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreError> {
     let m = c.execute(
@@ -664,6 +788,54 @@ mod tests {
             insert_command(&mut c, "g", "x", "AAAA", 10).unwrap(),
             Insert::Stored(201)
         );
+    }
+
+    #[test]
+    fn activity_tokens_replace_cascade_and_summaries_keep_newest() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        let phone = Device {
+            device_id: "p".into(),
+            kind: "ios".into(),
+            name: "iPhone".into(),
+            apns_token: None,
+            apns_env: "sandbox".into(),
+            created_at: 0,
+            updated_at: 0,
+            last_seen: None,
+        };
+        upsert_device(&mut c, "g", &phone, 1).unwrap();
+        assert!(put_activity_token(&mut c, "g", "p", "update", "aa", "sandbox", 5, 5).unwrap());
+        assert!(!put_activity_token(&mut c, "g", "p", "update", "bb", "sandbox", 6, 6).unwrap());
+        assert!(put_activity_token(&mut c, "g", "p", "start", "cc", "sandbox", 6, 6).unwrap());
+        let t = activity_tokens(&mut c, "g").unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            (
+                t[1].kind.as_str(),
+                t[1].push_token.as_str(),
+                t[1].started_at
+            ),
+            ("update", "bb", 6)
+        );
+        assert!(
+            !clear_activity_token(&mut c, "g", "p", "update", "aa").unwrap(),
+            "replaced"
+        );
+        assert_eq!(delete_update_tokens(&mut c, "g", Some(5)).unwrap(), 0);
+        assert_eq!(delete_update_tokens(&mut c, "g", Some(6)).unwrap(), 1);
+        delete_device(&mut c, "g", "p").unwrap();
+        assert!(activity_tokens(&mut c, "g").unwrap().is_empty(), "cascade");
+
+        let mut m = msg("s1");
+        m.kind = "summary".into();
+        insert_message(&mut c, "g", &m, 10).unwrap();
+        insert_message(&mut c, "g", &msg("a1"), 10).unwrap();
+        m.id = "s2".into();
+        insert_message(&mut c, "g", &m, 11).unwrap();
+        let (rows, _) = messages_since(&mut c, "g", 0, 11).unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a1", "s2"]);
     }
 
     #[test]

@@ -15,6 +15,8 @@ ciphertext:
 Mac --POST /v2/messages (sealed alert)--> server --APNs (sealed)--> iPhone NSE decrypts, shows alert
 iPhone action --POST /v2/commands (sealed)--> server --WebSocket--> Mac executes on Icinga/Alertmanager
 Mac --POST /v2/messages (sealed result, same collapse id)--> server --APNs--> iPhone replaces the alert
+Mac --POST /v2/messages (sealed summary)--> server mailbox --> iPhone app / widget read it when they run
+Mac --POST /v2/activity-state (plaintext counts)--> server --APNs liveactivity--> Dynamic Island / Lock Screen
 ```
 
 - The group secret never leaves the user's devices (synced with iCloud Keychain). The server stores
@@ -118,7 +120,8 @@ let plaintext = try ChaChaPoly.open(box, using: encKey, authenticating: Data(aad
 AAD = "{group_id}|{type}|{id}"      (UTF-8, no trailing newline)
 ```
 
-`type` is `alert`, `result` or `command`; `id` is the message or command id sent next to `sealed`.
+`type` is `alert`, `result`, `summary` or `command`; `id` is the message or command id sent next to
+`sealed`.
 This binds a ciphertext to its group, type and id: the server cannot move a box to another group,
 replay it under another id, or turn a result into an alert.
 
@@ -164,6 +167,17 @@ UTF-8 JSON object. Common fields:
 | `alert_id` | string | |
 | `ok` | bool | |
 | `message` | string | human-readable outcome, at most 256 characters |
+
+`summary` (Mac to phones): the alerts that are active on the Mac right now, for the phone's widget.
+
+| Field | Type | Rule |
+|---|---|---|
+| `critical`, `warning`, `unknown`, `info` | int | active (not muted) alerts per severity, after the Mac's source filters; `info` optional |
+| `top` | array, at most 5 | newest active alerts, worst severity first: `{"alert_id", "severity", "host", "service" (optional), "title"}` |
+
+The Mac sends a summary when the counts or `top` change (debounced, about 5 s) and every 15 min while
+anything is active. Only the Mac that runs iPhone actions sends summaries. Receivers keep only the
+summary with the highest `ts`.
 
 Receivers MUST ignore unknown fields. Senders SHOULD encode compact JSON.
 
@@ -326,7 +340,7 @@ the pushes that tell the phones about changes.
 
 | Field | Rule |
 |---|---|
-| `type` | `alert` or `result` |
+| `type` | `alert`, `result` or `summary` |
 | `sealed` | section 4; at least 28 bytes decoded |
 | `collapse_id` | optional, section 4.5 |
 | `urgency` | `critical`, `normal` or `silent`; plaintext metadata (section 10) |
@@ -343,6 +357,10 @@ A repeated `id` (within 24 h) returns `200 {"status":"duplicate","cursor":42}` w
 `413 payload_too_large` if the APNs payload would exceed 4096 bytes (nothing is stored),
 `429 rate_limited` above the per-group limit (default 2/s, burst 60). Tokens APNs reports as invalid
 are removed (`unregistered`).
+
+A `summary` is stored but **never pushed** (`pushed: 0`): a visible notification per summary would be
+noise, and silent background pushes are throttled by iOS. The server keeps only the group's newest
+summary in the mailbox (storing one deletes the older ones), so summaries never push alerts out of it.
 
 APNs payload (built by the server, identical for direct and gateway delivery):
 
@@ -414,9 +432,94 @@ result.
 ### 6.9 Other routes
 
 - `GET /healthz`: `200 ok`.
+- Live Activity routes: section 6.10.
 - `GET /v2/debug/pushes`: only with `APNS_MODE=mock`; the recorded pushes. Unauthenticated, for local
   development only.
 - `POST /v2/gateway/push`: only with `MODE=hosted`, section 9.
+
+### 6.10 Live Activity (Dynamic Island and Lock Screen)
+
+The iPhone can show the group's alert counts in a Live Activity (`ActivityKit`, attributes type
+`AlertsActivityAttributes`). iOS applies a Live Activity push itself: the Notification Service
+Extension does not run, so **its content travels in plaintext** through the server and APNs. By
+default it carries counts only. The Mac setting "Show host names on the lock screen (sent
+unencrypted)", off by default, adds up to 4 short lines of host / service text (section 10).
+
+#### `PUT /v2/activities/{device_id}` and `PUT /v2/activities/{device_id}/start-token` (phone)
+
+`X-MC-Device` MUST equal `{device_id}`; phones only (`403 wrong_device_kind` otherwise).
+
+```json
+{"push_token": "<hex>", "apns_env": "sandbox", "started_at": 1700000000}
+```
+
+| Field | Rule |
+|---|---|
+| `push_token` | 64..=512 hex characters (stored lower case) |
+| `apns_env` | `sandbox` or `production`; default `production` |
+| `started_at` | optional, Unix seconds the activity started; default now, clamped to the last 8 h |
+
+`/v2/activities/{device_id}` registers the push token of the phone's running activity
+(`Activity.pushTokenUpdates`); a new token replaces the old one. `/start-token` registers the
+push-to-start token (iOS 17.2+, `Activity.pushToStartTokenUpdates`). `201 {"status":"created"}`,
+`200 {"status":"updated"}`. `DELETE` on either path removes the token: `204`, or `404 not_found`.
+Phones MUST delete both when the user turns the activity off. Deleting the device removes them too.
+
+#### `POST /v2/activity-state` (Mac)
+
+```json
+{"event": "update", "stale_secs": 2400,
+ "state": {"critical": 2, "warning": 5, "unknown": 0, "mac_online": true,
+           "lines": [{"severity": "critical", "text": "web01 · disk"}]}}
+```
+
+| Field | Rule |
+|---|---|
+| `event` | `update` or `end` |
+| `state.critical`, `.warning`, `.unknown` | 0..=100000 |
+| `state.mac_online` | optional, default `true` |
+| `state.lines` | optional, at most 4 of `{"severity": "critical"/"warning"/"unknown"/"info", "text": 1..=40 characters, no control characters}`; only with the host names setting |
+| `stale_secs` | optional, 60..=43200: `stale-date` = send time + `stale_secs` |
+
+The server keeps the latest state per group (in memory) and pushes at most one Live Activity update
+per group every 5 s: a state that arrives sooner is coalesced, and only the newest one is sent when
+the 5 s have passed. `end` is never delayed. Answers: `200 {"status":"sent","pushed":1,"started":0,
+"failed":0,"unregistered":0}` or `200 {"status":"coalesced","send_in":4}`; `429 rate_limited` above
+one request per 5 s per group (burst 10). The Mac SHOULD send a state when the counts or lines change
+(debounced, about 5 s), every 15 min while anything is active, and `end` when the user turns Phone &
+Watch off. Only the Mac that runs iPhone actions sends states.
+
+Push targets:
+
+- `update` and `end` go to every registered activity token whose activity started less than 8 h
+  ago (iOS ends activities after 8 h; older tokens are deleted). After an `end` the server deletes
+  the group's activity tokens.
+- With an `update` whose `critical` is above 0, a phone with a start token and no running activity
+  gets an `event: "start"` push (push-to-start), at most once per 8 h per phone (the started
+  activity may not get to register its token).
+- When the Mac goes offline or comes back (section 7a), the latest state is sent again with
+  `mac_online` false / true.
+
+APNs request: `apns-push-type: liveactivity`, `apns-topic` = `APNS_TOPIC` +
+`.push-type.liveactivity`, `apns-priority: 10` when the critical count went up since the last push
+and for `start` and `end`, else `5`; `apns-expiration` = now + 1 h; no collapse id. Payload:
+
+```json
+{"aps": {"timestamp": 1700000005, "event": "update", "relevance-score": 100,
+         "stale-date": 1700002405,
+         "content-state": {"critical": 2, "warning": 5, "unknown": 0, "mac_online": true,
+                           "updated_at": 1700000003,
+                           "lines": [{"severity": "critical", "text": "web01 · disk"}]}}}
+```
+
+- `timestamp`: send time, strictly increasing per group (ActivityKit drops older pushes).
+- `content-state.updated_at`: when the server received the state from the Mac; `lines` is omitted
+  when empty. Swift: `ContentState` with snake_case `CodingKeys` and `updated_at` as Unix seconds
+  (not `Date`, whose default `Codable` form is seconds since 2001).
+- `relevance-score`: 100 if anything is critical, 50 if anything is a warning, else 10.
+- `end` adds `"dismissal-date": <now>` and has no `stale-date`.
+- `start` adds `"attributes-type": "AlertsActivityAttributes"`, `"attributes": {}` and
+  `"alert": {"title": "MetricCupid", "body": "2 critical alerts"}` (fixed text, counts only).
 
 ## 7. Stream: `GET /v2/stream` (Mac)
 
@@ -494,6 +597,9 @@ Extension is not invoked for them; if it is, it MUST pass a payload without `mc`
 Phones SHOULD store the `mc_presence` state when they receive one (e.g. in the app group, for the
 status header) and MUST NOT require them: `GET /v2/status` is the source of truth.
 
+The same two moments also re-send the group's latest Live Activity state with `mac_online: false` /
+`true` (section 6.10), with the usual 5 s coalescing.
+
 ## 8. Delivery semantics summary
 
 | Path | Guarantee |
@@ -523,12 +629,17 @@ X-MC-Timestamp, X-MC-Signature, X-MC-Group      (no X-MC-Device; device_id line 
 ```
 
 A presence notice (section 7a) carries `"presence": {"state": "offline", "reason": "lost", "since":
-1700000000}` instead of `message`; exactly one of the two is required (`400` otherwise).
+1700000000}` instead of `message`. A Live Activity push (section 6.10) carries `"activity": {"event":
+"update", "timestamp": 1700000005, "state": {<content-state>}, "stale_date": 1700002405,
+"dismissal_date": <optional>}` with `device_token` = the activity token; the gateway validates the
+state like `POST /v2/activity-state` (and its times within 24 h of now) and maps `urgency: "critical"`
+to priority 10, anything else to 5. Exactly one of `message`, `presence` and `activity` is required
+(`400` otherwise); a `message` with `t: "summary"` is refused (summaries are never pushed).
 `expiration` is 0 or at most 24 h ahead. The gateway builds the APNs payload itself from `message`
 and `urgency` (section 6.5) or from `presence` (fixed texts, section 7a), so it cannot be used to
 send arbitrary notification text, and sends it with its own key. A gateway older than this version
-rejects `presence` (`400`): the self-hosted server then logs the failure and the phones get no
-presence push (`GET /v2/status` still works). Answers: `200 {"status":"sent"}`, `410 {"error":"unregistered"}` (the self-hosted
+rejects `presence` or `activity` (`400`): the self-hosted server then logs the failure and the phones
+get no presence push (`GET /v2/status` still works) or no Live Activity update. Answers: `200 {"status":"sent"}`, `410 {"error":"unregistered"}` (the self-hosted
 server removes the token), `502 upstream_error`, `400`, `401`, `413`, `429` (per group, default
 5/s, burst 50).
 
@@ -549,6 +660,10 @@ nothing but the group registration.
 | `urgency` (critical / normal / silent) and message `type` | yes: a documented leak needed for APNs priority, sound and category |
 | Client IP addresses | yes (logged with the group id) |
 | Whether and when each Mac is connected (`last_seen`), and why it disconnected (`bye` reason) | yes: the server uses it for presence pushes (section 7a), which are plaintext but contain nothing else |
+| `summary` contents | no (ciphertext; only that one was sent, and when) |
+| Live Activity state: counts of critical / warning / unknown alerts and their changes over time | **yes, plaintext** (section 6.10): ActivityKit applies it without the extension, so it cannot be encrypted. Also visible to APNs (Apple). |
+| Live Activity lines (severity + host / service, up to 4 × 40 characters) | **yes, plaintext**, only if the user turns on "Show host names on the lock screen (sent unencrypted)" on the Mac (off by default) |
+| Live Activity push tokens and start tokens, when each activity started | yes |
 
 A server operator, or anyone who obtains `auth_key`, can delete or withhold messages and inject
 garbage that receivers drop, but cannot read or forge content.
@@ -566,6 +681,9 @@ garbage that receivers drop, but cannot read or forge content.
 | Messages per group | 2/s, burst 60 | `RATE_V2_MESSAGES_*` |
 | Commands per group | 1/s, burst 20 | `RATE_V2_COMMANDS_*` |
 | Gateway pushes per group | 5/s, burst 50 | `RATE_V2_GATEWAY_*` |
+| `POST /v2/activity-state` per group | 1 per 5 s, burst 10 | no |
+| Live Activity pushes per group | at most 1 per 5 s (coalesced; `end` immediate) | no |
+| Push-to-start per phone | 1 per 8 h | no |
 | Group registrations per IP | 6/h, burst 3 | `RATE_V2_GROUPS_*` |
 | Streams per server | 1024 | no |
 | Mac offline grace (lost stream, no `bye`) | 120 s | `MAC_OFFLINE_GRACE_SECS` |

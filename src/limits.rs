@@ -255,7 +255,16 @@ pub struct V2Limits {
     messages: DefaultKeyedRateLimiter<String>,
     commands: DefaultKeyedRateLimiter<String>,
     gateway: DefaultKeyedRateLimiter<String>,
+    activity: DefaultKeyedRateLimiter<String>,
     groups: DefaultKeyedRateLimiter<IpAddr>,
+}
+
+/// `POST /v2/activity-state` per group: one per 5 s, burst 10 (the server
+/// coalesces on top of this; Apple budgets Live Activity updates).
+pub fn activity_quota() -> Quota {
+    Quota::with_period(Duration::from_secs(5))
+        .expect("non-zero period")
+        .allow_burst(std::num::NonZeroU32::new(10).expect("non-zero"))
 }
 
 fn hourly(r: HourlyRate) -> Quota {
@@ -268,6 +277,7 @@ impl V2Limits {
             messages: RateLimiter::keyed(quota(c.rate_messages)),
             commands: RateLimiter::keyed(quota(c.rate_commands)),
             gateway: RateLimiter::keyed(quota(c.rate_gateway)),
+            activity: RateLimiter::keyed(activity_quota()),
             groups: RateLimiter::keyed(hourly(c.rate_groups)),
         }
     }
@@ -290,12 +300,23 @@ impl V2Limits {
             .map_err(retry_after)
     }
 
+    pub fn check_activity(&self, group: &str) -> Result<(), RetryAfter> {
+        self.activity
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
     pub fn check_group_registration(&self, ip: IpAddr) -> Result<(), RetryAfter> {
         self.groups.check_key(&ip).map_err(retry_after)
     }
 
     pub fn cleanup(&self) {
-        for l in [&self.messages, &self.commands, &self.gateway] {
+        for l in [
+            &self.messages,
+            &self.commands,
+            &self.gateway,
+            &self.activity,
+        ] {
             l.retain_recent();
             l.shrink_to_fit();
         }

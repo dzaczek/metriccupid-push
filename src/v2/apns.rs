@@ -21,6 +21,7 @@ use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::activity::{build_activity_payload, ActivityNote, TOPIC_SUFFIX};
 use crate::auth::{sign_v2, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 use crate::config::ApnsKey;
 use crate::limits::Clock;
@@ -92,6 +93,8 @@ impl Urgency {
 pub enum MessageType {
     Alert,
     Result,
+    /// Counts and newest alerts for the phone's widget: mailbox only, never pushed.
+    Summary,
 }
 
 impl MessageType {
@@ -99,6 +102,7 @@ impl MessageType {
         match self {
             MessageType::Alert => "alert",
             MessageType::Result => "result",
+            MessageType::Summary => "summary",
         }
     }
 
@@ -106,6 +110,7 @@ impl MessageType {
         match self {
             MessageType::Alert => "MC_ALERT",
             MessageType::Result => "MC_RESULT",
+            MessageType::Summary => "MC_SUMMARY",
         }
     }
 
@@ -115,6 +120,7 @@ impl MessageType {
         match self {
             MessageType::Alert => "New alert",
             MessageType::Result => "Command result",
+            MessageType::Summary => "Status update",
         }
     }
 }
@@ -225,6 +231,8 @@ pub enum PushContent {
     Sealed(McEnvelope),
     /// A server-generated presence notice.
     Presence(PresenceNote),
+    /// A Live Activity update, start or end (`apns-push-type: liveactivity`).
+    Activity(ActivityNote),
 }
 
 /// One push to one device.
@@ -236,6 +244,8 @@ pub struct PushJob {
     pub device_token: String,
     pub env: ApnsEnv,
     pub content: PushContent,
+    /// Activities: `Critical` = priority 10 (critical count went up, start,
+    /// end), anything else 5.
     pub urgency: Urgency,
     pub collapse_id: Option<String>,
     /// Unix seconds; 0 = deliver once, do not store.
@@ -247,6 +257,7 @@ impl PushJob {
         match &self.content {
             PushContent::Sealed(mc) => build_payload(mc, self.urgency),
             PushContent::Presence(note) => build_presence_payload(*note),
+            PushContent::Activity(note) => build_activity_payload(note),
         }
     }
 
@@ -255,6 +266,24 @@ impl PushJob {
             PushContent::Sealed(_) => self.urgency.priority(),
             PushContent::Presence(PresenceNote::Offline { .. }) => 10,
             PushContent::Presence(PresenceNote::Online { .. }) => 5,
+            PushContent::Activity(_) if self.urgency == Urgency::Critical => 10,
+            PushContent::Activity(_) => 5,
+        }
+    }
+
+    /// `apns-push-type`.
+    pub fn push_type(&self) -> &'static str {
+        match self.content {
+            PushContent::Activity(_) => "liveactivity",
+            _ => "alert",
+        }
+    }
+
+    /// Appended to the app's bundle id for `apns-topic`.
+    pub fn topic_suffix(&self) -> &'static str {
+        match self.content {
+            PushContent::Activity(_) => TOPIC_SUFFIX,
+            _ => "",
         }
     }
 
@@ -262,6 +291,7 @@ impl PushJob {
         match &self.content {
             PushContent::Sealed(mc) => mc.t.as_str(),
             PushContent::Presence(_) => "presence",
+            PushContent::Activity(_) => "activity",
         }
     }
 }
@@ -420,8 +450,11 @@ impl DirectApns {
             .http
             .post(format!("{base}/3/device/{}", job.device_token))
             .header("authorization", format!("bearer {token}"))
-            .header("apns-topic", &self.topic)
-            .header("apns-push-type", "alert")
+            .header(
+                "apns-topic",
+                format!("{}{}", self.topic, job.topic_suffix()),
+            )
+            .header("apns-push-type", job.push_type())
             .header("apns-priority", job.priority().to_string())
             .header("apns-expiration", job.expiration.to_string())
             .header("content-type", "application/json")
@@ -467,6 +500,8 @@ pub struct RecordedPush {
     pub env: ApnsEnv,
     pub priority: u8,
     pub push_type: &'static str,
+    /// `.push-type.liveactivity` for Live Activities, else empty.
+    pub topic_suffix: &'static str,
     pub collapse_id: Option<String>,
     pub expiration: u64,
     pub payload: Value,
@@ -529,7 +564,8 @@ impl ApnsSender for MockApns {
                 device_token: job.device_token.clone(),
                 env: job.env,
                 priority: job.priority(),
-                push_type: "alert",
+                push_type: job.push_type(),
+                topic_suffix: job.topic_suffix(),
                 collapse_id: job.collapse_id.clone(),
                 expiration: job.expiration,
                 payload,
@@ -546,7 +582,8 @@ impl ApnsSender for MockApns {
 
 // --------------------------------------------------------------- gateway ---
 
-/// Body of `POST /v2/gateway/push`: exactly one of `message` or `presence`.
+/// Body of `POST /v2/gateway/push`: exactly one of `message`, `presence` or
+/// `activity`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayPush {
@@ -556,6 +593,8 @@ pub struct GatewayPush {
     pub message: Option<McEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence: Option<PresenceNote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ActivityNote>,
     pub urgency: Urgency,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapse_id: Option<String>,
@@ -605,15 +644,18 @@ impl GatewayApns {
     }
 
     async fn send_inner(&self, job: &PushJob) -> Result<(), PushError> {
-        let (message, presence) = match &job.content {
-            PushContent::Sealed(mc) => (Some(mc.clone()), None),
-            PushContent::Presence(note) => (None, Some(*note)),
-        };
+        let (mut message, mut presence, mut activity) = (None, None, None);
+        match &job.content {
+            PushContent::Sealed(mc) => message = Some(mc.clone()),
+            PushContent::Presence(note) => presence = Some(*note),
+            PushContent::Activity(note) => activity = Some(note.clone()),
+        }
         let body = serde_json::to_string(&GatewayPush {
             device_token: job.device_token.clone(),
             env: job.env,
             message,
             presence,
+            activity,
             urgency: job.urgency,
             collapse_id: job.collapse_id.clone(),
             expiration: job.expiration,

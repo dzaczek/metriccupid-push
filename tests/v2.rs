@@ -1359,3 +1359,415 @@ async fn presence_goes_through_the_gateway() {
     let r = gw.post("/v2/gateway/push", &body).await;
     assert_eq!(r.status, 400, "{:?}", r.json);
 }
+
+// ------------------------------------------------------------ live activity
+
+const ACT_A: &str =
+    "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac";
+const START_A: &str =
+    "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d";
+
+fn activity_pushes(s: &Server) -> Vec<metriccupid_push::v2::apns::RecordedPush> {
+    s.mock()
+        .pushes()
+        .into_iter()
+        .filter(|p| p.push_type == "liveactivity")
+        .collect()
+}
+
+async fn put_token(phone: &Client, suffix: &str, token: &str, started_at: Option<u64>) -> u16 {
+    let mut body = json!({"push_token": token, "apns_env": "sandbox"});
+    if let Some(t) = started_at {
+        body["started_at"] = json!(t);
+    }
+    let path = format!("/v2/activities/{}{suffix}", phone.device_id);
+    phone.send("PUT", &path, &body.to_string()).await.status
+}
+
+fn activity_state(critical: u32, warning: u32) -> Value {
+    json!({"event": "update", "state": {"critical": critical, "warning": warning, "unknown": 0}})
+}
+
+#[tokio::test]
+async fn activity_token_endpoints_auth_and_validation() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 200).await;
+    assert_eq!(put_token(&phone, "", ACT_A, None).await, 201);
+    // A byte-identical request in the same second would be a replay (5.1).
+    s.set_time(T0 + 1);
+    assert_eq!(put_token(&phone, "", ACT_A, None).await, 200, "replace");
+    assert_eq!(put_token(&phone, "/start-token", START_A, None).await, 201);
+    assert_eq!(put_token(&phone, "", "abc", None).await, 400);
+    assert_eq!(put_token(&phone, "", &"g".repeat(64), None).await, 400);
+    // Macs don't have activities; a phone registers only itself.
+    let path = format!("/v2/activities/{}", mac.device_id);
+    let body = json!({"push_token": ACT_A}).to_string();
+    assert_eq!(mac.send("PUT", &path, &body).await.status, 403);
+    assert_eq!(phone.send("PUT", &path, &body).await.status, 400);
+    let stranger = phone.as_device(&id128(209));
+    assert_eq!(put_token(&stranger, "", ACT_A, None).await, 403);
+    let mut forged = phone.clone();
+    forged.keys = derive(&[99; 32]);
+    assert_eq!(put_token(&forged, "", ACT_A, None).await, 401);
+    let unknown = json!({"push_token": ACT_A, "extra": 1}).to_string();
+    let own = format!("/v2/activities/{}", phone.device_id);
+    assert_eq!(phone.send("PUT", &own, &unknown).await.status, 400);
+
+    assert_eq!(phone.send("DELETE", &own, "").await.status, 204);
+    s.set_time(T0 + 2);
+    assert_eq!(phone.send("DELETE", &own, "").await.status, 404);
+    let start = format!("{own}/start-token");
+    assert_eq!(phone.send("DELETE", &start, "").await.status, 204);
+
+    // Deleting the device drops its activity tokens.
+    s.set_time(T0 + 3);
+    assert_eq!(put_token(&phone, "", ACT_A, None).await, 201);
+    assert_eq!(
+        mac.send("DELETE", &format!("/v2/devices/{}", phone.device_id), "")
+            .await
+            .status,
+        204
+    );
+    let g = mac.group_id.clone();
+    let left = s
+        .state
+        .v2()
+        .store
+        .call(move |c| store::activity_tokens(c, &g))
+        .await
+        .unwrap();
+    assert!(left.is_empty());
+}
+
+#[tokio::test]
+async fn activity_state_pushes_liveactivity_payload() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 210).await;
+    assert_eq!(put_token(&phone, "", ACT_A, None).await, 201);
+    let body = json!({"event": "update", "stale_secs": 2400, "state": {
+        "critical": 2, "warning": 3, "unknown": 1, "mac_online": true,
+        "lines": [{"severity": "critical", "text": "web01 · disk"}]}});
+    let r = mac.post("/v2/activity-state", &body).await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(
+        r.json,
+        json!({"status": "sent", "pushed": 1, "started": 0, "failed": 0, "unregistered": 0})
+    );
+    let pushes = activity_pushes(&s);
+    assert_eq!(pushes.len(), 1);
+    let p = &pushes[0];
+    assert_eq!(p.device_token, ACT_A);
+    assert_eq!(p.topic_suffix, ".push-type.liveactivity");
+    assert_eq!(p.priority, 10, "critical went up");
+    assert_eq!(p.expiration, T0 + 3600);
+    assert_eq!(p.collapse_id, None);
+    assert_eq!(
+        p.payload,
+        json!({"aps": {
+            "timestamp": T0, "event": "update", "relevance-score": 100, "stale-date": T0 + 2400,
+            "content-state": {"critical": 2, "warning": 3, "unknown": 1, "mac_online": true,
+                              "updated_at": T0,
+                              "lines": [{"severity": "critical", "text": "web01 · disk"}]}}})
+    );
+    // Normal alert pushes are unchanged.
+    mac.post("/v2/messages", &alert_body(&mac, "a-1", "normal", 10))
+        .await;
+    let alert = s.mock().pushes().into_iter().last().unwrap();
+    assert_eq!((alert.push_type, alert.topic_suffix), ("alert", ""));
+
+    // Only Macs post state; validation.
+    assert_eq!(
+        phone
+            .post("/v2/activity-state", &activity_state(1, 0))
+            .await
+            .status,
+        403
+    );
+    let mut bad = activity_state(1, 0);
+    bad["event"] = json!("start");
+    assert_eq!(mac.post("/v2/activity-state", &bad).await.status, 400);
+    let mut bad = activity_state(1, 0);
+    bad["state"]["lines"] = json!(vec![json!({"severity": "warning", "text": "x"}); 5]);
+    assert_eq!(mac.post("/v2/activity-state", &bad).await.status, 400);
+    let mut bad = activity_state(1, 0);
+    bad["state"]["lines"] = json!([{"severity": "warning", "text": "x".repeat(41)}]);
+    assert_eq!(mac.post("/v2/activity-state", &bad).await.status, 400);
+    let mut bad = activity_state(1, 0);
+    bad["stale_secs"] = json!(10);
+    assert_eq!(mac.post("/v2/activity-state", &bad).await.status, 400);
+    let mut bad = activity_state(1, 0);
+    bad["state"]["host"] = json!("web01");
+    assert_eq!(mac.post("/v2/activity-state", &bad).await.status, 400);
+    assert_eq!(activity_pushes(&s).len(), 1, "nothing else was pushed");
+}
+
+#[tokio::test]
+async fn activity_updates_are_coalesced_and_rate_limited() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 220).await;
+    put_token(&phone, "", ACT_A, None).await;
+    let r = mac.post("/v2/activity-state", &activity_state(3, 0)).await;
+    assert_eq!(r.json["status"], "sent");
+    s.set_time(T0 + 1);
+    let r = mac.post("/v2/activity-state", &activity_state(3, 1)).await;
+    assert_eq!(
+        r.json,
+        json!({"status": "coalesced", "send_in": 4}),
+        "{:?}",
+        r.json
+    );
+    s.set_time(T0 + 2);
+    mac.post("/v2/activity-state", &activity_state(1, 4)).await;
+    metriccupid_push::v2::activity_tick(&s.state).await;
+    assert_eq!(activity_pushes(&s).len(), 1, "not due yet");
+    s.set_time(T0 + 5);
+    metriccupid_push::v2::activity_tick(&s.state).await;
+    let pushes = activity_pushes(&s);
+    assert_eq!(pushes.len(), 2, "one push for both coalesced states");
+    let cs = &pushes[1].payload["aps"]["content-state"];
+    assert_eq!(
+        (cs["critical"].clone(), cs["warning"].clone()),
+        (json!(1), json!(4))
+    );
+    assert_eq!(
+        cs["updated_at"],
+        T0 + 2,
+        "when the Mac sent the latest state"
+    );
+    assert_eq!(pushes[1].payload["aps"]["timestamp"], T0 + 5);
+    assert_eq!(pushes[1].priority, 5, "routine update");
+    metriccupid_push::v2::activity_tick(&s.state).await;
+    assert_eq!(activity_pushes(&s).len(), 2, "sent once");
+
+    // Per group: burst 10, then one per 5 s (3 used above).
+    for i in 0..7 {
+        let r = mac.post("/v2/activity-state", &activity_state(i, 0)).await;
+        assert_eq!(r.status, 200, "{i}: {:?}", r.json);
+    }
+    let r = mac.post("/v2/activity-state", &activity_state(9, 0)).await;
+    assert_eq!(r.status, 429);
+    assert!(r.headers.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn activity_end_dismisses_and_forgets_tokens() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 230).await;
+    put_token(&phone, "", ACT_A, None).await;
+    mac.post("/v2/activity-state", &activity_state(1, 0)).await;
+    // `end` is never coalesced.
+    let mut end = activity_state(0, 0);
+    end["event"] = json!("end");
+    let r = mac.post("/v2/activity-state", &end).await;
+    assert_eq!(r.json["pushed"], 1, "{:?}", r.json);
+    let p = activity_pushes(&s).pop().unwrap();
+    assert_eq!(p.payload["aps"]["event"], "end");
+    assert_eq!(p.payload["aps"]["dismissal-date"], T0);
+    assert_eq!(p.payload["aps"]["timestamp"], T0 + 1, "after the update");
+    assert!(p.payload["aps"].get("stale-date").is_none());
+    assert_eq!(p.priority, 10);
+    s.set_time(T0 + 10);
+    let r = mac.post("/v2/activity-state", &activity_state(1, 0)).await;
+    assert_eq!(r.json["pushed"], 0, "ended activity's token was dropped");
+}
+
+#[tokio::test]
+async fn mac_offline_and_back_update_the_activity() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 240).await;
+    put_token(&phone, "", ACT_A, None).await;
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    mac.post("/v2/activity-state", &activity_state(2, 1)).await;
+    s.set_time(T0 + 10);
+    ws.send(WsMessage::Text(r#"{"type":"bye","reason":"quit"}"#.into()))
+        .await
+        .unwrap();
+    // Presence alert + activity update.
+    let pushes = wait_pushes(&s, 3).await;
+    assert!(pushes
+        .iter()
+        .any(|p| p.payload.get("mc_presence").is_some()));
+    let a = activity_pushes(&s).pop().unwrap();
+    let cs = &a.payload["aps"]["content-state"];
+    assert_eq!(cs["mac_online"], false);
+    assert_eq!(cs["critical"], 2, "last known counts kept");
+    assert_eq!(cs["updated_at"], T0);
+    assert_eq!(a.priority, 5);
+
+    s.set_time(T0 + 20);
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    let pushes = wait_pushes(&s, 5).await;
+    let a = pushes
+        .iter()
+        .rev()
+        .find(|p| p.push_type == "liveactivity")
+        .unwrap();
+    assert_eq!(a.payload["aps"]["content-state"]["mac_online"], true);
+}
+
+#[tokio::test]
+async fn push_to_start_when_critical_and_no_running_activity() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 250).await;
+    assert_eq!(put_token(&phone, "/start-token", START_A, None).await, 201);
+    let r = mac.post("/v2/activity-state", &activity_state(0, 3)).await;
+    assert_eq!(r.json["started"], 0, "nothing critical");
+    s.set_time(T0 + 5);
+    let r = mac.post("/v2/activity-state", &activity_state(1, 3)).await;
+    assert_eq!(r.json["started"], 1, "{:?}", r.json);
+    let p = activity_pushes(&s).pop().unwrap();
+    assert_eq!(p.device_token, START_A);
+    assert_eq!(p.priority, 10);
+    let aps = &p.payload["aps"];
+    assert_eq!(aps["event"], "start");
+    assert_eq!(aps["attributes-type"], "AlertsActivityAttributes");
+    assert_eq!(aps["attributes"], json!({}));
+    assert_eq!(
+        aps["alert"],
+        json!({"title": "MetricCupid", "body": "1 critical alert"})
+    );
+    assert_eq!(aps["content-state"]["critical"], 1);
+    // Not again while that activity may be running.
+    s.set_time(T0 + 10);
+    let r = mac.post("/v2/activity-state", &activity_state(2, 3)).await;
+    assert_eq!(
+        (r.json["started"].clone(), r.json["pushed"].clone()),
+        (json!(0), json!(0))
+    );
+    // The started activity registers its token: it gets the updates.
+    assert_eq!(put_token(&phone, "", ACT_A, Some(T0 + 5)).await, 201);
+    s.set_time(T0 + 15);
+    let r = mac.post("/v2/activity-state", &activity_state(2, 4)).await;
+    assert_eq!(
+        (r.json["started"].clone(), r.json["pushed"].clone()),
+        (json!(0), json!(1))
+    );
+    // iOS ends activities after 8 h: the token is dropped, a new one is started.
+    s.set_time(T0 + 5 + 8 * 3600);
+    let r = mac.post("/v2/activity-state", &activity_state(2, 5)).await;
+    assert_eq!(
+        (r.json["started"].clone(), r.json["pushed"].clone()),
+        (json!(1), json!(0))
+    );
+}
+
+#[tokio::test]
+async fn unregistered_activity_token_is_removed() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 15).await;
+    put_token(&phone, "", ACT_A, None).await;
+    s.mock().mark_unregistered(ACT_A);
+    let r = mac.post("/v2/activity-state", &activity_state(1, 0)).await;
+    assert_eq!(r.json["unregistered"], 1, "{:?}", r.json);
+    let g = mac.group_id.clone();
+    let left = s
+        .state
+        .v2()
+        .store
+        .call(move |c| store::activity_tokens(c, &g))
+        .await
+        .unwrap();
+    assert!(left.is_empty());
+}
+
+#[tokio::test]
+async fn summary_is_stored_not_pushed_and_only_the_newest_kept() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 25).await;
+    let summary = |id: &str| {
+        let pt = json!({"v": 1, "type": "summary", "id": id, "ts": T0, "critical": 1, "warning": 0,
+                        "unknown": 0, "top": []});
+        json!({"id": id, "type": "summary", "sealed": mac.seal_json("summary", id, &pt, [3; 12]),
+               "urgency": "silent", "ttl_secs": 86400})
+    };
+    let r = mac.post("/v2/messages", &summary("s-1")).await;
+    assert_eq!(r.json["status"], "stored", "{:?}", r.json);
+    assert_eq!(r.json["pushed"], 0);
+    mac.post("/v2/messages", &summary("s-2")).await;
+    assert!(s.mock().pushes().is_empty());
+    let r = phone.get("/v2/messages?since=0").await;
+    let msgs = r.json["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(
+        (msgs[0]["id"].clone(), msgs[0]["type"].clone()),
+        (json!("s-2"), json!("summary"))
+    );
+}
+
+#[tokio::test]
+async fn activity_goes_through_the_gateway() {
+    let (_d1, hosted) = server(&[("MODE", "hosted"), ("HOSTED_OPEN_REGISTRATION", "true")]).await;
+    let (_d2, selfhosted) =
+        server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
+    let (mac, phone) = setup(&selfhosted, 35).await;
+    put_token(&phone, "", ACT_A, None).await;
+    let r = mac.post("/v2/activity-state", &activity_state(1, 2)).await;
+    assert_eq!(r.json["pushed"], 1, "{:?}", r.json);
+    let p = activity_pushes(&hosted).pop().unwrap();
+    assert_eq!(p.device_token, ACT_A);
+    assert_eq!(p.topic_suffix, ".push-type.liveactivity");
+    assert_eq!(p.priority, 10);
+    assert_eq!(p.payload["aps"]["content-state"]["warning"], 2);
+
+    // The gateway validates the activity like the server does.
+    let gw = Client::new(
+        &hosted.base,
+        &mac.group_id,
+        "",
+        mac.keys.clone(),
+        hosted.now_fn(),
+    );
+    let state = json!({"critical": 1, "warning": 0, "unknown": 0, "mac_online": true,
+                       "updated_at": T0, "lines": vec![json!({"severity": "critical", "text": "x"}); 5]});
+    let job = json!({"device_token": ACT_A, "env": "sandbox", "urgency": "silent", "expiration": 0,
+                     "activity": {"event": "update", "timestamp": T0, "state": state}});
+    assert_eq!(gw.post("/v2/gateway/push", &job).await.status, 400);
+    let mut far = job.clone();
+    far["activity"]["state"]["lines"] = json!([]);
+    far["activity"]["timestamp"] = json!(T0 + 2 * 86_400);
+    assert_eq!(gw.post("/v2/gateway/push", &far).await.status, 400);
+    // A summary is never pushed, so the gateway refuses one.
+    let summary = json!({"device_token": TOKEN_A, "env": "sandbox", "urgency": "silent", "expiration": 0,
+                         "message": {"id": "s", "t": "summary", "s": STANDARD.encode([0u8; 28])}});
+    assert_eq!(gw.post("/v2/gateway/push", &summary).await.status, 400);
+}
+
+#[tokio::test]
+async fn direct_sender_uses_liveactivity_topic_and_push_type() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let apple = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/3/device/{ACT_A}")))
+        .and(header(
+            "apns-topic",
+            "cat.sysop.MetricCupid.push-type.liveactivity",
+        ))
+        .and(header("apns-push-type", "liveactivity"))
+        .and(header("apns-priority", "10"))
+        .and(header("apns-expiration", (T0 + 3600).to_string().as_str()))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&apple)
+        .await;
+    let (_d, s) = server(&[
+        ("APNS_MODE", "direct"),
+        ("APNS_KEY_P8", TEST_P8),
+        ("APNS_KEY_ID", "ABCDE12345"),
+        ("APNS_TEAM_ID", "TEAM123456"),
+        ("APNS_SANDBOX_URL", &apple.uri()),
+        ("APNS_PRODUCTION_URL", "http://127.0.0.1:1"),
+    ])
+    .await;
+    let (mac, phone) = setup(&s, 45).await;
+    put_token(&phone, "", ACT_A, None).await;
+    let r = mac.post("/v2/activity-state", &activity_state(1, 0)).await;
+    assert_eq!(r.json["pushed"], 1, "{:?}", r.json);
+    let reqs = apple.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(body["aps"]["event"], "update");
+    assert!(body.get("mc").is_none(), "no sealed envelope");
+}

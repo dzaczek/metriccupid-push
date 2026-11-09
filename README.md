@@ -220,6 +220,13 @@ normative spec is [PROTOCOL.md](PROTOCOL.md); the Swift apps test against
 - If the phone's extension does not run, the app fetches missed messages from the mailbox
   (`GET /v2/messages?since=`). If the Mac is offline, commands wait up to 1 h and the phone shows
   "Mac offline, queued".
+- Live Activity (Dynamic Island / Lock Screen): the Mac posts the alert counts to
+  `POST /v2/activity-state`; the server coalesces them (at most one push per group every 5 s) and
+  sends `apns-push-type: liveactivity` pushes to the activity tokens the phone registered
+  (`PUT /v2/activities/{device_id}`). This content is **plaintext** (iOS applies it without the
+  extension): counts only, plus up to 4 short host / service lines if the user turns that on on the
+  Mac. See PROTOCOL.md section 6.10. With `APNS_MODE=direct`, the APNs key's topic must also allow
+  `cat.sysop.MetricCupid.push-type.liveactivity` (token-based keys do).
 
 ### Deployment options
 
@@ -283,8 +290,12 @@ The server, and anyone who controls it, can see:
 - whether and when each Mac is connected (`last_seen`). The server itself sends the phones plaintext
   presence notices ("MetricCupid is offline on your Mac" / "back online"); they contain only the
   state, a reason (`quit`, `sleep`, `disabled`, `lost`) and a time, never alert content.
+- the Live Activity state in plaintext: how many critical / warning / unknown alerts are active,
+  and, only with the Mac's "Show host names on the lock screen (sent unencrypted)" setting, up to 4
+  lines of severity + host / service (40 characters each).
 
-It cannot see alert titles, hosts, services, summaries, URLs, commands or results, and it cannot
+Apart from those opt-in Live Activity lines, it cannot see alert titles, hosts, services, summaries,
+URLs, commands or results, and it cannot
 forge them: content is sealed with a key it never receives. It can drop, delay or delete messages.
 Logs never contain sealed blobs, tokens or keys.
 

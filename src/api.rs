@@ -190,6 +190,7 @@ fn build_v2(config: &Config, clock: Arc<dyn Clock>) -> Result<V2State, String> {
         }),
         ws_ping: c.ws_ping,
         presence: v2::presence::Presence::new(c.mac_offline_grace),
+        activities: v2::activity::Activities::new(),
     })
 }
 

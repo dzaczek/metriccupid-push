@@ -8,12 +8,14 @@
 // response; it is only built on the cold path, so its size does not matter.
 #![allow(clippy::result_large_err)]
 
+pub mod activity;
 pub mod apns;
 pub mod licence;
 pub mod presence;
 pub mod store;
 pub mod stream;
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +33,10 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::task::JoinSet;
 
+use self::activity::{
+    Activities, ActivityEvent, ActivityLine, Batch, ContentState, ACTIVITY_MAX_SECS,
+    ACTIVITY_TTL_SECS, MAX_STALE_SECS, MIN_STALE_SECS,
+};
 use self::apns::{
     build_payload, build_presence_payload, ApnsEnv, ApnsSender, GatewayApns, GatewayPush,
     GatewayRegistration, McEnvelope, MessageType, MockApns, PresenceNote, PushContent, PushError,
@@ -64,6 +70,7 @@ pub struct V2State {
     pub licence: Box<dyn Licence>,
     pub ws_ping: Duration,
     pub presence: Presence,
+    pub activities: Activities,
 }
 
 /// Presence pushes expire after this long (a stale "offline" is useless).
@@ -81,6 +88,15 @@ pub fn routes(mode: Mode, mock: bool) -> Router<Arc<AppState>> {
         .route("/v2/messages", post(post_message).get(get_messages))
         .route("/v2/commands", post(post_command).get(get_commands))
         .route("/v2/commands/ack", post(ack_command))
+        .route(
+            "/v2/activities/{device_id}",
+            put(put_activity_token).delete(delete_activity_token),
+        )
+        .route(
+            "/v2/activities/{device_id}/start-token",
+            put(put_start_token).delete(delete_start_token),
+        )
+        .route("/v2/activity-state", post(post_activity_state))
         .route("/v2/stream", get(open_stream));
     if mode == Mode::Hosted {
         r = r.route(apns::GATEWAY_PUSH_PATH, post(gateway_push));
@@ -120,7 +136,14 @@ pub fn is_sealed(s: &str, max_len: usize) -> bool {
 
 /// APNs device token: lowercase hex, 64..=200 characters, even length.
 pub fn normalize_apns_token(s: &str) -> Option<String> {
-    let ok = (64..=200).contains(&s.len())
+    normalize_hex_token(s, 200)
+}
+
+/// Live Activity push tokens can be longer than device tokens.
+pub const MAX_ACTIVITY_TOKEN_HEX: usize = 512;
+
+fn normalize_hex_token(s: &str, max: usize) -> Option<String> {
+    let ok = (64..=max).contains(&s.len())
         && s.len() % 2 == 0
         && s.bytes().all(|b| b.is_ascii_hexdigit());
     ok.then(|| s.to_ascii_lowercase())
@@ -733,17 +756,22 @@ async fn post_message(
         };
 
         let expiration = if ttl == 0 { 0 } else { now + ttl };
-        let (pushed, failed, unregistered) = fan_out(
-            &state,
-            &a.group,
-            a.key,
-            PushContent::Sealed(mc),
-            req.urgency,
-            req.collapse_id,
-            expiration,
-        )
-        .await
-        .map_err(storage_error)?;
+        // Summaries feed the phone's widget from the mailbox: no notification.
+        let (pushed, failed, unregistered) = if req.kind == MessageType::Summary {
+            (0, 0, 0)
+        } else {
+            fan_out(
+                &state,
+                &a.group,
+                a.key,
+                PushContent::Sealed(mc),
+                req.urgency,
+                req.collapse_id,
+                expiration,
+            )
+            .await
+            .map_err(storage_error)?
+        };
         Ok(ok(
             StatusCode::OK,
             json!({
@@ -871,6 +899,11 @@ pub async fn push_presence(state: &AppState, group: &str, note: PresenceNote) {
         }
         Err(e) => tracing::error!(error = %e, "presence: cannot load devices"),
     }
+    // The Live Activity shows "Mac offline" too.
+    let online = matches!(note, PresenceNote::Online { .. });
+    if let Some(batch) = state.v2().activities.presence(group, online, state.now()) {
+        send_activity(state, group, key, batch).await;
+    }
 }
 
 /// Send every offline notice whose grace period has passed. Run periodically
@@ -881,6 +914,417 @@ pub async fn presence_tick(state: &AppState) {
     for (group, note) in due {
         push_presence(state, &group, note).await;
     }
+}
+
+// -------------------------------------------------------------- activity ---
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ActivityFanOut {
+    pub pushed: usize,
+    pub failed: usize,
+    pub unregistered: usize,
+    pub started: usize,
+}
+
+/// Push one Live Activity batch to the group's phones: `update` / `end` to
+/// every running activity, and a push-to-start to phones with a start token
+/// and no running activity while anything is critical.
+async fn fan_out_activity(
+    state: &AppState,
+    group: &str,
+    key: [u8; 32],
+    batch: Batch,
+) -> Result<ActivityFanOut, StoreError> {
+    let v2 = state.v2();
+    let now = state.now();
+    let g = group.to_string();
+    // iOS ends activities after 8 h: their tokens are useless now.
+    let cut = now.saturating_sub(ACTIVITY_MAX_SECS);
+    let tokens = v2
+        .store
+        .call(move |c| {
+            store::delete_update_tokens(c, &g, Some(cut))?;
+            store::activity_tokens(c, &g)
+        })
+        .await?;
+    let event = batch.note.event;
+    let urgency = if batch.raise || event != ActivityEvent::Update {
+        Urgency::Critical
+    } else {
+        Urgency::Silent
+    };
+    let running: HashSet<&str> = tokens
+        .iter()
+        .filter(|t| t.kind == "update")
+        .map(|t| t.device_id.as_str())
+        .collect();
+    let mut jobs = Vec::new();
+    for t in &tokens {
+        let (note, urgency) = if t.kind == "update" {
+            (batch.note.clone(), urgency)
+        } else if event == ActivityEvent::Update
+            && batch.note.state.critical > 0
+            && !running.contains(t.device_id.as_str())
+            && v2.activities.may_start(group, &t.device_id, now)
+        {
+            let mut n = batch.note.clone();
+            n.event = ActivityEvent::Start;
+            (n, Urgency::Critical)
+        } else {
+            continue;
+        };
+        jobs.push((
+            t.clone(),
+            PushJob {
+                group_id: group.to_string(),
+                auth_key: key,
+                device_token: t.push_token.clone(),
+                env: ApnsEnv::parse(&t.apns_env).unwrap_or(ApnsEnv::Production),
+                content: PushContent::Activity(note),
+                urgency,
+                collapse_id: None,
+                expiration: now + ACTIVITY_TTL_SECS,
+            },
+        ));
+    }
+    let mut set = JoinSet::new();
+    for (t, job) in jobs {
+        let sender = v2.sender.clone();
+        set.spawn(async move {
+            let r = sender.send(&job).await;
+            (t, r)
+        });
+    }
+    let mut out = ActivityFanOut::default();
+    while let Some(res) = set.join_next().await {
+        let Ok((t, r)) = res else {
+            out.failed += 1;
+            continue;
+        };
+        match r {
+            Ok(()) if t.kind == "start" => out.started += 1,
+            Ok(()) => out.pushed += 1,
+            Err(PushError::Unregistered) => {
+                out.unregistered += 1;
+                let g = group.to_string();
+                if let Err(e) = v2
+                    .store
+                    .call(move |c| {
+                        store::clear_activity_token(c, &g, &t.device_id, &t.kind, &t.push_token)
+                    })
+                    .await
+                {
+                    tracing::error!(error = %e, "cannot clear activity token");
+                }
+            }
+            Err(e) => {
+                out.failed += 1;
+                match e {
+                    PushError::Rejected { status, reason } => {
+                        tracing::warn!(group = %group, status, reason, "APNs rejected activity push")
+                    }
+                    _ => tracing::warn!(group = %group, "APNs transport error (activity)"),
+                }
+            }
+        }
+    }
+    if event == ActivityEvent::End {
+        let g = group.to_string();
+        v2.store
+            .call(move |c| store::delete_update_tokens(c, &g, None))
+            .await?;
+    }
+    Ok(out)
+}
+
+/// Best effort: log instead of failing (tick and presence paths).
+async fn send_activity(state: &AppState, group: &str, key: [u8; 32], batch: Batch) {
+    let event = batch.note.event;
+    match fan_out_activity(state, group, key, batch).await {
+        Ok(r) if r.pushed + r.started + r.failed + r.unregistered > 0 => tracing::info!(
+            group = %group,
+            event = event.as_str(),
+            pushed = r.pushed,
+            started = r.started,
+            failed = r.failed,
+            "activity push"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "activity: cannot load tokens"),
+    }
+}
+
+/// Send every coalesced Live Activity state whose interval has passed. Run
+/// periodically (see `spawn_activities`).
+pub async fn activity_tick(state: &AppState) {
+    let v2 = state.v2();
+    for (group, batch) in v2.activities.due(state.now()) {
+        let g = group.clone();
+        match v2.store.call(move |c| store::group_key(c, &g)).await {
+            Ok(Some(key)) => send_activity(state, &group, key, batch).await,
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = %e, "activity: cannot load group"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityTokenReq {
+    push_token: String,
+    #[serde(default)]
+    apns_env: Option<String>,
+    /// When the activity started (Unix seconds); default now.
+    #[serde(default)]
+    started_at: Option<u64>,
+}
+
+/// `PUT`/`DELETE /v2/activities/{device_id}[/start-token]` (the phone itself).
+#[allow(clippy::too_many_arguments)]
+async fn activity_token(
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    method: &'static str,
+    kind: &'static str,
+    device_id: String,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            method,
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("ios")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        if a.device_id.as_deref() != Some(device_id.as_str()) {
+            return Err(bad("X-MC-Device must match the device id in the path"));
+        }
+        let v2 = state.v2();
+        let g = a.group.clone();
+        if method == "DELETE" {
+            let removed = v2
+                .store
+                .call(move |c| store::delete_activity_token(c, &g, &device_id, kind))
+                .await
+                .map_err(storage_error)?;
+            return Ok(if removed {
+                (StatusCode::NO_CONTENT.into_response(), "deleted")
+            } else {
+                (error(StatusCode::NOT_FOUND, "not_found"), "not_found")
+            });
+        }
+        let req: ActivityTokenReq = parse(&body)?;
+        let token = normalize_hex_token(&req.push_token, MAX_ACTIVITY_TOKEN_HEX)
+            .ok_or_else(|| bad("push_token must be 64 to 512 hex characters"))?;
+        let env = match req.apns_env.as_deref() {
+            None => ApnsEnv::Production,
+            Some(e) => {
+                ApnsEnv::parse(e).ok_or_else(|| bad("apns_env must be sandbox or production"))?
+            }
+        };
+        let now = state.now();
+        // Clamped: a start in the future or over 8 h ago makes no sense.
+        let started_at = req
+            .started_at
+            .unwrap_or(now)
+            .clamp(now.saturating_sub(ACTIVITY_MAX_SECS), now);
+        if kind == "update" {
+            v2.activities.token_registered(&a.group, &device_id);
+        }
+        let created = v2
+            .store
+            .call(move |c| {
+                store::put_activity_token(
+                    c,
+                    &g,
+                    &device_id,
+                    kind,
+                    &token,
+                    env.as_str(),
+                    started_at,
+                    now,
+                )
+            })
+            .await
+            .map_err(storage_error)?;
+        Ok(if created {
+            ok(StatusCode::CREATED, json!({"status": "created"}), "created")
+        } else {
+            ok(StatusCode::OK, json!({"status": "updated"}), "updated")
+        })
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    let route = match (kind, method) {
+        ("update", "PUT") => "activities.put",
+        ("update", _) => "activities.delete",
+        (_, "PUT") => "activities.start.put",
+        _ => "activities.start.delete",
+    };
+    finish(route, ip, started, group.as_deref(), r)
+}
+
+async fn put_activity_token(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(device_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    activity_token(state, peer, "PUT", "update", device_id, uri, headers, body).await
+}
+
+async fn delete_activity_token(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(device_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    activity_token(
+        state, peer, "DELETE", "update", device_id, uri, headers, body,
+    )
+    .await
+}
+
+async fn put_start_token(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(device_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    activity_token(state, peer, "PUT", "start", device_id, uri, headers, body).await
+}
+
+async fn delete_start_token(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(device_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    activity_token(
+        state, peer, "DELETE", "start", device_id, uri, headers, body,
+    )
+    .await
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateReq {
+    critical: u32,
+    warning: u32,
+    unknown: u32,
+    #[serde(default = "default_true")]
+    mac_online: bool,
+    #[serde(default)]
+    lines: Vec<ActivityLine>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityStateReq {
+    event: ActivityEvent,
+    state: StateReq,
+    #[serde(default)]
+    stale_secs: Option<u64>,
+}
+
+async fn post_activity_state(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "POST",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("mac")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let v2 = state.v2();
+        if let Err(ra) = v2.limits.check_activity(&a.group) {
+            return Err((too_many(ra), "rate_limited_group"));
+        }
+        let req: ActivityStateReq = parse(&body)?;
+        if req.event == ActivityEvent::Start {
+            return Err(bad("event must be update or end"));
+        }
+        if req
+            .stale_secs
+            .is_some_and(|s| !(MIN_STALE_SECS..=MAX_STALE_SECS).contains(&s))
+        {
+            return Err(bad("stale_secs must be 60 to 43200"));
+        }
+        let now = state.now();
+        let cs = ContentState {
+            critical: req.state.critical,
+            warning: req.state.warning,
+            unknown: req.state.unknown,
+            mac_online: req.state.mac_online,
+            updated_at: now,
+            lines: req.state.lines,
+        };
+        cs.validate().map_err(bad)?;
+        match v2
+            .activities
+            .offer(&a.group, req.event, cs, req.stale_secs, now)
+        {
+            Some(batch) => {
+                let r = fan_out_activity(&state, &a.group, a.key, batch)
+                    .await
+                    .map_err(storage_error)?;
+                Ok(ok(
+                    StatusCode::OK,
+                    json!({
+                        "status": "sent",
+                        "pushed": r.pushed,
+                        "started": r.started,
+                        "failed": r.failed,
+                        "unregistered": r.unregistered,
+                    }),
+                    "sent",
+                ))
+            }
+            None => Ok(ok(
+                StatusCode::OK,
+                json!({ "status": "coalesced", "send_in": v2.activities.send_in(&a.group, now) }),
+                "coalesced",
+            )),
+        }
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("activity.state", ip, started, group.as_deref(), r)
 }
 
 #[derive(Deserialize, Default)]
@@ -1204,24 +1648,42 @@ async fn gateway_push(
         let req: GatewayPush = parse(&body)?;
         let token = normalize_apns_token(&req.device_token)
             .ok_or_else(|| bad("device_token must be 64 to 200 hex characters"))?;
-        let content = match (req.message, req.presence) {
-            (Some(m), None) => {
-                if !is_token_id(&m.id) || !is_sealed(&m.s, MAX_PAYLOAD_BYTES) {
+        let now = state.now();
+        let content = match (req.message, req.presence, req.activity) {
+            (Some(m), None, None) => {
+                if !is_token_id(&m.id)
+                    || !is_sealed(&m.s, MAX_PAYLOAD_BYTES)
+                    || m.t == MessageType::Summary
+                {
                     return Err(bad(
                         "message must be {id, t, s} with a valid id and sealed box",
                     ));
                 }
                 PushContent::Sealed(m)
             }
-            (None, Some(p)) => PushContent::Presence(p),
-            _ => return Err(bad("exactly one of message or presence is required")),
+            (None, Some(p), None) => PushContent::Presence(p),
+            (None, None, Some(n)) => {
+                n.state.validate().map_err(bad)?;
+                let near = |t: u64| t.abs_diff(now) <= MAX_TTL_SECS;
+                if !near(n.timestamp)
+                    || !n.stale_date.map_or(true, near)
+                    || !n.dismissal_date.map_or(true, near)
+                {
+                    return Err(bad("activity times must be within 24 h of now"));
+                }
+                PushContent::Activity(n)
+            }
+            _ => {
+                return Err(bad(
+                    "exactly one of message, presence or activity is required",
+                ))
+            }
         };
         if req.collapse_id.as_deref().is_some_and(|c| !is_token_id(c)) {
             return Err(bad(
                 "collapse_id must be 1 to 64 characters of A-Z a-z 0-9 _ -",
             ));
         }
-        let now = state.now();
         if req.expiration != 0 && req.expiration > now + MAX_TTL_SECS {
             return Err(bad("expiration must be 0 or at most 24 h ahead"));
         }
@@ -1230,6 +1692,7 @@ async fn gateway_push(
         let payload_len = match &content {
             PushContent::Sealed(m) => build_payload(m, req.urgency).len(),
             PushContent::Presence(p) => build_presence_payload(*p).len(),
+            PushContent::Activity(n) => activity::build_activity_payload(n).len(),
         };
         if payload_len > MAX_PAYLOAD_BYTES {
             return Err((
