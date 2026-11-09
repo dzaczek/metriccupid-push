@@ -95,6 +95,7 @@ pub struct V2Config {
     pub licence_max_groups: u32,
     /// Unix seconds until which unlicensed groups may still send.
     pub licence_grace_until: Option<u64>,
+    pub gateway_open: bool,
     pub rate_messages: Rate,
     pub rate_commands: Rate,
     pub rate_gateway: Rate,
@@ -560,6 +561,7 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
                 })
             })
             .transpose()?,
+        gateway_open: parse_bool("GATEWAY_OPEN", get("GATEWAY_OPEN"), false)?,
         rate_messages: parse_rate(get, "V2_MESSAGES", 2, 60)?,
         rate_commands: parse_rate(get, "V2_COMMANDS", 1, 20)?,
         rate_gateway: parse_rate(get, "V2_GATEWAY", 5, 50)?,

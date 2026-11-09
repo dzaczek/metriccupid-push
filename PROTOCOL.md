@@ -731,6 +731,8 @@ The same two moments also re-send the group's latest Live Activity state with `m
 
 ## 9. Gateway (self-hosted server without its own APNs key)
 
+A hosted server relays for self-hosted servers only when its operator sets `GATEWAY_OPEN=true`. Otherwise `POST /v2/groups` with `"gateway": true` and `POST /v2/gateway/push` answer `403 {"error":"gateway_closed"}`.
+
 APNs requires the provider key of the app's team, so a self-hosted server normally cannot push.
 With `APNS_MODE=gateway` it forwards each push job to the hosted service (`GATEWAY_URL`, default
 `https://push-metriccupid.sysop.cat`):

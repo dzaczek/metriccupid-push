@@ -253,6 +253,7 @@ exposes them at `GET /v2/debug/pushes`.
 | `APNS_TEAM_ID` | required for `direct` | 10-character team id. |
 | `APNS_TOPIC` | `cat.sysop.MetricCupid` | iOS app bundle id (`apns-topic`). |
 | `GATEWAY_URL` | `https://push-metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. |
+| `GATEWAY_OPEN` | `false` | Hosted only: relay APNs for self-hosted servers (`/v2/gateway/push`). Off by default; while off, gateway registrations and pushes get `403 gateway_closed`, so self-hosters need their own APNs key. |
 | `DATA_DIR` | `/data` | Directory for the SQLite database (`metriccupid-push.sqlite3`, WAL). Must be writable. |
 | `LICENCE_MODE` | `app_transaction` in hosted, `open` self-hosted | `MODE=hosted` only. `app_transaction`: a group needs a verified App Store purchase of the app (StoreKit `AppTransaction` JWS) to register and to send; unlicensed groups can still read. `open`: anyone (open beta). Self-hosted servers never require a licence. See PROTOCOL.md section 13. |
 | `HOSTED_OPEN_REGISTRATION` | `false` | Alias: `true` means `LICENCE_MODE=open` (an error together with `LICENCE_MODE=app_transaction`). |

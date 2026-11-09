@@ -118,6 +118,10 @@ pub struct LicencePolicy {
     pub verifier: AppTransactionVerifier,
     pub max_groups: u32,
     pub grace_until: Option<u64>,
+    /// `GATEWAY_OPEN`: whether this (hosted) server relays APNs for
+    /// self-hosted servers. Closed by default so nobody uses the operator's
+    /// APNs key and quota without being let in explicitly.
+    pub gateway_open: bool,
 }
 
 impl LicencePolicy {

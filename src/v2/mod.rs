@@ -480,6 +480,7 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
                 None
             }
         },
+        (_, Mode::Hosted) if req.gateway && !policy.gateway_open => return gateway_closed(),
         (None, Mode::Hosted) if required && !req.gateway => return licence_required(),
         (None, Mode::Hosted) => None,
     };
@@ -2049,6 +2050,14 @@ async fn open_stream(State(state): State<Arc<AppState>>, req: Request) -> Respon
     finish("stream", ip, started, group.as_deref(), r)
 }
 
+/// 403 for gateway registrations while `GATEWAY_OPEN` is off.
+fn gateway_closed() -> Outcome {
+    (
+        error(StatusCode::FORBIDDEN, "gateway_closed"),
+        "gateway_closed",
+    )
+}
+
 // --------------------------------------------------------------- gateway ---
 
 async fn gateway_push(
@@ -2064,6 +2073,12 @@ async fn gateway_push(
     let r = async {
         let a = authenticate(&state, ip, "POST", &uri, &headers, &body, DeviceRule::None).await?;
         group = Some(a.group.clone());
+        if !state.v2().licence.gateway_open {
+            return Err((
+                error(StatusCode::FORBIDDEN, "gateway_closed"),
+                "gateway_closed",
+            ));
+        }
         if let Err(ra) = state.v2().limits.check_gateway(&a.group) {
             return Err((too_many(ra), "rate_limited_gateway"));
         }

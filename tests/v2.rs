@@ -917,7 +917,12 @@ async fn data_survives_restart() {
 
 #[tokio::test]
 async fn self_hosted_server_pushes_through_hosted_gateway() {
-    let (_d1, hosted) = server(&[("MODE", "hosted"), ("HOSTED_OPEN_REGISTRATION", "true")]).await;
+    let (_d1, hosted) = server(&[
+        ("MODE", "hosted"),
+        ("HOSTED_OPEN_REGISTRATION", "true"),
+        ("GATEWAY_OPEN", "true"),
+    ])
+    .await;
     let (_d2, selfhosted) =
         server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
 
@@ -983,7 +988,12 @@ async fn self_hosted_server_pushes_through_hosted_gateway() {
 
 #[tokio::test]
 async fn gateway_rejects_unknown_groups_licence_and_rate() {
-    let (_d1, hosted) = server(&[("MODE", "hosted"), ("RATE_V2_GATEWAY_BURST", "2")]).await;
+    let (_d1, hosted) = server(&[
+        ("MODE", "hosted"),
+        ("RATE_V2_GATEWAY_BURST", "2"),
+        ("GATEWAY_OPEN", "true"),
+    ])
+    .await;
     let (_d2, selfhosted) =
         server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
     // Hosted requires licences, but a self-hosted server's forwarded
@@ -1357,7 +1367,12 @@ async fn second_mac_keeps_the_group_online_and_bad_bye_is_rejected() {
 
 #[tokio::test]
 async fn presence_goes_through_the_gateway() {
-    let (_d1, hosted) = server(&[("MODE", "hosted"), ("HOSTED_OPEN_REGISTRATION", "true")]).await;
+    let (_d1, hosted) = server(&[
+        ("MODE", "hosted"),
+        ("HOSTED_OPEN_REGISTRATION", "true"),
+        ("GATEWAY_OPEN", "true"),
+    ])
+    .await;
     let (_d2, selfhosted) =
         server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
     let (mac, _phone) = setup(&selfhosted, 150).await;
@@ -1725,7 +1740,12 @@ async fn summary_is_stored_not_pushed_and_only_the_newest_kept() {
 
 #[tokio::test]
 async fn activity_goes_through_the_gateway() {
-    let (_d1, hosted) = server(&[("MODE", "hosted"), ("HOSTED_OPEN_REGISTRATION", "true")]).await;
+    let (_d1, hosted) = server(&[
+        ("MODE", "hosted"),
+        ("HOSTED_OPEN_REGISTRATION", "true"),
+        ("GATEWAY_OPEN", "true"),
+    ])
+    .await;
     let (_d2, selfhosted) =
         server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
     let (mac, phone) = setup(&selfhosted, 35).await;
@@ -2314,4 +2334,22 @@ async fn snapshot_posts_are_rate_limited_per_group() {
         .post("/v2/snapshot", &snapshot_body(&other, "o-1", 10))
         .await;
     assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn closed_gateway_refuses_registrations_and_pushes() {
+    // GATEWAY_OPEN defaults to false: the hosted server relays for nobody.
+    let (_d1, hosted) = server(&[("MODE", "hosted"), ("HOSTED_OPEN_REGISTRATION", "true")]).await;
+    let (_d2, selfhosted) =
+        server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
+    // The self-hosted server forwards the registration; the gateway refuses it.
+    let r = selfhosted.group(170).create_group().await;
+    assert_ne!(r.status, 201, "{:?}", r.json);
+    // A direct `gateway: true` registration is refused too.
+    let direct = hosted.group(171);
+    let r = direct
+        .create_group_with(serde_json::json!({ "gateway": true }))
+        .await;
+    assert_eq!(r.status, 403, "{:?}", r.json);
+    assert_eq!(r.json["error"], "gateway_closed");
 }

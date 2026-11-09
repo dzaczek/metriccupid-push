@@ -240,6 +240,7 @@ fn build_v2(
             verifier: AppTransactionVerifier::apple(c.licence_allow_sandbox),
             max_groups: c.licence_max_groups,
             grace_until: c.licence_grace_until,
+            gateway_open: c.gateway_open,
         },
         ws_ping: c.ws_ping,
         presence: v2::presence::Presence::new(c.mac_offline_grace),
