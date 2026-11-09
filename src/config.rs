@@ -62,6 +62,15 @@ impl fmt::Debug for ApnsKey {
     }
 }
 
+/// How the hosted service decides who may use it (PROTOCOL.md section 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LicenceMode {
+    /// Any group may register and send (open beta, and always when self-hosted).
+    Open,
+    /// Groups need a verified App Store `AppTransaction` (hosted default).
+    AppTransaction,
+}
+
 /// A token bucket refilled per hour (used for group registration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HourlyRate {
@@ -79,7 +88,13 @@ pub struct V2Config {
     pub apns_production_url: String,
     pub apns_sandbox_url: String,
     pub gateway_url: String,
-    pub hosted_open_registration: bool,
+    pub licence_mode: LicenceMode,
+    /// Accept TestFlight (`Sandbox`) transactions.
+    pub licence_allow_sandbox: bool,
+    /// Groups one purchase may be attached to.
+    pub licence_max_groups: u32,
+    /// Unix seconds until which unlicensed groups may still send.
+    pub licence_grace_until: Option<u64>,
     pub rate_messages: Rate,
     pub rate_commands: Rate,
     pub rate_gateway: Rate,
@@ -404,11 +419,23 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
             "GATEWAY_URL",
             get("GATEWAY_URL").unwrap_or_else(|| DEFAULT_GATEWAY_URL.into()),
         )?,
-        hosted_open_registration: parse_bool(
-            "HOSTED_OPEN_REGISTRATION",
-            get("HOSTED_OPEN_REGISTRATION"),
-            false,
+        licence_mode: parse_licence_mode(get, mode)?,
+        licence_allow_sandbox: parse_bool(
+            "LICENCE_ALLOW_SANDBOX",
+            get("LICENCE_ALLOW_SANDBOX"),
+            true,
         )?,
+        licence_max_groups: parse_nonzero("LICENCE_MAX_GROUPS", get("LICENCE_MAX_GROUPS"), 3)?
+            .get(),
+        licence_grace_until: get("LICENCE_GRACE_UNTIL")
+            .map(|v| {
+                parse_rfc3339(&v).ok_or_else(|| {
+                    ConfigError(
+                        "LICENCE_GRACE_UNTIL must be an RFC 3339 time (2026-11-16T00:00:00Z) or a date (2026-11-16)".into(),
+                    )
+                })
+            })
+            .transpose()?,
         rate_messages: parse_rate(get, "V2_MESSAGES", 2, 60)?,
         rate_commands: parse_rate(get, "V2_COMMANDS", 1, 20)?,
         rate_gateway: parse_rate(get, "V2_GATEWAY", 5, 50)?,
@@ -423,6 +450,58 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
         ),
         mac_offline_grace: parse_num("MAC_OFFLINE_GRACE_SECS", get("MAC_OFFLINE_GRACE_SECS"), 120)?,
     })
+}
+
+/// `LICENCE_MODE`, with `HOSTED_OPEN_REGISTRATION=true` kept as an alias for
+/// `open`. Self-hosted servers never require a licence.
+fn parse_licence_mode(
+    get: &impl Fn(&str) -> Option<String>,
+    mode: Mode,
+) -> Result<LicenceMode, ConfigError> {
+    let open_alias = parse_bool(
+        "HOSTED_OPEN_REGISTRATION",
+        get("HOSTED_OPEN_REGISTRATION"),
+        false,
+    )?;
+    let explicit = match get("LICENCE_MODE").as_deref() {
+        None => None,
+        Some("open") => Some(LicenceMode::Open),
+        Some("app_transaction") => Some(LicenceMode::AppTransaction),
+        Some(_) => return err("LICENCE_MODE must be `open` or `app_transaction`"),
+    };
+    match (mode, explicit) {
+        (Mode::SelfHosted, Some(LicenceMode::AppTransaction)) => {
+            err("LICENCE_MODE=app_transaction needs MODE=hosted")
+        }
+        (Mode::SelfHosted, _) => Ok(LicenceMode::Open),
+        (Mode::Hosted, Some(LicenceMode::AppTransaction)) if open_alias => err(
+            "HOSTED_OPEN_REGISTRATION=true contradicts LICENCE_MODE=app_transaction; remove one",
+        ),
+        (Mode::Hosted, Some(m)) => Ok(m),
+        (Mode::Hosted, None) if open_alias => Ok(LicenceMode::Open),
+        (Mode::Hosted, None) => Ok(LicenceMode::AppTransaction),
+    }
+}
+
+/// Unix seconds of an RFC 3339 time, or of midnight UTC of a `YYYY-MM-DD` date.
+pub fn parse_rfc3339(v: &str) -> Option<u64> {
+    use time::format_description::well_known::Rfc3339;
+    let t = match time::OffsetDateTime::parse(v, &Rfc3339) {
+        Ok(t) => t,
+        Err(_) => {
+            let mut it = v.splitn(3, '-');
+            let (y, m, d) = (it.next()?, it.next()?, it.next()?);
+            if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+                return None;
+            }
+            let month = time::Month::try_from(m.parse::<u8>().ok()?).ok()?;
+            time::Date::from_calendar_date(y.parse().ok()?, month, d.parse().ok()?)
+                .ok()?
+                .midnight()
+                .assume_utc()
+        }
+    };
+    u64::try_from(t.unix_timestamp()).ok()
 }
 
 fn parse_secrets(raw: Option<String>, v1_enabled: bool) -> Result<Vec<Secret>, ConfigError> {
@@ -574,7 +653,10 @@ mod tests {
         assert_eq!(c.v2.gateway_url, DEFAULT_GATEWAY_URL);
         assert_eq!(c.v2.apns_topic, DEFAULT_APNS_TOPIC);
         assert_eq!(c.v2.data_dir, PathBuf::from("/data"));
-        assert!(!c.v2.hosted_open_registration);
+        assert_eq!(c.v2.licence_mode, LicenceMode::Open);
+        assert!(c.v2.licence_allow_sandbox);
+        assert_eq!(c.v2.licence_max_groups, 3);
+        assert_eq!(c.v2.licence_grace_until, None);
         assert_eq!(c.v2.rate_messages.per_sec.get(), 2);
         assert_eq!(c.v2.rate_messages.burst.get(), 60);
         assert_eq!(c.v2.rate_commands.burst.get(), 20);
@@ -628,6 +710,58 @@ mod tests {
         })
         .unwrap();
         assert_eq!(c.mode, Mode::Hosted);
+    }
+
+    #[test]
+    fn licence_mode_and_alias() {
+        let hosted = |pairs: &[(&str, &str)]| {
+            let mut m: HashMap<String, String> = HashMap::from([
+                ("MODE".into(), "hosted".into()),
+                ("APNS_MODE".into(), "mock".into()),
+            ]);
+            for (k, v) in pairs {
+                m.insert(k.to_string(), v.to_string());
+            }
+            Config::from_lookup(|k| m.get(k).cloned()).map(|c| c.v2)
+        };
+        assert_eq!(
+            hosted(&[]).unwrap().licence_mode,
+            LicenceMode::AppTransaction
+        );
+        assert_eq!(
+            hosted(&[("HOSTED_OPEN_REGISTRATION", "true")])
+                .unwrap()
+                .licence_mode,
+            LicenceMode::Open
+        );
+        assert_eq!(
+            hosted(&[("LICENCE_MODE", "open")]).unwrap().licence_mode,
+            LicenceMode::Open
+        );
+        assert!(hosted(&[
+            ("LICENCE_MODE", "app_transaction"),
+            ("HOSTED_OPEN_REGISTRATION", "true")
+        ])
+        .is_err());
+        assert!(hosted(&[("LICENCE_MODE", "paid")]).is_err());
+        assert!(cfg(&[("LICENCE_MODE", "app_transaction")]).is_err());
+        let v = hosted(&[
+            ("LICENCE_GRACE_UNTIL", "2026-11-16"),
+            ("LICENCE_ALLOW_SANDBOX", "false"),
+            ("LICENCE_MAX_GROUPS", "5"),
+        ])
+        .unwrap();
+        assert_eq!(v.licence_grace_until, Some(1_794_787_200));
+        assert!(!v.licence_allow_sandbox);
+        assert_eq!(v.licence_max_groups, 5);
+        assert_eq!(
+            hosted(&[("LICENCE_GRACE_UNTIL", "2026-11-16T12:00:00+01:00")])
+                .unwrap()
+                .licence_grace_until,
+            Some(1_794_787_200 + 11 * 3600)
+        );
+        assert!(hosted(&[("LICENCE_GRACE_UNTIL", "next week")]).is_err());
+        assert!(hosted(&[("LICENCE_MAX_GROUPS", "0")]).is_err());
     }
 
     #[test]

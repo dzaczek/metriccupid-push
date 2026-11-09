@@ -2,6 +2,8 @@
 //! derivation, sealing and request signing exactly as PROTOCOL.md specifies.
 #![allow(dead_code)]
 
+pub mod licence;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -193,10 +195,18 @@ impl Client {
     }
 
     pub async fn create_group(&self) -> Resp {
-        let body = serde_json::json!({
+        self.create_group_with(serde_json::json!({})).await
+    }
+
+    /// `POST /v2/groups` with extra fields (e.g. `licence`).
+    pub async fn create_group_with(&self, extra: serde_json::Value) -> Resp {
+        let mut body = serde_json::json!({
             "group_id": self.group_id,
             "auth_key": STANDARD.encode(self.keys.auth),
         });
+        if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+            b.extend(e.clone());
+        }
         let resp = self
             .http
             .post(format!("{}/v2/groups", self.base))

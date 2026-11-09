@@ -25,7 +25,7 @@ use crate::config::{ApnsMode, Config, Mode};
 use crate::limits::{ip_key, AuthBans, Clock, ExpiringSet, RateLimits, RetryAfter, V2Limits};
 use crate::pushover::{Message, PushoverClient, SendError};
 use crate::v2::apns::{ApnsSender, DirectApns, GatewayApns, MockApns};
-use crate::v2::licence::OpenRegistration;
+use crate::v2::licence::{AppTransactionVerifier, LicencePolicy};
 use crate::v2::store::{self, Store};
 use crate::v2::stream::Hub;
 use crate::v2::{self as v2, V2State};
@@ -82,6 +82,21 @@ impl AppState {
             clock,
             v2,
         })
+    }
+
+    /// Like `new`, but App Store licences are checked against `licence_root`
+    /// (DER) instead of Apple Root CA - G3. For tests, which cannot get
+    /// Apple-signed transactions.
+    pub fn new_with_licence_root(
+        config: &Config,
+        resolver: ClientIpResolver,
+        clock: Arc<dyn Clock>,
+        licence_root: Vec<u8>,
+    ) -> Result<Self, String> {
+        let mut s = Self::new(config, resolver, clock.clone())?;
+        s.v2.licence.verifier =
+            AppTransactionVerifier::with_root(licence_root, config.v2.licence_allow_sandbox);
+        Ok(s)
     }
 
     pub fn now(&self) -> u64 {
@@ -185,9 +200,12 @@ fn build_v2(config: &Config, clock: Arc<dyn Clock>) -> Result<V2State, String> {
         sender,
         mock,
         gateway,
-        licence: Box::new(OpenRegistration {
-            open: c.hosted_open_registration,
-        }),
+        licence: LicencePolicy {
+            mode: c.licence_mode,
+            verifier: AppTransactionVerifier::apple(c.licence_allow_sandbox),
+            max_groups: c.licence_max_groups,
+            grace_until: c.licence_grace_until,
+        },
         ws_ping: c.ws_ping,
         presence: v2::presence::Presence::new(c.mac_offline_grace),
         activities: v2::activity::Activities::new(),

@@ -215,7 +215,7 @@ APNs payloads are limited to 4096 bytes. With the fixed payload of section 6.1, 
 
 ### 5.1 Signature
 
-Every v2 request except `POST /v2/groups` carries:
+Every v2 request except `POST /v2/groups` (creating a group) carries:
 
 | Header | Value |
 |---|---|
@@ -267,20 +267,30 @@ kind, `403 wrong_device_kind`.
 ### 6.1 `POST /v2/groups` (unauthenticated)
 
 ```json
-{"group_id": "EBESExQVFhcYGRobHB0eHw", "auth_key": "<base64 of the 32-byte auth_key>", "licence": "<optional, reserved>"}
+{"group_id": "EBESExQVFhcYGRobHB0eHw", "auth_key": "<base64 of the 32-byte auth_key>",
+ "licence": {"kind": "app_transaction", "jws": "<AppTransaction.jwsRepresentation>"}}
 ```
+
+`licence` is optional except on a hosted server in `LICENCE_MODE=app_transaction` (section 13); `jws`
+at most 12 KB. `gateway: true` is set only by a self-hosted server forwarding the registration to its
+gateway (section 9).
 
 | Status | Body | Meaning |
 |---|---|---|
-| 201 | `{"status":"created"}` | |
-| 200 | `{"status":"exists"}` | same id, same key: idempotent retry |
+| 201 | `{"status":"created","licence":{...} or null}` | `licence` as in `GET /v2/status`: null when none was attached |
+| 200 | `{"status":"exists","licence":...}` | same id, same key: idempotent retry |
 | 409 | `{"error":"group_exists"}` | same id, different key |
-| 402 | `{"error":"licence_required"}` | `MODE=hosted` and the licence check refused (today: unless `HOSTED_OPEN_REGISTRATION=true`) |
+| 402 | `{"error":"licence_required"}` | hosted, `LICENCE_MODE=app_transaction`, no `licence` |
+| 403 | `{"error":"licence_invalid","reason":"<code>"}` | the licence did not verify (section 13.3) |
+| 403 | `{"error":"licence_in_use"}` | the purchase is already attached to `LICENCE_MAX_GROUPS` groups; the group is not created |
 | 502 | `{"error":"gateway_error"}` | `APNS_MODE=gateway` and the gateway did not accept the registration; retry |
 | 429 | `{"error":"rate_limited"}` | per-IP registration limit (default 6 per hour, burst 3) |
 
-`licence` is reserved for an App Store signed transaction (JWS) in a later version and is ignored
-today (at most 12 KB).
+### 6.1a `DELETE /v2/groups` (Mac)
+
+Deletes the caller's group with its devices, mailbox, command queue, Live Activity tokens and licence
+attachment (which frees a slot for the purchase, section 13). Live streams of the group are closed.
+`204`. The Mac SHOULD call it before it forgets a group secret ("Reset link").
 
 ### 6.2 `PUT /v2/devices/{device_id}`
 
@@ -323,8 +333,15 @@ Is a Mac able to receive commands and send alerts right now?
 
 ```json
 {"mac_online": false, "mac_last_seen": 1700000000,
- "macs": [{"device_id": "...", "online": false, "last_seen": 1700000000}]}
+ "macs": [{"device_id": "...", "online": false, "last_seen": 1700000000}],
+ "licence": {"tier": "founder", "environment": "production", "verified_at": 1700000000},
+ "licence_required": false, "licence_grace_until": null}
 ```
+
+`licence` is the group's licence (section 13) or `null`. `licence_required` is true when the group
+has none and the server refuses its messages and commands right now (`402`); `licence_grace_until` is
+the end of the grace period (Unix seconds) on a server in `LICENCE_MODE=app_transaction` that has
+one, else `null`. Self-hosted servers answer `null`, `false`, `null`.
 
 `mac_online` is true if any Mac of the group has a live stream; `mac_last_seen` is the latest
 `last_seen` of the group's Macs (`null` if none ever connected). Phones SHOULD call it when they come
@@ -436,6 +453,7 @@ result.
 - `GET /v2/debug/pushes`: only with `APNS_MODE=mock`; the recorded pushes. Unauthenticated, for local
   development only.
 - `POST /v2/gateway/push`: only with `MODE=hosted`, section 9.
+- `PUT /v2/licence`: only with `MODE=hosted`, section 13.
 
 ### 6.10 Live Activity (Dynamic Island and Lock Screen)
 
@@ -615,8 +633,11 @@ With `APNS_MODE=gateway` it forwards each push job to the hosted service (`GATEW
 `https://push-metriccupid.sysop.cat`):
 
 1. When the Mac creates the group on the self-hosted server, that server forwards the same
-   `POST /v2/groups` body (`group_id`, `auth_key`, `licence`) to the gateway. A refusal by the gateway
-   is returned to the Mac (`402`, `409`, `502`); the request is idempotent and can be retried.
+   `POST /v2/groups` body (`group_id`, `auth_key`, `licence` if any) to the gateway with
+   `"gateway": true`. The gateway then requires no licence: self-hosting stays free. A refusal by the
+   gateway is returned to the Mac (`402`, `403`, `409`, `502`); the request is idempotent and can be
+   retried. A self-hosted server with licence support needs a gateway with licence support too (older
+   gateways reject the `gateway` field with `400`).
 2. Each push job is sent to the gateway:
 
 ```
@@ -659,6 +680,7 @@ nothing but the group registration.
 | Timing, sizes, counts of messages and commands, which device sent them | yes |
 | `urgency` (critical / normal / silent) and message `type` | yes: a documented leak needed for APNs priority, sound and category |
 | Client IP addresses | yes (logged with the group id) |
+| Licence (hosted): App Store purchase id, environment, original purchase date, original app version and platform, when verified | yes, section 13.5 |
 | Whether and when each Mac is connected (`last_seen`), and why it disconnected (`bye` reason) | yes: the server uses it for presence pushes (section 7a), which are plaintext but contain nothing else |
 | `summary` contents | no (ciphertext; only that one was sent, and when) |
 | Live Activity state: counts of critical / warning / unknown alerts and their changes over time | **yes, plaintext** (section 6.10): ActivityKit applies it without the extension, so it cannot be encrypted. Also visible to APNs (Apple). |
@@ -685,13 +707,104 @@ garbage that receivers drop, but cannot read or forge content.
 | Live Activity pushes per group | at most 1 per 5 s (coalesced; `end` immediate) | no |
 | Push-to-start per phone | 1 per 8 h | no |
 | Group registrations per IP | 6/h, burst 3 | `RATE_V2_GROUPS_*` |
+| Groups per App Store purchase (hosted) | 3 | `LICENCE_MAX_GROUPS` |
 | Streams per server | 1024 | no |
 | Mac offline grace (lost stream, no `bye`) | 120 s | `MAC_OFFLINE_GRACE_SECS` |
 | Per-IP, global, auth-failure bans | as v1 | as v1 |
 
 ## 12. Error codes
 
-`unauthorized` (401), `unknown_device`, `wrong_device_kind` (403), `not_found` (404),
-`group_exists`, `device_limit` (409), `licence_required` (402), `payload_too_large` (413),
+`unauthorized` (401), `unknown_device`, `wrong_device_kind`, `licence_invalid` (with `reason`),
+`licence_in_use` (403), `not_found` (404), `group_exists`, `device_limit` (409),
+`licence_required` (402), `payload_too_large` (413),
 `rate_limited`, `queue_full` (429), `invalid_request` (400, with `detail`), `storage_error` (500),
 `gateway_error`, `upstream_error` (502), `too_many_streams` (503).
+
+## 13. Licences (hosted service)
+
+A self-hosted server never requires a licence. The hosted service (`MODE=hosted`) is included with
+the purchase of the MetricCupid app ("model A"): a group needs proof that one of its users owns the
+app. Today that proof is StoreKit 2's `AppTransaction`, and every such licence has tier `founder`.
+
+### 13.1 Modes
+
+| `LICENCE_MODE` | Behaviour |
+|---|---|
+| `open` | Any group may register and send. A `licence` in `POST /v2/groups` is verified and attached when valid, otherwise ignored; `PUT /v2/licence` works. `HOSTED_OPEN_REGISTRATION=true` is an alias. |
+| `app_transaction` (hosted default) | `POST /v2/groups` needs a valid licence (`402` / `403`), except gateway registrations (section 9). Groups without one may authenticate, read (`GET` routes, `/v2/stream`, devices, acks) and attach one, but `POST /v2/messages`, `POST /v2/commands` and `POST /v2/activity-state` return `402 licence_required`. |
+
+`LICENCE_GRACE_UNTIL` (RFC 3339 time or `YYYY-MM-DD`, UTC midnight) lets groups without a licence
+keep sending until then, so groups created during the open beta keep working while their Macs update
+and attach one. New groups need a licence during the grace period too.
+
+### 13.2 Client flow
+
+1. The Mac creates a group on the hosted server with `licence: {"kind": "app_transaction", "jws":
+   AppTransaction.shared.jwsRepresentation}`. It MUST NOT send a licence to any other server.
+2. Whenever `GET /v2/status` shows `licence: null` on the hosted server, the Mac attaches one:
+
+```
+PUT /v2/licence          (signed, any registered device)
+{"kind": "app_transaction", "jws": "<AppTransaction.jwsRepresentation>"}
+```
+
+   `200 {"status": "attached" | "refreshed", "licence": {"tier", "environment", "verified_at"}}`, or
+   the `403` answers of section 6.1. Attaching the same purchase again refreshes `verified_at`;
+   another purchase replaces the group's licence.
+3. On `402 licence_required` a sender MUST NOT retry the request: it SHOULD back off, show the
+   problem once, and try again after attaching a licence. The iPhone app cannot attach one (it does
+   not hold the Mac's purchase context); it SHOULD tell the user to open MetricCupid on the Mac.
+4. Before forgetting a group, the Mac SHOULD `DELETE /v2/groups`, which frees the purchase's slot.
+
+### 13.3 Verification
+
+The server verifies the JWS as Apple's App Store Server Library does:
+
+- compact JWS, header `alg: "ES256"` and `x5c` with exactly three certificates (leaf, intermediate,
+  root);
+- the root is byte-for-byte Apple Root CA - G3 (embedded in the server, SHA-256
+  `63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179`);
+- each certificate is issued by the next (names and ECDSA signatures; Apple uses P-384 / SHA-384),
+  the intermediate is a CA, all three are valid **at the payload's `signedDate`** (or
+  `receiptCreationDate` if absent), not at the current time, so a later certificate rotation does
+  not void old transactions;
+- the leaf has extension `1.2.840.113635.100.6.11.1`, the intermediate `1.2.840.113635.100.6.2.1`;
+- the JWS signature (P-256, SHA-256) verifies with the leaf key;
+- payload: `bundleId` is `cat.sysop.MetricCupid`; `receiptType` is `Production`, or `Sandbox`
+  (TestFlight) while `LICENCE_ALLOW_SANDBOX=true`; never `Xcode`; for `Production`, `appAppleId`, if
+  present, is `6757280443` (StoreKit has been seen to omit it on real installs; bundle id and
+  Apple's signature already identify the app).
+
+`reason` codes of `403 licence_invalid`: `unsupported_kind`, `malformed`, `chain`, `untrusted_root`,
+`certificate_expired`, `not_apple`, `signature`, `wrong_bundle`, `wrong_app`, `environment`. The JWS
+is never echoed or logged. `deviceVerification` is not used: the same purchase is valid on every
+device of the Apple ID.
+
+### 13.4 Sharing limit
+
+A purchase is identified by `appTransactionId`. If the payload has none (older OS versions), by
+`sha256:` + hex SHA-256 of `"{originalPurchaseDate}|{appAppleId}|{originalPlatform}"` (missing values
+as `0` / empty). One purchase may be attached to at most `LICENCE_MAX_GROUPS` (default 3) groups;
+another group gets `403 licence_in_use`. All Macs and iPhones of one Apple ID normally share one group
+(the group secret syncs through iCloud Keychain), so the limit is about separate setups. A slot is
+freed by deleting a group (section 6.1a).
+
+### 13.5 What is stored
+
+Per group: licence kind (`app_transaction`), `tier`, environment (`production` / `sandbox`), the
+purchase id of 13.4, `originalPurchaseDate`, `originalApplicationVersion`, `originalPlatform`, when it
+was first attached and last verified. Not stored: the JWS, `deviceVerification`, the Apple ID or any
+other payload field. Responses only ever contain `tier`, `environment` and `verified_at`. Deleting the
+group deletes the row.
+
+### 13.6 Tiers and the planned subscription model
+
+Every licence verified under model A has tier `founder`. A later version may introduce a free tier
+and subscriptions (`pro`, StoreKit `Transaction` JWS with an expiry). The migration keeps founders:
+
+- groups whose stored tier is `founder` stay `founder`, without a subscription;
+- a purchase whose `originalPurchaseDate` (or `originalApplicationVersion`) predates the switch keeps
+  qualifying as `founder` when attached to a new group, because the `AppTransaction` of an earlier
+  paid download still carries the original purchase;
+- new kinds will be added to `licence.kind` (`app_transaction` stays valid); clients SHOULD show an
+  unknown `tier` as "licensed" and MUST rely on `licence_required`, not on the tier, for behaviour.

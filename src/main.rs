@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metriccupid_push::client_ip::ClientIpResolver;
-use metriccupid_push::config::{ApnsMode, Config, LogFormat, Mode, TrustProxy};
+use metriccupid_push::config::{ApnsMode, Config, LicenceMode, LogFormat, Mode, TrustProxy};
 use metriccupid_push::limits::SystemClock;
 use metriccupid_push::{serve, spawn_activities, spawn_cleanup, spawn_presence, AppState};
 
@@ -118,6 +118,11 @@ async fn async_main(config: Config) -> Result<(), String> {
         secrets = config.secrets.len(),
         allow_emergency = config.allow_emergency,
         apns_mode,
+        licence = match config.v2.licence_mode {
+            LicenceMode::Open => "open",
+            LicenceMode::AppTransaction => "app_transaction",
+        },
+        licence_grace_until = config.v2.licence_grace_until,
         data_dir = %config.v2.data_dir.display(),
         version = env!("CARGO_PKG_VERSION"),
         "metriccupid-push listening"

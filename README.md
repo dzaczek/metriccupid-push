@@ -246,7 +246,7 @@ exposes them at `GET /v2/debug/pushes`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MODE` | `selfhosted` | `hosted` enables the licence gate on `POST /v2/groups` and the gateway endpoint `POST /v2/gateway/push`. |
+| `MODE` | `selfhosted` | `hosted` enables App Store licences (`LICENCE_MODE`), `PUT /v2/licence` and the gateway endpoint `POST /v2/gateway/push`. |
 | `APNS_MODE` | `gateway` (`direct` in hosted) | `direct`, `gateway` or `mock`. `gateway` is not allowed with `MODE=hosted`. |
 | `APNS_KEY_P8` | required for `direct` | Path to the `.p8` file, or the PEM itself (a one-line PEM with literal `\n` works). |
 | `APNS_KEY_ID` | required for `direct` | 10-character key id. |
@@ -254,7 +254,11 @@ exposes them at `GET /v2/debug/pushes`.
 | `APNS_TOPIC` | `cat.sysop.MetricCupid` | iOS app bundle id (`apns-topic`). |
 | `GATEWAY_URL` | `https://push-metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. |
 | `DATA_DIR` | `/data` | Directory for the SQLite database (`metriccupid-push.sqlite3`, WAL). Must be writable. |
-| `HOSTED_OPEN_REGISTRATION` | `false` | `MODE=hosted` only: allow every group registration (stub until App Store licences are verified); otherwise `402 licence_required`. |
+| `LICENCE_MODE` | `app_transaction` in hosted, `open` self-hosted | `MODE=hosted` only. `app_transaction`: a group needs a verified App Store purchase of the app (StoreKit `AppTransaction` JWS) to register and to send; unlicensed groups can still read. `open`: anyone (open beta). Self-hosted servers never require a licence. See PROTOCOL.md section 13. |
+| `HOSTED_OPEN_REGISTRATION` | `false` | Alias: `true` means `LICENCE_MODE=open` (an error together with `LICENCE_MODE=app_transaction`). |
+| `LICENCE_ALLOW_SANDBOX` | `true` | Accept TestFlight (`Sandbox`) transactions. `Xcode` transactions are always refused. Set `false` after the beta. |
+| `LICENCE_MAX_GROUPS` | `3` | Groups one purchase may be attached to; more get `403 licence_in_use`. |
+| `LICENCE_GRACE_UNTIL` | empty | RFC 3339 time or `YYYY-MM-DD` (UTC). Until then groups without a licence may still send, so beta groups keep working while their Macs attach one. |
 | `RATE_V2_MESSAGES_PER_SEC` / `_BURST` | `2` / `60` | Per-group bucket for `POST /v2/messages`. |
 | `RATE_V2_COMMANDS_PER_SEC` / `_BURST` | `1` / `20` | Per-group bucket for `POST /v2/commands`. |
 | `RATE_V2_GATEWAY_PER_SEC` / `_BURST` | `5` / `50` | Hosted: per-group bucket for gateway pushes. |
@@ -292,7 +296,10 @@ The server, and anyone who controls it, can see:
   state, a reason (`quit`, `sleep`, `disabled`, `lost`) and a time, never alert content.
 - the Live Activity state in plaintext: how many critical / warning / unknown alerts are active,
   and, only with the Mac's "Show host names on the lock screen (sent unencrypted)" setting, up to 4
-  lines of severity + host / service (40 characters each).
+  lines of severity + host / service (40 characters each);
+- hosted only: the group's licence, i.e. the App Store purchase id (`appTransactionId`),
+  environment, original purchase date, original app version and platform (never the JWS or the
+  Apple ID; PROTOCOL.md 13.5).
 
 Apart from those opt-in Live Activity lines, it cannot see alert titles, hosts, services, summaries,
 URLs, commands or results, and it cannot
@@ -434,10 +441,8 @@ by `examples/smoke.rs`.
 
 ## Roadmap
 
-- **Hosted Pro mode** (`MODE=hosted`): App Store signed transaction (JWS) verification behind the
-  `Licence` trait (`src/v2/licence.rs`), per-licence quotas. Today registration is open or closed via
-  `HOSTED_OPEN_REGISTRATION`; `/v1/notify` returns `501`.
-- v2: QR pairing and group key rotation; group deletion and expiry of inactive groups.
+- Hosted: free tier and subscriptions next to today's `founder` licences (PROTOCOL.md 13.6).
+- v2: QR pairing and group key rotation; expiry of inactive groups.
 - "Minimal content" option (send only severity and host).
 - Server-side alert polling, so notifications arrive while the Mac sleeps.
 

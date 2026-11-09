@@ -42,9 +42,11 @@ use self::apns::{
     GatewayRegistration, McEnvelope, MessageType, MockApns, PresenceNote, PushContent, PushError,
     PushJob, Urgency, DEVICE_HEADER, GROUP_HEADER, MAX_PAYLOAD_BYTES, PRESENCE_COLLAPSE_ID,
 };
-use self::licence::Licence;
+use self::licence::{LicenceError, LicencePolicy, LicenceReq, VerifiedLicence};
 use self::presence::Presence;
-use self::store::{CreateGroup, Device, Insert, NewMessage, Store, StoreError, Upsert};
+use self::store::{
+    Attach, CreateGroup, Device, GroupLicence, Insert, NewMessage, Store, StoreError, Upsert,
+};
 use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME, MAX_STREAMS};
 use crate::api::{error, invalid, json_error, precheck, too_many, AppState, Outcome};
 use crate::config::Mode;
@@ -67,7 +69,7 @@ pub struct V2State {
     pub mock: Option<Arc<MockApns>>,
     /// Set in `APNS_MODE=gateway`: group registrations are forwarded too.
     pub gateway: Option<Arc<GatewayApns>>,
-    pub licence: Box<dyn Licence>,
+    pub licence: LicencePolicy,
     pub ws_ping: Duration,
     pub presence: Presence,
     pub activities: Activities,
@@ -78,7 +80,7 @@ pub const PRESENCE_TTL_SECS: u64 = 3600;
 
 pub fn routes(mode: Mode, mock: bool) -> Router<Arc<AppState>> {
     let mut r = Router::new()
-        .route("/v2/groups", post(create_group))
+        .route("/v2/groups", post(create_group).delete(delete_group))
         .route("/v2/devices", get(list_devices))
         .route("/v2/status", get(get_status))
         .route(
@@ -99,7 +101,9 @@ pub fn routes(mode: Mode, mock: bool) -> Router<Arc<AppState>> {
         .route("/v2/activity-state", post(post_activity_state))
         .route("/v2/stream", get(open_stream));
     if mode == Mode::Hosted {
-        r = r.route(apns::GATEWAY_PUSH_PATH, post(gateway_push));
+        r = r
+            .route(apns::GATEWAY_PUSH_PATH, post(gateway_push))
+            .route("/v2/licence", put(put_licence));
     }
     if mock {
         r = r.route("/v2/debug/pushes", get(debug_pushes));
@@ -311,7 +315,65 @@ struct CreateGroupReq {
     group_id: String,
     auth_key: String,
     #[serde(default)]
-    licence: Option<String>,
+    licence: Option<LicenceReq>,
+    /// Set by a self-hosted server forwarding the registration to its
+    /// gateway: such groups only push through the gateway and need no licence.
+    #[serde(default)]
+    gateway: bool,
+}
+
+// -------------------------------------------------------------- licences ---
+
+fn licence_invalid(e: LicenceError) -> Outcome {
+    tracing::info!(reason = e.code(), "licence refused");
+    (
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "licence_invalid", "reason": e.code() })),
+        )
+            .into_response(),
+        "licence_invalid",
+    )
+}
+
+fn licence_in_use() -> Outcome {
+    (
+        error(StatusCode::FORBIDDEN, "licence_in_use"),
+        "licence_in_use",
+    )
+}
+
+fn licence_required() -> Outcome {
+    (
+        error(StatusCode::PAYMENT_REQUIRED, "licence_required"),
+        "licence_required",
+    )
+}
+
+/// `licence` in responses: never the purchase id.
+fn licence_json(tier: &str, environment: &str, verified_at: u64) -> serde_json::Value {
+    json!({ "tier": tier, "environment": environment, "verified_at": verified_at })
+}
+
+fn stored_licence_json(l: Option<&GroupLicence>) -> serde_json::Value {
+    l.map_or(serde_json::Value::Null, |l| {
+        licence_json(&l.tier, &l.environment, l.verified_at)
+    })
+}
+
+/// 402 unless the group may send: it has a licence, or the server does not
+/// enforce one (open mode, self-hosted, grace period).
+async fn require_licence(state: &AppState, group: &str) -> Result<(), Outcome> {
+    let v2 = state.v2();
+    if !v2.licence.enforced(state.now()) {
+        return Ok(());
+    }
+    let g = group.to_string();
+    match v2.store.call(move |c| store::group_licence(c, &g)).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(licence_required()),
+        Err(e) => Err(storage_error(e)),
+    }
 }
 
 async fn create_group(
@@ -350,37 +412,76 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
         Some(k) => k,
         None => return bad("auth_key must be 32 bytes, standard base64"),
     };
-    if req.licence.as_ref().is_some_and(|l| l.len() > 12 * 1024) {
+    if req
+        .licence
+        .as_ref()
+        .is_some_and(|l| l.jws.len() > licence::MAX_JWS_LEN)
+    {
         return bad("licence too long");
     }
-    if state.mode() == Mode::Hosted && !v2.licence.allows(req.licence.as_deref()) {
-        return (
-            error(StatusCode::PAYMENT_REQUIRED, "licence_required"),
-            "licence_required",
-        );
-    }
+
+    // Hosted: verify a supplied licence; in app_transaction mode one is
+    // required. In open mode a bad licence is only logged (the Mac learns
+    // about it from GET /v2/status and PUT /v2/licence). Self-hosted servers
+    // never check, they only forward it to the gateway.
+    let policy = &v2.licence;
+    let required = policy.required_for_new_groups();
+    let verified: Option<VerifiedLicence> = match (&req.licence, state.mode()) {
+        (_, Mode::SelfHosted) => None,
+        (Some(l), Mode::Hosted) => match policy.verify(l) {
+            Ok(v) => Some(v),
+            Err(e) if required => return licence_invalid(e),
+            Err(e) => {
+                tracing::info!(reason = e.code(), "open registration: licence ignored");
+                None
+            }
+        },
+        (None, Mode::Hosted) if required && !req.gateway => return licence_required(),
+        (None, Mode::Hosted) => None,
+    };
 
     let g = req.group_id.clone();
-    let created = match v2
+    let max = policy.max_groups;
+    let lic = verified.clone();
+    let stored = v2
         .store
-        .call(move |c| store::create_group(c, &g, &key, now))
-        .await
-    {
-        Ok(CreateGroup::Conflict) => {
+        .call(move |c| match lic {
+            Some(lic) if required => store::create_group_with_licence(c, &g, &key, &lic, max, now)
+                .map(|(created, a)| (created, Some(a))),
+            Some(lic) => {
+                let created = store::create_group(c, &g, &key, now)?;
+                if created == CreateGroup::Conflict {
+                    return Ok((created, None));
+                }
+                Ok((created, Some(store::attach_licence(c, &g, &lic, max, now)?)))
+            }
+            None => Ok((store::create_group(c, &g, &key, now)?, None)),
+        })
+        .await;
+    let (created, attached) = match stored {
+        Ok((CreateGroup::Conflict, _)) => {
             return (
                 error(StatusCode::CONFLICT, "group_exists"),
                 "group_conflict",
             )
         }
-        Ok(c) => c,
+        Ok((_, Some(Attach::InUse))) if required => return licence_in_use(),
+        Ok((c, a)) => (c, a),
         Err(e) => return storage_error(e),
+    };
+    let licence = match (&verified, attached) {
+        (Some(v), Some(Attach::Attached | Attach::Refreshed)) => {
+            licence_json(v.tier, v.environment, now)
+        }
+        _ => serde_json::Value::Null,
     };
 
     // Self-hosted with the hosted gateway: the gateway must know the group to
     // accept our signed push jobs. Idempotent, so a client retry after a
     // gateway failure is safe.
     if let Some(gw) = &v2.gateway {
-        let mut fwd = json!({ "group_id": req.group_id, "auth_key": req.auth_key });
+        let mut fwd =
+            json!({ "group_id": req.group_id, "auth_key": req.auth_key, "gateway": true });
         if let Some(l) = &req.licence {
             fwd["licence"] = json!(l);
         }
@@ -390,6 +491,16 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
                 return (
                     error(StatusCode::PAYMENT_REQUIRED, "licence_required"),
                     "gateway_licence_required",
+                )
+            }
+            GatewayRegistration::Status(403) => {
+                return (
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "licence_invalid", "reason": "gateway" })),
+                    )
+                        .into_response(),
+                    "gateway_licence_invalid",
                 )
             }
             GatewayRegistration::Status(409) => {
@@ -409,9 +520,111 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
     }
 
     match created {
-        CreateGroup::Created => ok(StatusCode::CREATED, json!({"status": "created"}), "created"),
-        _ => ok(StatusCode::OK, json!({"status": "exists"}), "exists"),
+        CreateGroup::Created => ok(
+            StatusCode::CREATED,
+            json!({"status": "created", "licence": licence}),
+            "created",
+        ),
+        _ => ok(
+            StatusCode::OK,
+            json!({"status": "exists", "licence": licence}),
+            "exists",
+        ),
     }
+}
+
+/// `DELETE /v2/groups` (Mac): delete the caller's group and all its data,
+/// which also frees its licence slot.
+async fn delete_group(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "DELETE",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("mac")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let g = a.group.clone();
+        let devices = state
+            .v2()
+            .store
+            .call(move |c| {
+                let devices = store::list_devices(c, &g)?;
+                store::delete_group(c, &g)?;
+                Ok(devices)
+            })
+            .await
+            .map_err(storage_error)?;
+        for d in devices {
+            state.v2().hub.remove_device(&a.group, &d.device_id);
+        }
+        Ok((StatusCode::NO_CONTENT.into_response(), "deleted"))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("groups.delete", ip, started, group.as_deref(), r)
+}
+
+/// `PUT /v2/licence` (hosted only): attach or refresh the group's licence.
+async fn put_licence(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "PUT",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(None),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let req: LicenceReq = parse(&body)?;
+        let v2 = state.v2();
+        let lic = v2.licence.verify(&req).map_err(licence_invalid)?;
+        let (g, max, now) = (a.group.clone(), v2.licence.max_groups, state.now());
+        let l = lic.clone();
+        let attached = v2
+            .store
+            .call(move |c| store::attach_licence(c, &g, &l, max, now))
+            .await
+            .map_err(storage_error)?;
+        let status = match attached {
+            Attach::InUse => return Err(licence_in_use()),
+            Attach::Attached => "attached",
+            Attach::Refreshed => "refreshed",
+        };
+        Ok(ok(
+            StatusCode::OK,
+            json!({ "status": status, "licence": licence_json(lic.tier, lic.environment, now) }),
+            status,
+        ))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("licence.put", ip, started, group.as_deref(), r)
 }
 
 // --------------------------------------------------------------- devices ---
@@ -626,10 +839,10 @@ async fn get_status(
         .await?;
         group = Some(a.group.clone());
         let g = a.group.clone();
-        let devices = state
+        let (devices, licence) = state
             .v2()
             .store
-            .call(move |c| store::list_devices(c, &g))
+            .call(move |c| Ok((store::list_devices(c, &g)?, store::group_licence(c, &g)?)))
             .await
             .map_err(storage_error)?;
         let hub = &state.v2().hub;
@@ -646,9 +859,18 @@ async fn get_status(
                 json!({ "device_id": d.device_id, "online": online, "last_seen": d.last_seen })
             })
             .collect();
+        let policy = &state.v2().licence;
+        let in_force = policy.required_for_new_groups();
         Ok(ok(
             StatusCode::OK,
-            json!({ "mac_online": mac_online, "mac_last_seen": mac_last_seen, "macs": list }),
+            json!({
+                "mac_online": mac_online,
+                "mac_last_seen": mac_last_seen,
+                "macs": list,
+                "licence": stored_licence_json(licence.as_ref()),
+                "licence_required": in_force && licence.is_none() && policy.enforced(state.now()),
+                "licence_grace_until": if in_force { policy.grace_until } else { None },
+            }),
             "status",
         ))
     }
@@ -695,6 +917,7 @@ async fn post_message(
         )
         .await?;
         group = Some(a.group.clone());
+        require_licence(&state, &a.group).await?;
         if let Err(ra) = state.v2().limits.check_messages(&a.group) {
             return Err((too_many(ra), "rate_limited_group"));
         }
@@ -1271,6 +1494,7 @@ async fn post_activity_state(
         )
         .await?;
         group = Some(a.group.clone());
+        require_licence(&state, &a.group).await?;
         let v2 = state.v2();
         if let Err(ra) = v2.limits.check_activity(&a.group) {
             return Err((too_many(ra), "rate_limited_group"));
@@ -1432,6 +1656,7 @@ async fn post_command(
         )
         .await?;
         group = Some(a.group.clone());
+        require_licence(&state, &a.group).await?;
         if let Err(ra) = state.v2().limits.check_commands(&a.group) {
             return Err((too_many(ra), "rate_limited_group"));
         }

@@ -97,7 +97,15 @@ async fn server_at(data: &Path, overrides: &[(&str, &str)], clock: Arc<TestClock
     }
     let config = Config::from_lookup(|k| env.get(k).cloned()).expect("valid test config");
     let resolver = ClientIpResolver::from_config(&config.trust_proxy).await;
-    let state = Arc::new(AppState::new(&config, resolver, clock.clone()).unwrap());
+    let state = Arc::new(
+        AppState::new_with_licence_root(
+            &config,
+            resolver,
+            clock.clone(),
+            common::licence::CHAIN.root.clone(),
+        )
+        .unwrap(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -978,9 +986,27 @@ async fn gateway_rejects_unknown_groups_licence_and_rate() {
     let (_d1, hosted) = server(&[("MODE", "hosted"), ("RATE_V2_GATEWAY_BURST", "2")]).await;
     let (_d2, selfhosted) =
         server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
-    // Hosted without open registration: the self-hosted create fails with 402.
+    // Hosted requires licences, but a self-hosted server's forwarded
+    // registration (`gateway: true`) needs none: self-hosting is free.
     let r = selfhosted.group(150).create_group().await;
-    assert_eq!(r.status, 402, "{:?}", r.json);
+    assert_eq!(r.status, 201, "{:?}", r.json);
+    // Claiming `gateway` directly gives a group that cannot send.
+    let direct = hosted.group(155);
+    assert_eq!(
+        direct
+            .create_group_with(json!({"gateway": true}))
+            .await
+            .status,
+        201
+    );
+    assert_eq!(direct.register("mac", "Mac", None).await.status, 201);
+    let r = direct
+        .post("/v2/messages", &alert_body(&direct, "x1", "normal", 10))
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
 
     // Direct gateway calls: unknown group -> 401.
     let c = Client::new(
@@ -1146,7 +1172,8 @@ async fn status_reports_mac_presence_and_last_seen() {
     assert_eq!(
         r.json,
         json!({"mac_online": false, "mac_last_seen": null,
-               "macs": [{"device_id": mac.device_id, "online": false, "last_seen": null}]})
+               "macs": [{"device_id": mac.device_id, "online": false, "last_seen": null}],
+               "licence": null, "licence_required": false, "licence_grace_until": null})
     );
 
     s.set_time(T0 + 10);
@@ -1770,4 +1797,399 @@ async fn direct_sender_uses_liveactivity_topic_and_push_type() {
     let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
     assert_eq!(body["aps"]["event"], "update");
     assert!(body.get("mc").is_none(), "no sealed envelope");
+}
+
+// ---------------------------------------------------------------- licences
+
+const HOSTED: &[(&str, &str)] = &[("MODE", "hosted"), ("LICENCE_MODE", "app_transaction")];
+
+fn lic(id: &str) -> Value {
+    common::licence::licence(id, T0)
+}
+
+#[tokio::test]
+async fn hosted_group_needs_a_valid_licence() {
+    let (_d, s) = server(HOSTED).await;
+    let mac = s.group(10);
+    let r = mac.create_group().await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
+
+    let r = mac
+        .create_group_with(json!({"licence": {"kind": "subscription", "jws": "x"}}))
+        .await;
+    assert_eq!(r.status, 403);
+    assert_eq!(
+        r.json,
+        json!({"error": "licence_invalid", "reason": "unsupported_kind"})
+    );
+    let r = mac
+        .create_group_with(json!({"licence": {"kind": "app_transaction", "jws": "a.b.c"}}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["reason"].as_str()),
+        (403, Some("malformed"))
+    );
+    let other = common::licence::Chain::build(&Default::default());
+    let foreign = other.sign(&common::licence::app_transaction("1", T0));
+    let r = mac
+        .create_group_with(json!({"licence": {"kind": "app_transaction", "jws": foreign}}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["reason"].as_str()),
+        (403, Some("untrusted_root"))
+    );
+    assert!(
+        !r.json.to_string().contains(&foreign[..20]),
+        "never echoes the JWS"
+    );
+
+    let r = mac
+        .create_group_with(json!({"licence": lic("p-200")}))
+        .await;
+    assert_eq!(r.status, 201, "{:?}", r.json);
+    assert_eq!(
+        r.json["licence"],
+        json!({"tier": "founder", "environment": "production", "verified_at": T0})
+    );
+    // Idempotent retry with the licence.
+    let r = mac
+        .create_group_with(json!({"licence": lic("p-200")}))
+        .await;
+    assert_eq!((r.status, r.json["status"].as_str()), (200, Some("exists")));
+
+    assert_eq!(mac.register("mac", "Mac", None).await.status, 201);
+    let r = mac.get("/v2/status").await;
+    assert_eq!(r.json["licence"]["tier"], "founder");
+    assert_eq!(r.json["licence_required"], false);
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "m1", "normal", 10))
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+}
+
+#[tokio::test]
+async fn one_purchase_links_at_most_three_groups_and_delete_frees_one() {
+    let (_d, s) = server(HOSTED).await;
+    for seed in [20, 23, 26] {
+        let r = s
+            .group(seed)
+            .create_group_with(json!({"licence": lic("shared")}))
+            .await;
+        assert_eq!(r.status, 201, "{:?}", r.json);
+    }
+    let fourth = s.group(29);
+    let r = fourth
+        .create_group_with(json!({"licence": lic("shared")}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("licence_in_use"))
+    );
+    let g = fourth.group_id.clone();
+    let key = s
+        .state
+        .v2()
+        .store
+        .call(move |c| store::group_key(c, &g))
+        .await
+        .unwrap();
+    assert_eq!(key, None, "the refused group was not created");
+    // Another purchase is fine.
+    assert_eq!(
+        s.group(32)
+            .create_group_with(json!({"licence": lic("other")}))
+            .await
+            .status,
+        201
+    );
+
+    // DELETE /v2/groups: Macs only, signed, removes everything.
+    let first = s.group(20);
+    assert_eq!(first.register("mac", "Mac", None).await.status, 201);
+    let phone = first.as_device(&id128(22));
+    assert_eq!(
+        phone.register("ios", "iPhone", Some(TOKEN_A)).await.status,
+        201
+    );
+    let mut ws = open_ws(&first).await.unwrap();
+    wait_ready(&mut ws).await;
+    assert_eq!(phone.send("DELETE", "/v2/groups", "").await.status, 403);
+    assert_eq!(first.send("DELETE", "/v2/groups", "").await.status, 204);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .is_ok(),
+        "stream closed"
+    );
+    assert_eq!(first.get("/v2/status").await.status, 401, "group is gone");
+
+    let r = fourth
+        .create_group_with(json!({"licence": lic("shared")}))
+        .await;
+    assert_eq!(r.status, 201, "{:?}", r.json);
+}
+
+/// A group created during the open beta, without a licence.
+async fn beta_group(s: &Server, seed: u8) -> (Client, Client) {
+    let mac = s.group(seed);
+    let (g, key) = (mac.group_id.clone(), mac.keys.auth);
+    s.state
+        .v2()
+        .store
+        .call(move |c| store::create_group(c, &g, &key, T0))
+        .await
+        .unwrap();
+    assert_eq!(mac.register("mac", "Mac", None).await.status, 201);
+    let phone = mac.as_device(&id128(seed.wrapping_add(2)));
+    assert_eq!(
+        phone.register("ios", "iPhone", Some(TOKEN_A)).await.status,
+        201
+    );
+    (mac, phone)
+}
+
+#[tokio::test]
+async fn unlicensed_group_can_read_but_not_send_until_put_licence() {
+    let (_d, s) = server(HOSTED).await;
+    let (mac, phone) = beta_group(&s, 40).await;
+
+    let r = phone.get("/v2/status").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json["licence"], Value::Null);
+    assert_eq!(r.json["licence_required"], true);
+    assert_eq!(mac.get("/v2/messages").await.status, 200);
+    let mut ws = open_ws(&mac).await.expect("stream still works");
+    wait_ready(&mut ws).await;
+
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "u1", "critical", 10))
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
+    let r = phone
+        .post("/v2/commands", &command_body(&phone, "c1"))
+        .await;
+    assert_eq!(r.status, 402);
+    let r = mac
+        .post(
+            "/v2/activity-state",
+            &json!({"event": "update", "state": {"critical": 1, "warning": 0, "unknown": 0}}),
+        )
+        .await;
+    assert_eq!(r.status, 402);
+    assert!(s.mock().pushes().is_empty());
+
+    let r = mac
+        .send(
+            "PUT",
+            "/v2/licence",
+            &json!({"kind": "app_transaction", "jws": "x"}).to_string(),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.json["reason"].as_str()),
+        (403, Some("malformed"))
+    );
+    let r = mac
+        .send("PUT", "/v2/licence", &lic("p-230").to_string())
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(r.json["status"], "attached");
+    assert_eq!(r.json["licence"]["tier"], "founder");
+    s.set_time(T0 + 5);
+    let r = mac
+        .send("PUT", "/v2/licence", &lic("p-230").to_string())
+        .await;
+    assert_eq!(r.json["status"], "refreshed");
+    assert_eq!(
+        phone.get("/v2/status").await.json["licence"]["verified_at"],
+        T0 + 5
+    );
+
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "u2", "critical", 10))
+        .await;
+    assert_eq!(r.json["pushed"], 1, "{:?}", r.json);
+    assert_eq!(
+        phone
+            .post("/v2/commands", &command_body(&phone, "c2"))
+            .await
+            .status,
+        200
+    );
+
+    // The cap applies to PUT too.
+    for seed in [43, 46] {
+        let (m, _) = beta_group(&s, seed).await;
+        assert_eq!(
+            m.send("PUT", "/v2/licence", &lic("p-230").to_string())
+                .await
+                .status,
+            200
+        );
+    }
+    let (m, _) = beta_group(&s, 49).await;
+    let r = m
+        .send("PUT", "/v2/licence", &lic("p-230").to_string())
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("licence_in_use"))
+    );
+}
+
+#[tokio::test]
+async fn grace_period_lets_beta_groups_send_until_it_ends() {
+    let grace = T0 + 3600;
+    let until = "2023-11-14T23:13:20Z"; // T0 + 3600
+    assert_eq!(metriccupid_push::config::parse_rfc3339(until), Some(grace));
+    let (_d, s) = server(&[
+        ("MODE", "hosted"),
+        ("LICENCE_MODE", "app_transaction"),
+        ("LICENCE_GRACE_UNTIL", until),
+    ])
+    .await;
+    // New groups still need a licence during the grace period.
+    assert_eq!(s.group(50).create_group().await.status, 402);
+    let (mac, _phone) = beta_group(&s, 52).await;
+    let r = mac.get("/v2/status").await;
+    assert_eq!(r.json["licence_required"], false);
+    assert_eq!(r.json["licence_grace_until"], grace);
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "g1", "normal", 10))
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+
+    s.set_time(grace);
+    assert_eq!(mac.get("/v2/status").await.json["licence_required"], true);
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "g2", "normal", 10))
+        .await;
+    assert_eq!(r.status, 402);
+}
+
+#[tokio::test]
+async fn open_mode_accepts_any_group_and_records_valid_licences() {
+    let (_d, s) = server(&[("MODE", "hosted"), ("HOSTED_OPEN_REGISTRATION", "true")]).await;
+    let r = s.group(60).create_group().await;
+    assert_eq!(r.status, 201);
+    assert_eq!(r.json["licence"], Value::Null);
+    let r = s
+        .group(62)
+        .create_group_with(json!({"licence": {"kind": "app_transaction", "jws": "a.b.c"}}))
+        .await;
+    assert_eq!(r.status, 201, "a bad licence does not block the open beta");
+    assert_eq!(r.json["licence"], Value::Null);
+    let mac = s.group(64);
+    let r = mac
+        .create_group_with(json!({"licence": lic("p-254")}))
+        .await;
+    assert_eq!(r.json["licence"]["tier"], "founder");
+    assert_eq!(mac.register("mac", "Mac", None).await.status, 201);
+    let r = mac.get("/v2/status").await;
+    assert_eq!(r.json["licence"]["tier"], "founder");
+    assert_eq!(r.json["licence_required"], false);
+    assert_eq!(r.json["licence_grace_until"], Value::Null);
+    let (beta, _) = beta_group(&s, 66).await;
+    assert_eq!(beta.get("/v2/status").await.json["licence_required"], false);
+    let r = beta
+        .post("/v2/messages", &alert_body(&beta, "o1", "normal", 10))
+        .await;
+    assert_eq!(r.status, 200);
+    // PUT /v2/licence works in open mode, so beta groups can attach early.
+    let r = beta
+        .send("PUT", "/v2/licence", &lic("p-256").to_string())
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+}
+
+#[tokio::test]
+async fn self_hosted_never_requires_a_licence() {
+    let (_d, s) = server(&[]).await;
+    let (mac, _phone) = setup(&s, 70).await;
+    let r = mac.get("/v2/status").await;
+    assert_eq!(r.json["licence"], Value::Null);
+    assert_eq!(r.json["licence_required"], false);
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "s1", "normal", 10))
+        .await;
+    assert_eq!(r.status, 200);
+    // Not even a broken licence is looked at; PUT /v2/licence does not exist.
+    let r = s
+        .group(72)
+        .create_group_with(json!({"licence": {"kind": "app_transaction", "jws": "x"}}))
+        .await;
+    assert_eq!(r.status, 201);
+    assert_eq!(
+        mac.send("PUT", "/v2/licence", &lic("x").to_string())
+            .await
+            .status,
+        404
+    );
+}
+
+#[tokio::test]
+async fn sandbox_transactions_follow_licence_allow_sandbox() {
+    let sandbox = || {
+        let mut p = common::licence::app_transaction("tf-1", T0);
+        p["receiptType"] = json!("Sandbox");
+        json!({"kind": "app_transaction", "jws": common::licence::CHAIN.sign(&p)})
+    };
+    let (_d, s) = server(HOSTED).await;
+    let r = s
+        .group(80)
+        .create_group_with(json!({"licence": sandbox()}))
+        .await;
+    assert_eq!(r.json["licence"]["environment"], "sandbox", "{:?}", r.json);
+    let (_d, s) = server(&[
+        ("MODE", "hosted"),
+        ("LICENCE_MODE", "app_transaction"),
+        ("LICENCE_ALLOW_SANDBOX", "false"),
+    ])
+    .await;
+    let r = s
+        .group(82)
+        .create_group_with(json!({"licence": sandbox()}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["reason"].as_str()),
+        (403, Some("environment"))
+    );
+}
+
+#[tokio::test]
+async fn licences_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock(AtomicU64::new(T0)));
+    let s = server_at(dir.path(), HOSTED, clock.clone()).await;
+    let mac = s.group(90);
+    assert_eq!(
+        mac.create_group_with(json!({"licence": lic("p-280")}))
+            .await
+            .status,
+        201
+    );
+    s.stop().await;
+    let s = server_at(dir.path(), HOSTED, clock).await;
+    let mac = Client {
+        base: s.base.clone(),
+        ..mac
+    };
+    assert_eq!(mac.register("mac", "Mac", None).await.status, 201);
+    assert_eq!(
+        mac.get("/v2/status").await.json["licence"]["tier"],
+        "founder"
+    );
 }

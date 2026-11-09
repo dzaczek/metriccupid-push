@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{params, Connection, OptionalExtension};
 use subtle::ConstantTimeEq;
 
+use super::licence::VerifiedLicence;
+
 pub const DB_FILE: &str = "metriccupid-push.sqlite3";
 pub const MAX_DEVICES: usize = 10;
 pub const MESSAGE_RETENTION_SECS: u64 = 24 * 3600;
@@ -83,6 +85,23 @@ CREATE TABLE activity_tokens (
     PRIMARY KEY (group_id, device_id, kind),
     FOREIGN KEY (group_id, device_id) REFERENCES devices(group_id, device_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
+"#,
+    // Licences (PROTOCOL.md section 13). `tier` is `founder` for every App
+    // Store purchase today; subscriptions will add other tiers.
+    r#"
+CREATE TABLE group_licences (
+    group_id                     TEXT PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
+    kind                         TEXT NOT NULL,
+    tier                         TEXT NOT NULL,
+    environment                  TEXT NOT NULL,
+    app_transaction_id           TEXT NOT NULL,
+    original_purchase_date       INTEGER,
+    original_application_version TEXT,
+    original_platform            TEXT,
+    attached_at                  INTEGER NOT NULL,
+    verified_at                  INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX group_licences_purchase ON group_licences(app_transaction_id);
 "#,
 ];
 
@@ -168,6 +187,26 @@ pub enum Insert {
     Full,
 }
 
+/// The licence attached to a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupLicence {
+    pub kind: String,
+    pub tier: String,
+    pub environment: String,
+    pub app_transaction_id: String,
+    pub verified_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attach {
+    /// First licence of the group, or another purchase than before.
+    Attached,
+    /// The same purchase again: `verified_at` and details updated.
+    Refreshed,
+    /// The purchase is already attached to `max` other groups.
+    InUse,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -235,6 +274,15 @@ pub fn create_group(
     auth_key: &[u8; 32],
     now: u64,
 ) -> Result<CreateGroup, StoreError> {
+    create_group_in(c, group_id, auth_key, now)
+}
+
+fn create_group_in(
+    c: &Connection,
+    group_id: &str,
+    auth_key: &[u8; 32],
+    now: u64,
+) -> Result<CreateGroup, StoreError> {
     let existing: Option<Vec<u8>> = c
         .query_row(
             "SELECT auth_key FROM groups WHERE group_id = ?1",
@@ -254,6 +302,127 @@ pub fn create_group(
         params![group_id, auth_key.as_slice(), now as i64],
     )?;
     Ok(CreateGroup::Created)
+}
+
+/// Delete a group and everything it owns (devices, mailbox, queue, tokens,
+/// licence). Returns whether it existed.
+pub fn delete_group(c: &mut Connection, group_id: &str) -> Result<bool, StoreError> {
+    Ok(c.execute("DELETE FROM groups WHERE group_id = ?1", [group_id])? > 0)
+}
+
+pub fn group_licence(
+    c: &mut Connection,
+    group_id: &str,
+) -> Result<Option<GroupLicence>, StoreError> {
+    Ok(c.query_row(
+        "SELECT kind, tier, environment, app_transaction_id, verified_at
+         FROM group_licences WHERE group_id = ?1",
+        [group_id],
+        |r| {
+            Ok(GroupLicence {
+                kind: r.get(0)?,
+                tier: r.get(1)?,
+                environment: r.get(2)?,
+                app_transaction_id: r.get(3)?,
+                verified_at: ts(r.get(4)?),
+            })
+        },
+    )
+    .optional()?)
+}
+
+/// Attach (or refresh) `lic` on an existing group, unless that purchase is
+/// already attached to `max_groups` other groups.
+pub fn attach_licence(
+    c: &mut Connection,
+    group_id: &str,
+    lic: &VerifiedLicence,
+    max_groups: u32,
+    now: u64,
+) -> Result<Attach, StoreError> {
+    let tx = c.transaction()?;
+    let r = attach_in(&tx, group_id, lic, max_groups, now)?;
+    tx.commit()?;
+    Ok(r)
+}
+
+/// `create_group` and `attach_licence` in one transaction: a group refused
+/// with `InUse` is not created.
+pub fn create_group_with_licence(
+    c: &mut Connection,
+    group_id: &str,
+    auth_key: &[u8; 32],
+    lic: &VerifiedLicence,
+    max_groups: u32,
+    now: u64,
+) -> Result<(CreateGroup, Attach), StoreError> {
+    let tx = c.transaction()?;
+    let created = create_group_in(&tx, group_id, auth_key, now)?;
+    if created == CreateGroup::Conflict {
+        return Ok((created, Attach::InUse));
+    }
+    let attach = attach_in(&tx, group_id, lic, max_groups, now)?;
+    if attach == Attach::InUse {
+        // Dropping the transaction rolls the new group back.
+        return Ok((created, attach));
+    }
+    tx.commit()?;
+    Ok((created, attach))
+}
+
+fn attach_in(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    lic: &VerifiedLicence,
+    max_groups: u32,
+    now: u64,
+) -> Result<Attach, StoreError> {
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT app_transaction_id FROM group_licences WHERE group_id = ?1",
+            [group_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let same = current.as_deref() == Some(lic.app_transaction_id.as_str());
+    if !same {
+        let others: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM group_licences WHERE app_transaction_id = ?1 AND group_id != ?2",
+            [&lic.app_transaction_id, group_id],
+            |r| r.get(0),
+        )?;
+        if others >= i64::from(max_groups) {
+            return Ok(Attach::InUse);
+        }
+    }
+    tx.execute(
+        "INSERT INTO group_licences (group_id, kind, tier, environment, app_transaction_id,
+             original_purchase_date, original_application_version, original_platform,
+             attached_at, verified_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+         ON CONFLICT (group_id) DO UPDATE SET kind = ?2, tier = ?3, environment = ?4,
+             app_transaction_id = ?5, original_purchase_date = ?6,
+             original_application_version = ?7, original_platform = ?8,
+             attached_at = CASE WHEN app_transaction_id = ?5 THEN attached_at ELSE ?9 END,
+             verified_at = ?9",
+        params![
+            group_id,
+            lic.kind,
+            lic.tier,
+            lic.environment,
+            lic.app_transaction_id,
+            lic.original_purchase_date
+                .map(|d| d.min(i64::MAX as u64) as i64),
+            lic.original_application_version,
+            lic.original_platform,
+            now as i64
+        ],
+    )?;
+    Ok(if same {
+        Attach::Refreshed
+    } else {
+        Attach::Attached
+    })
 }
 
 pub fn group_key(c: &mut Connection, group_id: &str) -> Result<Option<[u8; 32]>, StoreError> {
@@ -836,6 +1005,76 @@ mod tests {
         let (rows, _) = messages_since(&mut c, "g", 0, 11).unwrap();
         let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["a1", "s2"]);
+    }
+
+    fn lic(id: &str) -> VerifiedLicence {
+        VerifiedLicence {
+            kind: "app_transaction",
+            tier: "founder",
+            environment: "production",
+            app_transaction_id: id.into(),
+            original_purchase_date: Some(1),
+            original_application_version: Some("1.0".into()),
+            original_platform: Some("macOS".into()),
+            signed_date: 2,
+        }
+    }
+
+    #[test]
+    fn licences_attach_refresh_cap_and_cascade() {
+        let (_d, mut c) = store();
+        for g in ["a", "b", "c"] {
+            create_group(&mut c, g, &[1; 32], 0).unwrap();
+            assert_eq!(
+                attach_licence(&mut c, g, &lic("p1"), 2, 10).unwrap(),
+                if g == "c" {
+                    Attach::InUse
+                } else {
+                    Attach::Attached
+                }
+            );
+        }
+        assert_eq!(group_licence(&mut c, "c").unwrap(), None);
+        assert_eq!(
+            attach_licence(&mut c, "a", &lic("p1"), 2, 20).unwrap(),
+            Attach::Refreshed
+        );
+        let l = group_licence(&mut c, "a").unwrap().unwrap();
+        assert_eq!((l.tier.as_str(), l.verified_at), ("founder", 20));
+
+        // Refused on create: the group is rolled back.
+        let (created, attach) =
+            create_group_with_licence(&mut c, "d", &[1; 32], &lic("p1"), 2, 30).unwrap();
+        assert_eq!((created, attach), (CreateGroup::Created, Attach::InUse));
+        assert_eq!(group_key(&mut c, "d").unwrap(), None);
+
+        // Deleting a group frees its slot and cascades.
+        upsert_device(
+            &mut c,
+            "a",
+            &Device {
+                device_id: "mac".into(),
+                kind: "mac".into(),
+                name: "Mac".into(),
+                apns_token: None,
+                apns_env: "production".into(),
+                created_at: 0,
+                updated_at: 0,
+                last_seen: None,
+            },
+            1,
+        )
+        .unwrap();
+        insert_message(&mut c, "a", &msg("m"), 10).unwrap();
+        assert!(delete_group(&mut c, "a").unwrap());
+        assert!(!delete_group(&mut c, "a").unwrap());
+        assert_eq!(counts(&mut c, "a").unwrap(), (0, 0));
+        assert!(list_devices(&mut c, "a").unwrap().is_empty());
+        assert_eq!(group_licence(&mut c, "a").unwrap(), None);
+        assert_eq!(
+            create_group_with_licence(&mut c, "d", &[1; 32], &lic("p1"), 2, 40).unwrap(),
+            (CreateGroup::Created, Attach::Attached)
+        );
     }
 
     #[test]
