@@ -253,14 +253,20 @@ impl AppTransactionVerifier {
         if payload.bundle_id.as_deref() != Some(BUNDLE_ID) {
             return Err(WrongBundle);
         }
-        let environment = match payload
+        let receipt_type = payload
             .receipt_type
             .as_deref()
-            .or(payload.environment.as_deref())
-        {
+            .or(payload.environment.as_deref());
+        let environment = match receipt_type {
             Some("Production") => "production",
             Some("Sandbox") if self.allow_sandbox => "sandbox",
-            _ => return Err(Environment),
+            other => {
+                // Apple-signed, so the value is safe to log (Xcode, Sandbox
+                // while sandbox is off, or something new from Apple).
+                let value: String = other.unwrap_or("<missing>").chars().take(32).collect();
+                tracing::info!(receipt_type = %value.escape_debug(), "licence environment refused");
+                return Err(Environment);
+            }
         };
         // A production transaction for another app id is refused. One without
         // an app id is accepted: StoreKit has been seen to omit it on real App

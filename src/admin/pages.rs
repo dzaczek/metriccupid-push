@@ -703,10 +703,13 @@ pub fn security(now: u64, s: &Security, sessions: usize) -> String {
     );
     let _ = write!(
         b,
-        "<div class=\"card\">{}</div>",
-        count_table("Licence verifications (30 d)", &s.licence_outcomes)
+        "<div class=\"card\">{}{}</div>",
+        count_table("Licence verifications (30 d)", &s.licence_outcomes),
+        count_table("Licence results by reason (raw events)", &s.licence_reasons)
     );
-    b += "</section><h2>Bans (30 d)</h2>";
+    b += "</section><h2>Recent licence verifications</h2>";
+    b += &events_table(now, &s.licence_events, true);
+    b += "<h2>Bans (30 d)</h2>";
     b += &events_table(now, &s.bans, true);
     b += "<h2>Admin logins</h2>";
     b += &events_table(now, &s.admin_logins, true);

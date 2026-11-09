@@ -767,3 +767,31 @@ async fn snapshot_posts_counted_with_the_client_header() {
     let (_, _, html) = s.get("/admin/", Some(&session)).await;
     assert!(html.contains("Snapshots (30 d)"));
 }
+
+#[tokio::test]
+async fn licence_refusal_reasons_are_visible_on_the_security_page() {
+    let s = servers(&[("MODE", "hosted"), ("LICENCE_MODE", "app_transaction")]).await;
+    let mac = s.mac(30);
+    let r = mac
+        .create_group_with(json!({"licence": {"kind": "app_transaction", "jws": "a.b.c"}}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["reason"].as_str()),
+        (403, Some("malformed"))
+    );
+    s.flush().await;
+
+    let session = s.login().await;
+    let (status, _, html) = s.get("/admin/security", Some(&session)).await;
+    assert_eq!(status, 200);
+    assert!(html.contains("Licence results by reason"), "reason table");
+    assert!(html.contains("groups invalid malformed"), "reason counted");
+    assert!(
+        html.contains("Recent licence verifications"),
+        "recent table"
+    );
+    let (_, _, body) = s.get("/admin/api/security", Some(&session)).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["security"]["licence_reasons"][0]["count"], 1, "{v}");
+    assert!(body.contains("groups invalid malformed"));
+}

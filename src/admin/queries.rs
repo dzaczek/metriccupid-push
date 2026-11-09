@@ -651,6 +651,11 @@ pub struct Security {
     pub bans: Vec<EventRow>,
     pub admin_logins: Vec<EventRow>,
     pub licence_outcomes: Vec<Count>,
+    /// Raw licence events by `route outcome detail` (refusal reason, or
+    /// `tier/environment` when accepted). Raw rows are kept for
+    /// `ADMIN_EVENTS_RETENTION_DAYS` only, so this may cover less than 30 d.
+    pub licence_reasons: Vec<Count>,
+    pub licence_events: Vec<EventRow>,
 }
 
 pub fn security(c: &Connection, now: u64) -> R<Security> {
@@ -733,6 +738,13 @@ pub fn security(c: &Connection, now: u64) -> R<Security> {
              WHERE kind = 'licence' AND day >= ?1 GROUP BY 1 ORDER BY 2 DESC",
             [&d30],
         )?,
+        licence_reasons: counts(
+            c,
+            "SELECT route || ' ' || outcome || COALESCE(' ' || detail, ''), COUNT(*) FROM events
+             WHERE kind = 'licence' AND ts >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+            [t30],
+        )?,
+        licence_events: events(c, "kind = 'licence' AND ts >= ?1", [t30])?,
     })
 }
 
