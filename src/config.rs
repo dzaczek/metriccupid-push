@@ -11,7 +11,7 @@ use ipnet::IpNet;
 
 pub const MIN_SECRET_LEN: usize = 32;
 const DEFAULT_PUSHOVER_API_URL: &str = "https://api.pushover.net/1/messages.json";
-pub const DEFAULT_GATEWAY_URL: &str = "https://push.metriccupid.sysop.cat";
+pub const DEFAULT_GATEWAY_URL: &str = "https://push-metriccupid.sysop.cat";
 pub const DEFAULT_APNS_TOPIC: &str = "cat.sysop.MetricCupid";
 pub const APNS_PRODUCTION_URL: &str = "https://api.push.apple.com";
 pub const APNS_SANDBOX_URL: &str = "https://api.sandbox.push.apple.com";

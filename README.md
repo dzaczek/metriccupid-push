@@ -232,7 +232,7 @@ normative spec is [PROTOCOL.md](PROTOCOL.md); the Swift apps test against
 
 | | Who sends to APNs | You need | Set |
 |---|---|---|---|
-| **Hosted** (default in the apps) | `push.metriccupid.sysop.cat` | nothing | in the app: server URL default |
+| **Hosted** (default in the apps) | `push-metriccupid.sysop.cat` | nothing | in the app: server URL default |
 | **Self-hosted** | the hosted gateway, on your behalf | this server | `APNS_MODE=gateway` (default) |
 | **Self-hosted + own APNs key** | your server, directly | an Apple Developer APNs key for the app's bundle id (only possible if you build the iOS app yourself) | `APNS_MODE=direct`, `APNS_KEY_P8`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` |
 
@@ -252,7 +252,7 @@ exposes them at `GET /v2/debug/pushes`.
 | `APNS_KEY_ID` | required for `direct` | 10-character key id. |
 | `APNS_TEAM_ID` | required for `direct` | 10-character team id. |
 | `APNS_TOPIC` | `cat.sysop.MetricCupid` | iOS app bundle id (`apns-topic`). |
-| `GATEWAY_URL` | `https://push.metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. |
+| `GATEWAY_URL` | `https://push-metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. |
 | `DATA_DIR` | `/data` | Directory for the SQLite database (`metriccupid-push.sqlite3`, WAL). Must be writable. |
 | `HOSTED_OPEN_REGISTRATION` | `false` | `MODE=hosted` only: allow every group registration (stub until App Store licences are verified); otherwise `402 licence_required`. |
 | `RATE_V2_MESSAGES_PER_SEC` / `_BURST` | `2` / `60` | Per-group bucket for `POST /v2/messages`. |

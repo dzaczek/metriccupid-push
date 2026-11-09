@@ -38,7 +38,7 @@ sync, which avoids two devices creating two groups at the same time). It generat
 |---|---|
 | `group_key` | 32 bytes from a CSPRNG |
 | `group_id` | 16 bytes from a CSPRNG, base64url without padding (22 characters) |
-| `server_url` | e.g. `https://push.metriccupid.sysop.cat` (default) or a self-hosted URL, no trailing slash |
+| `server_url` | e.g. `https://push-metriccupid.sysop.cat` (default) or a self-hosted URL, no trailing slash |
 
 It is stored as one synchronizable generic-password Keychain item:
 
@@ -612,7 +612,7 @@ The same two moments also re-send the group's latest Live Activity state with `m
 
 APNs requires the provider key of the app's team, so a self-hosted server normally cannot push.
 With `APNS_MODE=gateway` it forwards each push job to the hosted service (`GATEWAY_URL`, default
-`https://push.metriccupid.sysop.cat`):
+`https://push-metriccupid.sysop.cat`):
 
 1. When the Mac creates the group on the self-hosted server, that server forwards the same
    `POST /v2/groups` body (`group_id`, `auth_key`, `licence`) to the gateway. A refusal by the gateway
