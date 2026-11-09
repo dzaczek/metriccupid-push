@@ -1105,3 +1105,257 @@ async fn direct_sender_speaks_http2_to_apns() {
     assert_eq!(body["aps"]["category"], "MC_ALERT");
     assert_eq!(body["mc"]["id"], "d-1");
 }
+
+// ---------------------------------------------------------------- presence
+
+/// Wait until the group has no live Mac stream (the server saw the close).
+async fn wait_offline(s: &Server, group: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while s.state.v2().hub.group_online(group) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stream closed within 5 s");
+}
+
+async fn wait_pushes(s: &Server, n: usize) -> Vec<metriccupid_push::v2::apns::RecordedPush> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let p = s.mock().pushes();
+            if p.len() >= n {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pushes within 5 s")
+}
+
+async fn tick(s: &Server) {
+    metriccupid_push::v2::presence_tick(&s.state).await;
+}
+
+#[tokio::test]
+async fn status_reports_mac_presence_and_last_seen() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 155).await;
+    let r = phone.get("/v2/status").await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(
+        r.json,
+        json!({"mac_online": false, "mac_last_seen": null,
+               "macs": [{"device_id": mac.device_id, "online": false, "last_seen": null}]})
+    );
+
+    s.set_time(T0 + 10);
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    let r = phone.get("/v2/status").await;
+    assert_eq!(r.json["mac_online"], true);
+    assert_eq!(r.json["mac_last_seen"], T0 + 10);
+    let r = mac.get("/v2/devices").await;
+    let d = &r.json["devices"][0];
+    assert_eq!(
+        (d["online"].clone(), d["last_seen"].clone()),
+        (json!(true), json!(T0 + 10))
+    );
+    assert!(r.json["devices"][1].get("last_seen").is_none(), "Macs only");
+
+    s.set_time(T0 + 20);
+    ws.send(WsMessage::Text(r#"{"type":"bye","reason":"sleep"}"#.into()))
+        .await
+        .unwrap();
+    wait_offline(&s, &mac.group_id).await;
+    let r = phone.get("/v2/status").await;
+    assert_eq!(r.json["mac_online"], false);
+    assert_eq!(r.json["mac_last_seen"], T0 + 20);
+    // Only registered devices may ask.
+    let stranger = mac.as_device(&id128(9));
+    assert_eq!(stranger.get("/v2/status").await.status, 403);
+}
+
+#[tokio::test]
+async fn bye_pushes_offline_immediately_then_back_online_replaces_it() {
+    let (_d, s) = server(&[]).await;
+    let (mac, _phone) = setup(&s, 160).await;
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    assert!(
+        s.mock().pushes().is_empty(),
+        "first connect is not announced"
+    );
+
+    ws.send(WsMessage::Text(r#"{"type":"bye","reason":"quit"}"#.into()))
+        .await
+        .unwrap();
+    let pushes = wait_pushes(&s, 1).await;
+    let p = &pushes[0];
+    assert_eq!(p.device_token, TOKEN_A);
+    assert_eq!(p.collapse_id.as_deref(), Some("mc-presence"));
+    assert_eq!(p.priority, 10);
+    assert_eq!(p.expiration, T0 + 3600);
+    assert_eq!(
+        p.payload,
+        json!({
+            "aps": {
+                "alert": {"title": "MetricCupid is offline on your Mac",
+                          "body": "MetricCupid was quit. Alerts won't reach this iPhone until it's back."},
+                "category": "MC_PRESENCE",
+                "thread-id": "mc-presence",
+                "sound": "default",
+                "interruption-level": "time-sensitive"
+            },
+            "mc_presence": {"state": "offline", "reason": "quit", "since": T0}
+        })
+    );
+    // The server closed the stream with 1000 "bye".
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Close(Some(f)))) => return f.reason.to_string(),
+                Some(Ok(_)) => continue,
+                _ => return String::new(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(closed, "bye");
+    tick(&s).await;
+    assert_eq!(s.mock().pushes().len(), 1, "no second offline push");
+
+    s.set_time(T0 + 600);
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    let pushes = wait_pushes(&s, 2).await;
+    let p = &pushes[1];
+    assert_eq!(
+        p.collapse_id.as_deref(),
+        Some("mc-presence"),
+        "replaces the offline one"
+    );
+    assert_eq!(p.priority, 5);
+    assert_eq!(p.payload["aps"]["interruption-level"], "passive");
+    assert!(p.payload["aps"].get("sound").is_none());
+    assert_eq!(
+        p.payload["aps"]["alert"]["title"],
+        "MetricCupid is back online"
+    );
+    assert_eq!(
+        p.payload["mc_presence"],
+        json!({"state": "online", "since": T0 + 600})
+    );
+
+    // Replacing the stream (reconnect) while online: nothing new.
+    s.set_time(T0 + 601);
+    let mut ws2 = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws2).await;
+    tick(&s).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(s.mock().pushes().len(), 2);
+    drop(ws);
+}
+
+#[tokio::test]
+async fn dropped_stream_pushes_after_grace_unless_it_reconnects() {
+    let (_d, s) = server(&[]).await;
+    let (mac, _phone) = setup(&s, 165).await;
+
+    // Reconnect within the grace period: no push.
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    ws.close(None).await.unwrap();
+    wait_offline(&s, &mac.group_id).await;
+    s.set_time(T0 + 60);
+    tick(&s).await;
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    s.set_time(T0 + 1000);
+    tick(&s).await;
+    assert!(s.mock().pushes().is_empty(), "flap within grace is silent");
+
+    // Lost for longer than MAC_OFFLINE_GRACE_SECS (120): one push.
+    ws.close(None).await.unwrap();
+    wait_offline(&s, &mac.group_id).await;
+    s.set_time(T0 + 1119);
+    tick(&s).await;
+    assert!(s.mock().pushes().is_empty(), "still within grace");
+    s.set_time(T0 + 1120);
+    tick(&s).await;
+    let pushes = s.mock().pushes();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(
+        pushes[0].payload["mc_presence"],
+        json!({"state": "offline", "reason": "lost", "since": T0 + 1000})
+    );
+    assert_eq!(
+        pushes[0].payload["aps"]["alert"]["body"],
+        "The connection to your Mac was lost. Alerts won't reach this iPhone until it's back."
+    );
+    s.set_time(T0 + 5000);
+    tick(&s).await;
+    assert_eq!(s.mock().pushes().len(), 1, "no duplicates");
+}
+
+#[tokio::test]
+async fn second_mac_keeps_the_group_online_and_bad_bye_is_rejected() {
+    let (_d, s) = server(&[("MAC_OFFLINE_GRACE_SECS", "0")]).await;
+    let (mac, _phone) = setup(&s, 175).await;
+    let mac2 = mac.as_device(&id128(179));
+    assert_eq!(mac2.register("mac", "Mac mini", None).await.status, 201);
+    let mut a = open_ws(&mac).await.unwrap();
+    wait_ready(&mut a).await;
+    let mut b = open_ws(&mac2).await.unwrap();
+    wait_ready(&mut b).await;
+    a.send(WsMessage::Text(r#"{"type":"bye","reason":"quit"}"#.into()))
+        .await
+        .unwrap();
+    s.set_time(T0 + 10);
+    tick(&s).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(s.mock().pushes().is_empty(), "another Mac is still online");
+
+    // An unknown reason is an invalid frame: closed, treated as lost (grace 0).
+    b.send(WsMessage::Text(r#"{"type":"bye","reason":"lost"}"#.into()))
+        .await
+        .unwrap();
+    wait_offline(&s, &mac.group_id).await;
+    tick(&s).await;
+    let pushes = s.mock().pushes();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0].payload["mc_presence"]["reason"], "lost");
+}
+
+#[tokio::test]
+async fn presence_goes_through_the_gateway() {
+    let (_d1, hosted) = server(&[("MODE", "hosted"), ("HOSTED_OPEN_REGISTRATION", "true")]).await;
+    let (_d2, selfhosted) =
+        server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
+    let (mac, _phone) = setup(&selfhosted, 150).await;
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    ws.send(WsMessage::Text(
+        r#"{"type":"bye","reason":"disabled"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let pushes = wait_pushes(&hosted, 1).await;
+    assert_eq!(pushes[0].collapse_id.as_deref(), Some("mc-presence"));
+    assert_eq!(pushes[0].payload["mc_presence"]["reason"], "disabled");
+    assert_eq!(pushes[0].payload["aps"]["category"], "MC_PRESENCE");
+
+    // The gateway accepts exactly one of message / presence.
+    let body =
+        json!({"device_token": TOKEN_A, "env": "sandbox", "urgency": "normal", "expiration": 0});
+    let gw = Client::new(
+        &hosted.base,
+        &mac.group_id,
+        "",
+        mac.keys.clone(),
+        hosted.now_fn(),
+    );
+    let r = gw.post("/v2/gateway/push", &body).await;
+    assert_eq!(r.status, 400, "{:?}", r.json);
+}

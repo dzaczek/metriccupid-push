@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use super::apns::OfflineReason;
 use super::store::{self, MAX_COMMANDS};
 use crate::api::AppState;
 
@@ -126,6 +127,13 @@ impl Hub {
             .is_some_and(|g| g.get(device).is_some_and(|c| !c.tx.is_closed()))
     }
 
+    /// Whether any Mac stream of the group is live.
+    pub fn group_online(&self, group: &str) -> bool {
+        self.lock()
+            .get(group)
+            .is_some_and(|g| g.values().any(|c| !c.tx.is_closed()))
+    }
+
     pub fn len(&self) -> usize {
         self.lock().values().map(HashMap::len).sum()
     }
@@ -138,7 +146,78 @@ impl Hub {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum ClientFrame {
-    Ack { cursor: u64 },
+    Ack {
+        cursor: u64,
+    },
+    /// The Mac is going offline on purpose (PROTOCOL.md, "Presence").
+    Bye {
+        reason: ByeReason,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ByeReason {
+    Quit,
+    Disabled,
+    Sleep,
+}
+
+impl From<ByeReason> for OfflineReason {
+    fn from(r: ByeReason) -> Self {
+        match r {
+            ByeReason::Quit => OfflineReason::Quit,
+            ByeReason::Disabled => OfflineReason::Disabled,
+            ByeReason::Sleep => OfflineReason::Sleep,
+        }
+    }
+}
+
+/// `last_seen` is written to the database at most this often per stream.
+const TOUCH_EVERY_SECS: u64 = 10;
+
+async fn touch(state: &AppState, group: &str, device: &str, now: u64) {
+    let (g, d) = (group.to_string(), device.to_string());
+    if let Err(e) = state
+        .v2()
+        .store
+        .call(move |c| store::touch_device(c, &g, &d, now))
+        .await
+    {
+        tracing::error!(error = %e, "stream: cannot record last_seen");
+    }
+}
+
+/// Serve one stream, then record presence: last_seen, and an offline notice
+/// when it was the group's last Mac stream.
+pub async fn run(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    group: String,
+    device: String,
+    conn_id: u64,
+    rx: mpsc::Receiver<CommandFrame>,
+) {
+    let v2 = state.v2();
+    let now = state.now();
+    touch(&state, &group, &device, now).await;
+    if let Some(note) = v2.presence.connected(&group, now) {
+        let (st, g) = (state.clone(), group.clone());
+        tokio::spawn(async move { super::push_presence(&st, &g, note).await });
+    }
+
+    let (last_seen, bye) = serve(socket, &state, &group, &device, rx).await;
+
+    v2.hub.unregister(&group, &device, conn_id);
+    let last_mac = !v2.hub.group_online(&group);
+    if last_mac {
+        v2.presence
+            .disconnected(&group, bye.map(Into::into), last_seen, state.now());
+    }
+    touch(&state, &group, &device, last_seen).await;
+    if last_mac && bye.is_some() {
+        super::presence_tick(&state).await;
+    }
 }
 
 async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
@@ -151,14 +230,14 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 }
 
 /// Serve one authenticated stream until it closes, is replaced, or goes idle.
-pub async fn run(
+/// Returns when the server last heard from the Mac and the `bye` reason, if any.
+async fn serve(
     mut socket: WebSocket,
-    state: Arc<AppState>,
-    group: String,
-    device: String,
-    conn_id: u64,
+    state: &Arc<AppState>,
+    group: &str,
+    device: &str,
     mut rx: mpsc::Receiver<CommandFrame>,
-) {
+) -> (u64, Option<ByeReason>) {
     let v2 = state.v2();
     let ping_every = v2.ws_ping;
     // No frame (pong included) for two ping intervals: the peer is gone.
@@ -167,7 +246,9 @@ pub async fn run(
     // Registration happened before this load, so a command posted in between
     // can arrive both here and on `rx`; `sent` filters that duplicate.
     let now = state.now();
-    let g = group.clone();
+    let mut seen = now;
+    let mut touched = now;
+    let g = group.to_string();
     let pending = v2
         .store
         .call(move |c| store::commands_since(c, &g, 0, now, MAX_COMMANDS))
@@ -186,8 +267,7 @@ pub async fn run(
                     .await
                     .is_err()
                 {
-                    v2.hub.unregister(&group, &device, conn_id);
-                    return;
+                    return (seen, None);
                 }
                 sent.insert(f.cursor);
             }
@@ -195,8 +275,7 @@ pub async fn run(
         Err(e) => {
             tracing::error!(error = %e, "stream: cannot load pending commands");
             close(&mut socket, 1011, "storage error").await;
-            v2.hub.unregister(&group, &device, conn_id);
-            return;
+            return (seen, None);
         }
     }
 
@@ -204,14 +283,14 @@ pub async fn run(
     // arrive live (and `POST /v2/commands` reports `delivered`).
     let ready = json!({ "type": "ready" }).to_string();
     if socket.send(Message::Text(ready.into())).await.is_err() {
-        v2.hub.unregister(&group, &device, conn_id);
-        return;
+        return (seen, None);
     }
 
     let mut ping = tokio::time::interval(ping_every);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await;
     let mut last_rx = Instant::now();
+    let mut bye = None;
     let reason = loop {
         tokio::select! {
             frame = rx.recv() => match frame {
@@ -228,25 +307,41 @@ pub async fn run(
                     break "replaced";
                 }
             },
-            msg = socket.recv() => match msg {
-                Some(Ok(Message::Text(t))) => {
+            msg = socket.recv() => {
+                if matches!(msg, Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_)))) {
                     last_rx = Instant::now();
-                    let Ok(ClientFrame::Ack { cursor }) = serde_json::from_str(t.as_str()) else {
-                        close(&mut socket, 1008, "invalid frame").await;
-                        break "invalid_frame";
-                    };
-                    let g = group.clone();
-                    if let Err(e) = v2.store.call(move |c| store::ack_command(c, &g, cursor)).await {
-                        tracing::error!(error = %e, "stream: ack failed");
+                    seen = state.now();
+                    if seen.saturating_sub(touched) >= TOUCH_EVERY_SECS {
+                        touched = seen;
+                        touch(state, group, device, seen).await;
                     }
                 }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => last_rx = Instant::now(),
-                Some(Ok(Message::Binary(_))) => {
-                    close(&mut socket, 1003, "text frames only").await;
-                    break "binary_frame";
+                match msg {
+                    Some(Ok(Message::Text(t))) => match serde_json::from_str(t.as_str()) {
+                        Ok(ClientFrame::Ack { cursor }) => {
+                            let g = group.to_string();
+                            if let Err(e) = v2.store.call(move |c| store::ack_command(c, &g, cursor)).await {
+                                tracing::error!(error = %e, "stream: ack failed");
+                            }
+                        }
+                        Ok(ClientFrame::Bye { reason }) => {
+                            bye = Some(reason);
+                            close(&mut socket, 1000, "bye").await;
+                            break "bye";
+                        }
+                        Err(_) => {
+                            close(&mut socket, 1008, "invalid frame").await;
+                            break "invalid_frame";
+                        }
+                    },
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Binary(_))) => {
+                        close(&mut socket, 1003, "text frames only").await;
+                        break "binary_frame";
+                    }
+                    Some(Ok(Message::Close(_))) | None => break "closed",
+                    Some(Err(_)) => break "error",
                 }
-                Some(Ok(Message::Close(_))) | None => break "closed",
-                Some(Err(_)) => break "error",
             },
             _ = ping.tick() => {
                 if last_rx.elapsed() > idle_after {
@@ -259,8 +354,8 @@ pub async fn run(
             }
         }
     };
-    v2.hub.unregister(&group, &device, conn_id);
     tracing::info!(group = %group, reason, "stream closed");
+    (seen, bye)
 }
 
 #[cfg(test)]

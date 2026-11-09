@@ -145,6 +145,88 @@ pub fn build_payload(mc: &McEnvelope, urgency: Urgency) -> String {
     json!({ "aps": aps, "mc": mc }).to_string()
 }
 
+/// Why the last Mac of a group went offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OfflineReason {
+    /// The app was quit (`bye`).
+    Quit,
+    /// The Mac went to sleep (`bye`).
+    Sleep,
+    /// Phone & Watch was turned off in the app (`bye`).
+    Disabled,
+    /// The stream dropped without a `bye` and stayed down for the grace period.
+    Lost,
+}
+
+/// A server-generated presence notice (PROTOCOL.md, "Presence"). Contains no
+/// alert content, so it is sent in plaintext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum PresenceNote {
+    Offline { reason: OfflineReason, since: u64 },
+    Online { since: u64 },
+}
+
+pub const PRESENCE_COLLAPSE_ID: &str = "mc-presence";
+pub const PRESENCE_CATEGORY: &str = "MC_PRESENCE";
+
+impl PresenceNote {
+    pub fn title(self) -> &'static str {
+        match self {
+            PresenceNote::Offline { .. } => "MetricCupid is offline on your Mac",
+            PresenceNote::Online { .. } => "MetricCupid is back online",
+        }
+    }
+
+    pub fn body(self) -> &'static str {
+        match self {
+            PresenceNote::Offline { reason, .. } => match reason {
+                OfflineReason::Quit => {
+                    "MetricCupid was quit. Alerts won't reach this iPhone until it's back."
+                }
+                OfflineReason::Sleep => {
+                    "Your Mac went to sleep. Alerts won't reach this iPhone until it wakes."
+                }
+                OfflineReason::Disabled => {
+                    "Phone & Watch was turned off on the Mac. Alerts won't reach this iPhone until it's back on."
+                }
+                OfflineReason::Lost => {
+                    "The connection to your Mac was lost. Alerts won't reach this iPhone until it's back."
+                }
+            },
+            PresenceNote::Online { .. } => "Alerts from your Mac reach this iPhone again.",
+        }
+    }
+}
+
+/// Build the APNs payload of a presence notice. No `mutable-content`: the
+/// Notification Service Extension does not run for it.
+pub fn build_presence_payload(note: PresenceNote) -> String {
+    let mut aps = json!({
+        "alert": { "title": note.title(), "body": note.body() },
+        "category": PRESENCE_CATEGORY,
+        "thread-id": PRESENCE_COLLAPSE_ID,
+    });
+    match note {
+        PresenceNote::Offline { .. } => {
+            aps["sound"] = json!("default");
+            aps["interruption-level"] = json!("time-sensitive");
+        }
+        PresenceNote::Online { .. } => aps["interruption-level"] = json!("passive"),
+    }
+    json!({ "aps": aps, "mc_presence": note }).to_string()
+}
+
+/// What a push carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushContent {
+    /// A sealed message from the Mac.
+    Sealed(McEnvelope),
+    /// A server-generated presence notice.
+    Presence(PresenceNote),
+}
+
 /// One push to one device.
 #[derive(Clone)]
 pub struct PushJob {
@@ -153,11 +235,35 @@ pub struct PushJob {
     pub auth_key: [u8; 32],
     pub device_token: String,
     pub env: ApnsEnv,
-    pub mc: McEnvelope,
+    pub content: PushContent,
     pub urgency: Urgency,
     pub collapse_id: Option<String>,
     /// Unix seconds; 0 = deliver once, do not store.
     pub expiration: u64,
+}
+
+impl PushJob {
+    pub fn payload(&self) -> String {
+        match &self.content {
+            PushContent::Sealed(mc) => build_payload(mc, self.urgency),
+            PushContent::Presence(note) => build_presence_payload(*note),
+        }
+    }
+
+    pub fn priority(&self) -> u8 {
+        match self.content {
+            PushContent::Sealed(_) => self.urgency.priority(),
+            PushContent::Presence(PresenceNote::Offline { .. }) => 10,
+            PushContent::Presence(PresenceNote::Online { .. }) => 5,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match &self.content {
+            PushContent::Sealed(mc) => mc.t.as_str(),
+            PushContent::Presence(_) => "presence",
+        }
+    }
 }
 
 impl fmt::Debug for PushJob {
@@ -165,7 +271,7 @@ impl fmt::Debug for PushJob {
         f.debug_struct("PushJob")
             .field("group_id", &self.group_id)
             .field("env", &self.env)
-            .field("type", &self.mc.t)
+            .field("type", &self.kind())
             .field("urgency", &self.urgency)
             .finish_non_exhaustive()
     }
@@ -316,10 +422,10 @@ impl DirectApns {
             .header("authorization", format!("bearer {token}"))
             .header("apns-topic", &self.topic)
             .header("apns-push-type", "alert")
-            .header("apns-priority", job.urgency.priority().to_string())
+            .header("apns-priority", job.priority().to_string())
             .header("apns-expiration", job.expiration.to_string())
             .header("content-type", "application/json")
-            .body(build_payload(&job.mc, job.urgency));
+            .body(job.payload());
         if let Some(c) = &job.collapse_id {
             req = req.header("apns-collapse-id", c);
         }
@@ -413,8 +519,7 @@ impl ApnsSender for MockApns {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&job.device_token);
-            let payload: Value =
-                serde_json::from_str(&build_payload(&job.mc, job.urgency)).unwrap_or(Value::Null);
+            let payload: Value = serde_json::from_str(&job.payload()).unwrap_or(Value::Null);
             let mut pushes = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
             if pushes.len() >= MOCK_CAP {
                 pushes.remove(0);
@@ -423,7 +528,7 @@ impl ApnsSender for MockApns {
                 group_id: job.group_id.clone(),
                 device_token: job.device_token.clone(),
                 env: job.env,
-                priority: job.urgency.priority(),
+                priority: job.priority(),
                 push_type: "alert",
                 collapse_id: job.collapse_id.clone(),
                 expiration: job.expiration,
@@ -441,13 +546,16 @@ impl ApnsSender for MockApns {
 
 // --------------------------------------------------------------- gateway ---
 
-/// Body of `POST /v2/gateway/push`.
+/// Body of `POST /v2/gateway/push`: exactly one of `message` or `presence`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayPush {
     pub device_token: String,
     pub env: ApnsEnv,
-    pub message: McEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<McEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<PresenceNote>,
     pub urgency: Urgency,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapse_id: Option<String>,
@@ -497,10 +605,15 @@ impl GatewayApns {
     }
 
     async fn send_inner(&self, job: &PushJob) -> Result<(), PushError> {
+        let (message, presence) = match &job.content {
+            PushContent::Sealed(mc) => (Some(mc.clone()), None),
+            PushContent::Presence(note) => (None, Some(*note)),
+        };
         let body = serde_json::to_string(&GatewayPush {
             device_token: job.device_token.clone(),
             env: job.env,
-            message: job.mc.clone(),
+            message,
+            presence,
             urgency: job.urgency,
             collapse_id: job.collapse_id.clone(),
             expiration: job.expiration,
@@ -588,6 +701,34 @@ mod tests {
         assert!(p["aps"].get("interruption-level").is_none());
         assert_eq!(Urgency::Silent.priority(), 5);
         assert_eq!(Urgency::Normal.priority(), 10);
+    }
+
+    #[test]
+    fn presence_payload_shape() {
+        let off = PresenceNote::Offline {
+            reason: OfflineReason::Quit,
+            since: 7,
+        };
+        let p: Value = serde_json::from_str(&build_presence_payload(off)).unwrap();
+        assert_eq!(p["aps"]["category"], "MC_PRESENCE");
+        assert_eq!(p["aps"]["thread-id"], "mc-presence");
+        assert_eq!(p["aps"]["interruption-level"], "time-sensitive");
+        assert_eq!(
+            p["aps"]["alert"]["title"],
+            "MetricCupid is offline on your Mac"
+        );
+        assert!(p["aps"].get("mutable-content").is_none());
+        assert!(p.get("mc").is_none());
+        assert_eq!(
+            p["mc_presence"],
+            json!({"state": "offline", "reason": "quit", "since": 7})
+        );
+        let on: Value =
+            serde_json::from_str(&build_presence_payload(PresenceNote::Online { since: 9 }))
+                .unwrap();
+        assert_eq!(on["aps"]["interruption-level"], "passive");
+        assert!(on["aps"].get("sound").is_none());
+        assert_eq!(on["mc_presence"], json!({"state": "online", "since": 9}));
     }
 
     struct FixedClock(u64);

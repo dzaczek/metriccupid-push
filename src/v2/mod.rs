@@ -10,6 +10,7 @@
 
 pub mod apns;
 pub mod licence;
+pub mod presence;
 pub mod store;
 pub mod stream;
 
@@ -31,11 +32,12 @@ use serde_json::json;
 use tokio::task::JoinSet;
 
 use self::apns::{
-    build_payload, ApnsEnv, ApnsSender, GatewayApns, GatewayPush, GatewayRegistration, McEnvelope,
-    MessageType, MockApns, PushError, PushJob, Urgency, DEVICE_HEADER, GROUP_HEADER,
-    MAX_PAYLOAD_BYTES,
+    build_payload, build_presence_payload, ApnsEnv, ApnsSender, GatewayApns, GatewayPush,
+    GatewayRegistration, McEnvelope, MessageType, MockApns, PresenceNote, PushContent, PushError,
+    PushJob, Urgency, DEVICE_HEADER, GROUP_HEADER, MAX_PAYLOAD_BYTES, PRESENCE_COLLAPSE_ID,
 };
 use self::licence::Licence;
+use self::presence::Presence;
 use self::store::{CreateGroup, Device, Insert, NewMessage, Store, StoreError, Upsert};
 use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME, MAX_STREAMS};
 use crate::api::{error, invalid, json_error, precheck, too_many, AppState, Outcome};
@@ -61,12 +63,17 @@ pub struct V2State {
     pub gateway: Option<Arc<GatewayApns>>,
     pub licence: Box<dyn Licence>,
     pub ws_ping: Duration,
+    pub presence: Presence,
 }
+
+/// Presence pushes expire after this long (a stale "offline" is useless).
+pub const PRESENCE_TTL_SECS: u64 = 3600;
 
 pub fn routes(mode: Mode, mock: bool) -> Router<Arc<AppState>> {
     let mut r = Router::new()
         .route("/v2/groups", post(create_group))
         .route("/v2/devices", get(list_devices))
+        .route("/v2/status", get(get_status))
         .route(
             "/v2/devices/{device_id}",
             put(put_device).delete(delete_device),
@@ -447,6 +454,7 @@ async fn put_device(
             apns_env: env.as_str().to_string(),
             created_at: 0,
             updated_at: 0,
+            last_seen: None,
         };
         let now = state.now();
         let g = a.group.clone();
@@ -560,6 +568,7 @@ async fn list_devices(
                 });
                 if d.kind == "mac" {
                     v["online"] = json!(hub.is_online(&a.group, &d.device_id));
+                    v["last_seen"] = json!(d.last_seen);
                 }
                 v
             })
@@ -569,6 +578,60 @@ async fn list_devices(
     .await
     .unwrap_or_else(|o| o);
     finish("devices.list", ip, started, group.as_deref(), r)
+}
+
+async fn get_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "GET",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(None),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let g = a.group.clone();
+        let devices = state
+            .v2()
+            .store
+            .call(move |c| store::list_devices(c, &g))
+            .await
+            .map_err(storage_error)?;
+        let hub = &state.v2().hub;
+        let macs: Vec<_> = devices
+            .iter()
+            .filter(|d| d.kind == "mac")
+            .map(|d| (d, hub.is_online(&a.group, &d.device_id)))
+            .collect();
+        let mac_online = macs.iter().any(|(_, online)| *online);
+        let mac_last_seen = macs.iter().filter_map(|(d, _)| d.last_seen).max();
+        let list: Vec<_> = macs
+            .iter()
+            .map(|(d, online)| {
+                json!({ "device_id": d.device_id, "online": online, "last_seen": d.last_seen })
+            })
+            .collect();
+        Ok(ok(
+            StatusCode::OK,
+            json!({ "mac_online": mac_online, "mac_last_seen": mac_last_seen, "macs": list }),
+            "status",
+        ))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("status", ip, started, group.as_deref(), r)
 }
 
 // -------------------------------------------------------------- messages ---
@@ -670,8 +733,17 @@ async fn post_message(
         };
 
         let expiration = if ttl == 0 { 0 } else { now + ttl };
-        let (pushed, failed, unregistered) =
-            fan_out(&state, &a, mc, req.urgency, req.collapse_id, expiration).await?;
+        let (pushed, failed, unregistered) = fan_out(
+            &state,
+            &a.group,
+            a.key,
+            PushContent::Sealed(mc),
+            req.urgency,
+            req.collapse_id,
+            expiration,
+        )
+        .await
+        .map_err(storage_error)?;
         Ok(ok(
             StatusCode::OK,
             json!({
@@ -691,31 +763,28 @@ async fn post_message(
 
 /// Push to every iOS device of the group concurrently; forget dead tokens.
 async fn fan_out(
-    state: &Arc<AppState>,
-    a: &Authed,
-    mc: McEnvelope,
+    state: &AppState,
+    group: &str,
+    key: [u8; 32],
+    content: PushContent,
     urgency: Urgency,
     collapse_id: Option<String>,
     expiration: u64,
-) -> Result<(usize, usize, usize), Outcome> {
+) -> Result<(usize, usize, usize), StoreError> {
     let v2 = state.v2();
-    let g = a.group.clone();
-    let targets = v2
-        .store
-        .call(move |c| store::push_targets(c, &g))
-        .await
-        .map_err(storage_error)?;
+    let g = group.to_string();
+    let targets = v2.store.call(move |c| store::push_targets(c, &g)).await?;
     let mut set = JoinSet::new();
     for d in targets {
         let Some(token) = d.apns_token.clone() else {
             continue;
         };
         let job = PushJob {
-            group_id: a.group.clone(),
-            auth_key: a.key,
+            group_id: group.to_string(),
+            auth_key: key,
             device_token: token,
             env: ApnsEnv::parse(&d.apns_env).unwrap_or(ApnsEnv::Production),
-            mc: mc.clone(),
+            content: content.clone(),
             urgency,
             collapse_id: collapse_id.clone(),
             expiration,
@@ -736,7 +805,7 @@ async fn fan_out(
             Ok(()) => pushed += 1,
             Err(PushError::Unregistered) => {
                 unregistered += 1;
-                let g = a.group.clone();
+                let g = group.to_string();
                 if let Err(e) = v2
                     .store
                     .call(move |c| store::clear_token(c, &g, &device_id, &token))
@@ -749,14 +818,69 @@ async fn fan_out(
                 failed += 1;
                 match e {
                     PushError::Rejected { status, reason } => {
-                        tracing::warn!(group = %a.group, status, reason, "APNs rejected push")
+                        tracing::warn!(group = %group, status, reason, "APNs rejected push")
                     }
-                    _ => tracing::warn!(group = %a.group, "APNs transport error"),
+                    _ => tracing::warn!(group = %group, "APNs transport error"),
                 }
             }
         }
     }
     Ok((pushed, failed, unregistered))
+}
+
+// -------------------------------------------------------------- presence ---
+
+/// Send a presence notice to every phone of the group (best effort).
+pub async fn push_presence(state: &AppState, group: &str, note: PresenceNote) {
+    let g = group.to_string();
+    let key = match state
+        .v2()
+        .store
+        .call(move |c| store::group_key(c, &g))
+        .await
+    {
+        Ok(Some(k)) => k,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(error = %e, "presence: cannot load group");
+            return;
+        }
+    };
+    let urgency = match note {
+        PresenceNote::Offline { .. } => Urgency::Critical,
+        PresenceNote::Online { .. } => Urgency::Silent,
+    };
+    let expiration = state.now() + PRESENCE_TTL_SECS;
+    let state_label = match note {
+        PresenceNote::Offline { .. } => "offline",
+        PresenceNote::Online { .. } => "online",
+    };
+    match fan_out(
+        state,
+        group,
+        key,
+        PushContent::Presence(note),
+        urgency,
+        Some(PRESENCE_COLLAPSE_ID.to_string()),
+        expiration,
+    )
+    .await
+    {
+        Ok((pushed, failed, _)) => {
+            tracing::info!(group = %group, state = state_label, pushed, failed, "presence push")
+        }
+        Err(e) => tracing::error!(error = %e, "presence: cannot load devices"),
+    }
+}
+
+/// Send every offline notice whose grace period has passed. Run periodically
+/// (see `spawn_presence`) and right after a `bye`.
+pub async fn presence_tick(state: &AppState) {
+    let v2 = state.v2();
+    let due = v2.presence.due(state.now(), |g| v2.hub.group_online(g));
+    for (group, note) in due {
+        push_presence(state, &group, note).await;
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1080,11 +1204,18 @@ async fn gateway_push(
         let req: GatewayPush = parse(&body)?;
         let token = normalize_apns_token(&req.device_token)
             .ok_or_else(|| bad("device_token must be 64 to 200 hex characters"))?;
-        if !is_token_id(&req.message.id) || !is_sealed(&req.message.s, MAX_PAYLOAD_BYTES) {
-            return Err(bad(
-                "message must be {id, t, s} with a valid id and sealed box",
-            ));
-        }
+        let content = match (req.message, req.presence) {
+            (Some(m), None) => {
+                if !is_token_id(&m.id) || !is_sealed(&m.s, MAX_PAYLOAD_BYTES) {
+                    return Err(bad(
+                        "message must be {id, t, s} with a valid id and sealed box",
+                    ));
+                }
+                PushContent::Sealed(m)
+            }
+            (None, Some(p)) => PushContent::Presence(p),
+            _ => return Err(bad("exactly one of message or presence is required")),
+        };
         if req.collapse_id.as_deref().is_some_and(|c| !is_token_id(c)) {
             return Err(bad(
                 "collapse_id must be 1 to 64 characters of A-Z a-z 0-9 _ -",
@@ -1094,9 +1225,13 @@ async fn gateway_push(
         if req.expiration != 0 && req.expiration > now + MAX_TTL_SECS {
             return Err(bad("expiration must be 0 or at most 24 h ahead"));
         }
-        // The gateway builds the payload itself, so it cannot be used to send
-        // arbitrary notification text.
-        if build_payload(&req.message, req.urgency).len() > MAX_PAYLOAD_BYTES {
+        // The gateway builds the payload itself (presence text is fixed), so it
+        // cannot be used to send arbitrary notification text.
+        let payload_len = match &content {
+            PushContent::Sealed(m) => build_payload(m, req.urgency).len(),
+            PushContent::Presence(p) => build_presence_payload(*p).len(),
+        };
+        if payload_len > MAX_PAYLOAD_BYTES {
             return Err((
                 error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
                 "payload_too_large",
@@ -1107,7 +1242,7 @@ async fn gateway_push(
             auth_key: a.key,
             device_token: token,
             env: req.env,
-            mc: req.message,
+            content,
             urgency: req.urgency,
             collapse_id: req.collapse_id,
             expiration: req.expiration,

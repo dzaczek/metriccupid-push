@@ -253,6 +253,7 @@ exposes them at `GET /v2/debug/pushes`.
 | `RATE_V2_GATEWAY_PER_SEC` / `_BURST` | `5` / `50` | Hosted: per-group bucket for gateway pushes. |
 | `RATE_V2_GROUPS_PER_HOUR` / `RATE_V2_GROUPS_BURST` | `6` / `3` | Per-IP bucket for `POST /v2/groups`. |
 | `WS_PING_SECS` | `30` | WebSocket ping interval; idle streams are closed after 2 intervals + 5 s. |
+| `MAC_OFFLINE_GRACE_SECS` | `120` | When a group's last Mac stream drops without a `bye`, wait this long before telling the phones "MetricCupid is offline on your Mac" (reconnects within it stay silent). `0` = immediately. A `bye` (quit, sleep, Phone & Watch turned off) is announced at once. |
 | `APNS_PRODUCTION_URL` / `APNS_SANDBOX_URL` | Apple's | Overrides for tests only. |
 
 The v1 per-IP, global and auth-ban limits apply to every v2 route too. Fixed limits: 16 KB v2 body,
@@ -278,7 +279,10 @@ The server, and anyone who controls it, can see:
 - timing, sizes and counts of messages and commands, and which device sent them;
 - `urgency` (critical / normal / silent) and type (alert / result / command): needed for the APNs
   priority, sound and notification category;
-- client IP addresses (logged together with the group id).
+- client IP addresses (logged together with the group id);
+- whether and when each Mac is connected (`last_seen`). The server itself sends the phones plaintext
+  presence notices ("MetricCupid is offline on your Mac" / "back online"); they contain only the
+  state, a reason (`quit`, `sleep`, `disabled`, `lost`) and a time, never alert content.
 
 It cannot see alert titles, hosts, services, summaries, URLs, commands or results, and it cannot
 forge them: content is sealed with a key it never receives. It can drop, delay or delete messages.

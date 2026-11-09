@@ -298,7 +298,24 @@ Any registered device of the group may remove any device (e.g. a lost phone). `2
               "has_token": false, "created_at": 1700000000, "updated_at": 1700000000, "online": true}]}
 ```
 
-APNs tokens are never returned. `online` (Macs only) is true while the Mac has a live stream.
+APNs tokens are never returned. `online` and `last_seen` (Macs only): `online` is true while the
+Mac has a live stream (section 7); `last_seen` is the Unix time the server last heard from that
+stream (connect, any frame or pong, disconnect; written at least every 10 s while connected), `null`
+if it never connected.
+
+### 6.4a `GET /v2/status` (any device)
+
+Is a Mac able to receive commands and send alerts right now?
+
+```json
+{"mac_online": false, "mac_last_seen": 1700000000,
+ "macs": [{"device_id": "...", "online": false, "last_seen": 1700000000}]}
+```
+
+`mac_online` is true if any Mac of the group has a live stream; `mac_last_seen` is the latest
+`last_seen` of the group's Macs (`null` if none ever connected). Phones SHOULD call it when they come
+to the foreground and show "Mac offline since ..." while `mac_online` is false. Section 7a describes
+the pushes that tell the phones about changes.
 
 ### 6.5 `POST /v2/messages` (Mac)
 
@@ -419,12 +436,63 @@ On connect the server first sends every queued command (backlog), then `ready`. 
 commands arrive as they are posted. The same command can arrive more than once (backlog and live,
 reconnects, several Macs): dedupe by `id` (section 4.4).
 
-Mac to server, text frames: `{"type": "ack", "cursor": 7}` (same effect as section 6.8). Any other
-frame closes the stream with 1008 (binary: 1003). Frames are limited to 4 KB.
+Mac to server, text frames:
+
+- `{"type": "ack", "cursor": 7}`: same effect as section 6.8.
+- `{"type": "bye", "reason": "quit"}`: the Mac is going offline on purpose; `reason` is `quit` (the
+  app is quitting), `sleep` (the Mac is going to sleep) or `disabled` (the user turned Phone & Watch
+  off). The server closes the stream (1000, `bye`) and announces the Mac offline at once
+  (section 7a). Macs SHOULD send it, best effort, before they disconnect on purpose.
+
+Any other frame closes the stream with 1008 (binary: 1003). Frames are limited to 4 KB.
 
 Keepalive: the server sends a WebSocket ping every 30 s (`WS_PING_SECS`) and closes the stream (1001,
 `idle`) after 65 s without any frame or pong from the Mac. Clients SHOULD reconnect with backoff
 (1, 2, 4 ... 60 s) and fall back to polling section 6.8 every 30 to 60 s while the stream is down.
+
+## 7a. Presence
+
+The server tells the group's phones when alerts stop reaching them because no Mac is connected.
+
+- When the group's **last** Mac stream ends after a `bye`, the server pushes an offline notice
+  immediately. When it ends without one (network loss, crash, idle timeout), it waits
+  `MAC_OFFLINE_GRACE_SECS` (default 120 s); if any Mac of the group reconnects in that time, nothing
+  is sent (reconnects and flapping within the grace period are silent).
+- When a Mac connects after an offline notice was sent, the server pushes a "back online" notice
+  with the same `apns-collapse-id`, so it replaces the offline one.
+- The server never sends the same state twice in a row, and never announces a Mac's first connect.
+  The state is kept in memory: after a server restart nothing is pending and a reconnecting Mac is
+  not announced.
+
+APNs payload (built by the server; `apns-collapse-id: mc-presence`, `apns-expiration` = now + 1 h,
+`apns-priority` 10 offline / 5 back online):
+
+```json
+{"aps": {"alert": {"title": "MetricCupid is offline on your Mac",
+                   "body": "MetricCupid was quit. Alerts won't reach this iPhone until it's back."},
+         "category": "MC_PRESENCE", "thread-id": "mc-presence", "sound": "default",
+         "interruption-level": "time-sensitive"},
+ "mc_presence": {"state": "offline", "reason": "quit", "since": 1700000000}}
+
+{"aps": {"alert": {"title": "MetricCupid is back online",
+                   "body": "Alerts from your Mac reach this iPhone again."},
+         "category": "MC_PRESENCE", "thread-id": "mc-presence", "interruption-level": "passive"},
+ "mc_presence": {"state": "online", "since": 1700000600}}
+```
+
+| `reason` | `body` |
+|---|---|
+| `quit` | MetricCupid was quit. Alerts won't reach this iPhone until it's back. |
+| `sleep` | Your Mac went to sleep. Alerts won't reach this iPhone until it wakes. |
+| `disabled` | Phone & Watch was turned off on the Mac. Alerts won't reach this iPhone until it's back on. |
+| `lost` | The connection to your Mac was lost. Alerts won't reach this iPhone until it's back. |
+
+`since` is the Unix time the server last heard from the Mac (offline) or the time it reconnected
+(online). Presence payloads are **plaintext** and have no `mutable-content` and no `mc`: they carry
+no alert content, only what the server already knows (section 10). The Notification Service
+Extension is not invoked for them; if it is, it MUST pass a payload without `mc` through unchanged.
+Phones SHOULD store the `mc_presence` state when they receive one (e.g. in the app group, for the
+status header) and MUST NOT require them: `GET /v2/status` is the source of truth.
 
 ## 8. Delivery semantics summary
 
@@ -454,9 +522,13 @@ X-MC-Timestamp, X-MC-Signature, X-MC-Group      (no X-MC-Device; device_id line 
  "urgency": "critical", "collapse_id": "<optional>", "expiration": 1700003600}
 ```
 
+A presence notice (section 7a) carries `"presence": {"state": "offline", "reason": "lost", "since":
+1700000000}` instead of `message`; exactly one of the two is required (`400` otherwise).
 `expiration` is 0 or at most 24 h ahead. The gateway builds the APNs payload itself from `message`
-and `urgency` (section 6.5), so it cannot be used to send arbitrary notification text, and sends it
-with its own key. Answers: `200 {"status":"sent"}`, `410 {"error":"unregistered"}` (the self-hosted
+and `urgency` (section 6.5) or from `presence` (fixed texts, section 7a), so it cannot be used to
+send arbitrary notification text, and sends it with its own key. A gateway older than this version
+rejects `presence` (`400`): the self-hosted server then logs the failure and the phones get no
+presence push (`GET /v2/status` still works). Answers: `200 {"status":"sent"}`, `410 {"error":"unregistered"}` (the self-hosted
 server removes the token), `502 upstream_error`, `400`, `401`, `413`, `429` (per group, default
 5/s, burst 50).
 
@@ -476,6 +548,7 @@ nothing but the group registration.
 | Timing, sizes, counts of messages and commands, which device sent them | yes |
 | `urgency` (critical / normal / silent) and message `type` | yes: a documented leak needed for APNs priority, sound and category |
 | Client IP addresses | yes (logged with the group id) |
+| Whether and when each Mac is connected (`last_seen`), and why it disconnected (`bye` reason) | yes: the server uses it for presence pushes (section 7a), which are plaintext but contain nothing else |
 
 A server operator, or anyone who obtains `auth_key`, can delete or withhold messages and inject
 garbage that receivers drop, but cannot read or forge content.
@@ -495,6 +568,7 @@ garbage that receivers drop, but cannot read or forge content.
 | Gateway pushes per group | 5/s, burst 50 | `RATE_V2_GATEWAY_*` |
 | Group registrations per IP | 6/h, burst 3 | `RATE_V2_GROUPS_*` |
 | Streams per server | 1024 | no |
+| Mac offline grace (lost stream, no `bye`) | 120 s | `MAC_OFFLINE_GRACE_SECS` |
 | Per-IP, global, auth-failure bans | as v1 | as v1 |
 
 ## 12. Error codes

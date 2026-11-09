@@ -36,6 +36,21 @@ pub fn spawn_cleanup(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// How often pending Mac-offline notices are checked.
+pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawn the task that sends Mac-offline notices after their grace period.
+pub fn spawn_presence(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PRESENCE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            v2::presence_tick(&state).await;
+        }
+    })
+}
+
 /// Serve the API on `listener` until `shutdown` resolves.
 pub async fn serve(
     listener: TcpListener,

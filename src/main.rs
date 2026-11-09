@@ -9,7 +9,7 @@ use std::time::Duration;
 use metriccupid_push::client_ip::ClientIpResolver;
 use metriccupid_push::config::{ApnsMode, Config, LogFormat, Mode, TrustProxy};
 use metriccupid_push::limits::SystemClock;
-use metriccupid_push::{serve, spawn_cleanup, AppState};
+use metriccupid_push::{serve, spawn_cleanup, spawn_presence, AppState};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -89,6 +89,7 @@ async fn async_main(config: Config) -> Result<(), String> {
     let resolver = ClientIpResolver::from_config(&config.trust_proxy).await;
     let state = Arc::new(AppState::new(&config, resolver, Arc::new(SystemClock))?);
     spawn_cleanup(state.clone());
+    spawn_presence(state.clone());
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

@@ -189,6 +189,7 @@ fn build_v2(config: &Config, clock: Arc<dyn Clock>) -> Result<V2State, String> {
             open: c.hosted_open_registration,
         }),
         ws_ping: c.ws_ping,
+        presence: v2::presence::Presence::new(c.mac_offline_grace),
     })
 }
 

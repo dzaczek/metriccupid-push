@@ -85,6 +85,9 @@ pub struct V2Config {
     pub rate_gateway: Rate,
     pub rate_groups: HourlyRate,
     pub ws_ping: Duration,
+    /// Seconds the last Mac of a group may stay offline (stream lost without
+    /// a `bye`) before its phones get a presence push. 0 = immediately.
+    pub mac_offline_grace: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +421,7 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
                 .get()
                 .into(),
         ),
+        mac_offline_grace: parse_num("MAC_OFFLINE_GRACE_SECS", get("MAC_OFFLINE_GRACE_SECS"), 120)?,
     })
 }
 
@@ -575,6 +579,7 @@ mod tests {
         assert_eq!(c.v2.rate_messages.burst.get(), 60);
         assert_eq!(c.v2.rate_commands.burst.get(), 20);
         assert_eq!(c.v2.ws_ping, Duration::from_secs(30));
+        assert_eq!(c.v2.mac_offline_grace, 120);
     }
 
     #[test]

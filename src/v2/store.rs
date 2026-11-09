@@ -21,7 +21,8 @@ pub const PAGE: usize = 100;
 
 /// Schema migrations, applied in order; `PRAGMA user_version` is the number
 /// already applied. Never edit a released entry, append a new one.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE groups (
     group_id     TEXT PRIMARY KEY,
     auth_key     BLOB NOT NULL,
@@ -66,7 +67,11 @@ CREATE TABLE commands (
     UNIQUE (group_id, cmd_id)
 );
 CREATE INDEX commands_created ON commands(created_at);
-"#];
+"#,
+    r#"
+ALTER TABLE devices ADD COLUMN last_seen INTEGER;
+"#,
+];
 
 #[derive(Debug)]
 pub struct StoreError(pub String);
@@ -92,6 +97,8 @@ pub struct Device {
     pub apns_env: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Macs: last time the server heard from its stream (Unix seconds).
+    pub last_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,10 +251,12 @@ fn row_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         apns_env: r.get(4)?,
         created_at: ts(r.get(5)?),
         updated_at: ts(r.get(6)?),
+        last_seen: r.get::<_, Option<i64>>(7)?.map(ts),
     })
 }
 
-const DEVICE_COLS: &str = "device_id, kind, name, apns_token, apns_env, created_at, updated_at";
+const DEVICE_COLS: &str =
+    "device_id, kind, name, apns_token, apns_env, created_at, updated_at, last_seen";
 
 pub fn device(
     c: &mut Connection,
@@ -321,6 +330,20 @@ pub fn delete_device(
         "DELETE FROM devices WHERE group_id = ?1 AND device_id = ?2",
         [group_id, device_id],
     )? > 0)
+}
+
+/// Record that the server heard from the device's stream at `now`.
+pub fn touch_device(
+    c: &mut Connection,
+    group_id: &str,
+    device_id: &str,
+    now: u64,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE devices SET last_seen = ?3 WHERE group_id = ?1 AND device_id = ?2",
+        params![group_id, device_id, now as i64],
+    )?;
+    Ok(())
 }
 
 /// iOS devices with an APNs token.
@@ -640,6 +663,30 @@ mod tests {
         assert_eq!(
             insert_command(&mut c, "g", "x", "AAAA", 10).unwrap(),
             Insert::Stored(201)
+        );
+    }
+
+    #[test]
+    fn last_seen_is_kept_across_upserts() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        let d = Device {
+            device_id: "mac".into(),
+            kind: "mac".into(),
+            name: "Mac".into(),
+            apns_token: None,
+            apns_env: "production".into(),
+            created_at: 0,
+            updated_at: 0,
+            last_seen: None,
+        };
+        upsert_device(&mut c, "g", &d, 10).unwrap();
+        assert_eq!(device(&mut c, "g", "mac").unwrap().unwrap().last_seen, None);
+        touch_device(&mut c, "g", "mac", 42).unwrap();
+        upsert_device(&mut c, "g", &d, 50).unwrap();
+        assert_eq!(
+            device(&mut c, "g", "mac").unwrap().unwrap().last_seen,
+            Some(42)
         );
     }
 }
