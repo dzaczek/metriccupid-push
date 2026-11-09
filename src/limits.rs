@@ -256,6 +256,7 @@ pub struct V2Limits {
     commands: DefaultKeyedRateLimiter<String>,
     gateway: DefaultKeyedRateLimiter<String>,
     activity: DefaultKeyedRateLimiter<String>,
+    snapshot: DefaultKeyedRateLimiter<String>,
     groups: DefaultKeyedRateLimiter<IpAddr>,
 }
 
@@ -265,6 +266,14 @@ pub fn activity_quota() -> Quota {
     Quota::with_period(Duration::from_secs(5))
         .expect("non-zero period")
         .allow_burst(std::num::NonZeroU32::new(10).expect("non-zero"))
+}
+
+/// `POST /v2/snapshot` per group: one per 5 s, burst 5 (a snapshot can be
+/// 192 KB; the Mac sends at most one per 10 s plus a 5-min heartbeat).
+pub fn snapshot_quota() -> Quota {
+    Quota::with_period(Duration::from_secs(5))
+        .expect("non-zero period")
+        .allow_burst(std::num::NonZeroU32::new(5).expect("non-zero"))
 }
 
 fn hourly(r: HourlyRate) -> Quota {
@@ -278,6 +287,7 @@ impl V2Limits {
             commands: RateLimiter::keyed(quota(c.rate_commands)),
             gateway: RateLimiter::keyed(quota(c.rate_gateway)),
             activity: RateLimiter::keyed(activity_quota()),
+            snapshot: RateLimiter::keyed(snapshot_quota()),
             groups: RateLimiter::keyed(hourly(c.rate_groups)),
         }
     }
@@ -306,6 +316,12 @@ impl V2Limits {
             .map_err(retry_after)
     }
 
+    pub fn check_snapshot(&self, group: &str) -> Result<(), RetryAfter> {
+        self.snapshot
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
     pub fn check_group_registration(&self, ip: IpAddr) -> Result<(), RetryAfter> {
         self.groups.check_key(&ip).map_err(retry_after)
     }
@@ -316,6 +332,7 @@ impl V2Limits {
             &self.commands,
             &self.gateway,
             &self.activity,
+            &self.snapshot,
         ] {
             l.retain_recent();
             l.shrink_to_fit();

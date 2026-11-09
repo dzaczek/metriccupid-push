@@ -16,6 +16,7 @@ Mac --POST /v2/messages (sealed alert)--> server --APNs (sealed)--> iPhone NSE d
 iPhone action --POST /v2/commands (sealed)--> server --WebSocket--> Mac executes on Icinga/Alertmanager
 Mac --POST /v2/messages (sealed result, same collapse id)--> server --APNs--> iPhone replaces the alert
 Mac --POST /v2/messages (sealed summary)--> server mailbox --> iPhone app / widget read it when they run
+Mac --POST /v2/snapshot (sealed, every active alert)--> server keeps the newest --> iPhone Active tab (GET /v2/snapshot)
 Mac --POST /v2/activity-state (plaintext counts)--> server --APNs liveactivity--> Dynamic Island / Lock Screen
 ```
 
@@ -120,7 +121,7 @@ let plaintext = try ChaChaPoly.open(box, using: encKey, authenticating: Data(aad
 AAD = "{group_id}|{type}|{id}"      (UTF-8, no trailing newline)
 ```
 
-`type` is `alert`, `result`, `summary` or `command`; `id` is the message or command id sent next to
+`type` is `alert`, `result`, `summary`, `snapshot` or `command`; `id` is the message or command id sent next to
 `sealed`.
 This binds a ciphertext to its group, type and id: the server cannot move a box to another group,
 replay it under another id, or turn a result into an alert.
@@ -150,6 +151,24 @@ UTF-8 JSON object. Common fields:
 | `url` | string, optional | absolute http(s) URL to open the alert in its source UI |
 | `state` | string | `firing` or `resolved` |
 | `actions` | array of string | commands the Mac will accept for this alert, subset of `ack`, `unack`, `mute`, `unmute`, `open` |
+| `display_name` | string, optional | human name of the host (Icinga host `display_name`, Zabbix visible name); receivers show it instead of `host` when present |
+| `kind` | string, optional | `digest`, see below; absent for an ordinary alert |
+
+**Digest.** To avoid a flood of pushes during an outage, a Mac MAY send the first few new alerts of a
+burst one by one and then a single `alert` with `kind: "digest"` standing for the rest. Its
+`alert_id` is `metriccupid:digest:<random>`, `host` is empty, `severity` is the worst of the bundled
+alerts, `state` is `firing`, `actions` is `["open"]`, `title` is e.g. `12 new alerts` and `summary`
+e.g. `5 critical: web01, db02 and 3 more`, plus:
+
+| Field | Type | Rule |
+|---|---|---|
+| `digest_count` | int | alerts bundled |
+| `digest_critical` | int | of which critical |
+| `digest_hosts` | array of string, at most 10 | distinct host (display) names, worst first |
+
+Receivers that do not know `kind` show `title` and `summary` like any alert. The bundled alerts are
+not sent individually; the Mac sends a later state change of one of them only if it escalates to
+critical (then as an ordinary alert message). They are always in the `snapshot`.
 
 `command` (phone to Mac):
 
@@ -178,6 +197,48 @@ UTF-8 JSON object. Common fields:
 The Mac sends a summary when the counts or `top` change (debounced, about 5 s) and every 15 min while
 anything is active. Only the Mac that runs iPhone actions sends summaries. Receivers keep only the
 summary with the highest `ts`.
+
+`snapshot` (Mac to phones): every alert that is active or muted on the Mac right now, for the
+phone's list of current alerts. Stored by the server (only the newest per group), never pushed, never
+in the mailbox; read with `GET /v2/snapshot` (section 6.6a).
+
+| Field | Type | Rule |
+|---|---|---|
+| `compressed` | bool | `true`: `items` is compressed as below |
+| `count` | int | alerts on the Mac (can exceed the items sent, see `truncated`) |
+| `truncated` | bool, optional | `true` when items were left out to fit the size limit |
+| `items` | string | `base64( DEFLATE( UTF-8 JSON array of item ) )` |
+
+Compression is **raw DEFLATE** (RFC 1951, no zlib header or checksum), which is what Apple's
+`NSData.compressed(using: .zlib)` / `COMPRESSION_ZLIB` produce and consume. The compressed bytes are
+base64-encoded inside the plaintext, so the plaintext stays JSON and the usual receiver rules (4.4)
+apply unchanged; the plaintext is then sealed like every message (AAD `{group_id}|snapshot|{id}`).
+
+Item, at most 2000, in the Mac's list order (worst severity first, newest first):
+
+| Field | Type | Rule |
+|---|---|---|
+| `alert_id` | string | as in `alert` |
+| `title` | string | at most 200 characters |
+| `host` | string | host name at the source, may be empty |
+| `display_name` | string, optional | human host name |
+| `service` | string, optional | |
+| `check` | string, optional | the check / rule that raised it (grouping "by alert") |
+| `severity` | string | as in `alert` |
+| `state` | string | `firing`, `acknowledged` or `muted` |
+| `ack_by` | string, optional | |
+| `muted_until` | int, optional | Unix seconds |
+| `source` | string | as in `alert` |
+| `source_name` | string, optional | the source's name on the Mac |
+| `since` | int, optional | Unix time the alert started (or was first seen) |
+| `summary` | string, optional | at most 200 characters |
+| `url` | string, optional | as in `alert` |
+| `actions` | array of string | as in `alert` |
+
+Names are cut to 128 characters. The Mac sends a snapshot when the list changes (debounced about
+5 s, at most one per 10 s) and every 5 min while linked, even when nothing changed, so a phone can
+tell an old snapshot ("Mac offline?") from an empty list. Only the Mac that runs iPhone actions
+sends snapshots. Receivers keep the snapshot with the highest `ts`.
 
 Receivers MUST ignore unknown fields. Senders SHOULD encode compact JSON.
 
@@ -209,7 +270,9 @@ it. The server only sees that two pushes concern the same (unknown) alert.
 
 APNs payloads are limited to 4096 bytes. With the fixed payload of section 6.1, a plaintext of up to
 2834 bytes fits in the worst case. The Mac MUST keep plaintext at or below **2560 bytes** (truncate
-`summary` first); the server answers `413 payload_too_large` otherwise.
+`summary` first); the server answers `413 payload_too_large` otherwise. This limit is for pushed
+messages; a `snapshot` (never pushed) has its own: `sealed` at most `V2_SNAPSHOT_MAX_BYTES` base64
+characters (default 192 KB), so a plaintext of about 140 000 bytes.
 
 ## 5. Request authentication
 
@@ -260,8 +323,8 @@ Clients SHOULD send, on every v2 request (including `POST /v2/groups` and the `G
 upgrade):
 
 ```
-X-MC-Client: MetricCupid-Mac/1.32.0 (151)
-X-MC-Client: MetricCupid-iOS/1.32.0 (4)
+X-MC-Client: MetricCupid-Mac/1.33.0 (153)
+X-MC-Client: MetricCupid-iOS/1.33.0 (6)
 ```
 
 Format: `MetricCupid-<platform>/<marketing version> (<build>)`, at most 64 printable ASCII
@@ -272,7 +335,8 @@ the operator can see which app versions are still in use before changing the pro
 
 ## 6. HTTP API
 
-All bodies are JSON (`Content-Type: application/json`), at most 16 KB (`413` above). Unknown
+All bodies are JSON (`Content-Type: application/json`), at most 16 KB (`413` above), except
+`POST /v2/snapshot` (section 6.6a). Unknown
 request fields are rejected with `400`. Errors are `{"error":"<code>"}`, validation errors add
 `"detail"`. Rate-limited responses carry `Retry-After`.
 
@@ -429,7 +493,30 @@ Messages with `cursor > since` (default 0), oldest first, at most 100 per page:
 ```
 
 Pass the returned `cursor` as the next `since`. Used by the app's recent list and when the extension
-could not run. Retention: 24 h and at most 500 messages per group (oldest dropped).
+could not run. Retention: 24 h and at most 500 messages per group (oldest dropped). Snapshots are
+never listed here (they have their own route, 6.6a), so a mailbox sync stays small.
+
+### 6.6a `POST /v2/snapshot` (Mac) and `GET /v2/snapshot` (any device)
+
+```json
+{"id": "c25hcHNob3QtMDAwMDAwMQ", "sealed": "..."}
+```
+
+The body may be up to `V2_SNAPSHOT_MAX_BYTES` + 1 KB (other routes keep 16 KB); `sealed` longer than
+`V2_SNAPSHOT_MAX_BYTES` (default 196 608) is `413 payload_too_large`. The server replaces the group's
+stored snapshot and pushes nothing: `200 {"status":"stored"}`, or `{"status":"duplicate"}` if the
+stored one already has this `id`. `429 rate_limited` above 1 per 5 s per group (burst 5); `402` as
+for messages.
+
+`GET /v2/snapshot` returns the stored snapshot, `ts` being when the server received it:
+
+```json
+{"id": "c25hcHNob3QtMDAwMDAwMQ", "ts": 1700000000, "sealed": "..."}
+```
+
+or `204` (no body) when the group has none (or it is older than 24 h). Phones SHOULD fetch it when
+they come to the foreground, on pull-to-refresh and after a push while open; and SHOULD show a
+snapshot whose plaintext `ts` is older than 15 min as possibly stale ("Mac offline?").
 
 ### 6.7 `POST /v2/commands` (phone)
 
@@ -699,6 +786,7 @@ nothing but the group registration.
 | Licence (hosted): App Store purchase id, environment, original purchase date, original app version and platform, when verified | yes, section 13.5 |
 | Whether and when each Mac is connected (`last_seen`), and why it disconnected (`bye` reason) | yes: the server uses it for presence pushes (section 7a), which are plaintext but contain nothing else |
 | `summary` contents | no (ciphertext; only that one was sent, and when) |
+| `snapshot` contents | no (ciphertext; its size, which roughly tracks how many alerts are active, and when) |
 | Live Activity state: counts of critical / warning / unknown alerts and their changes over time | **yes, plaintext** (section 6.10): ActivityKit applies it without the extension, so it cannot be encrypted. Also visible to APNs (Apple). |
 | Live Activity lines (severity + host / service, up to 4 × 40 characters) | **yes, plaintext**, only if the user turns on "Show host names on the lock screen (sent unencrypted)" on the Mac (off by default) |
 | Live Activity push tokens and start tokens, when each activity started | yes |
@@ -713,7 +801,8 @@ keeps operational metadata in its database. Without the panel nothing below is c
 
 | Stored | Retention |
 |---|---|
-| Per request: time, route, HTTP status, outcome label, latency, request size, group and (signed) device id once authenticated, `X-MC-Client` (section 5.3), Cloudflare country (`CF-IPCountry`, only from a trusted proxy), and the client network truncated to **/24 (IPv4) or /48 (IPv6)** | raw rows `ADMIN_EVENTS_RETENTION_DAYS` (default 30) and at most 1 000 000 rows; successful polls (`GET /v2/messages`, `/v2/commands`, `/v2/status`, `/v2/devices`) are only counted, not stored as rows |
+| Per request: time, route, HTTP status, outcome label, latency, request size, group and (signed) device id once authenticated, `X-MC-Client` (section 5.3), Cloudflare country (`CF-IPCountry`, only from a trusted proxy), and the client network truncated to **/24 (IPv4) or /48 (IPv6)** | raw rows `ADMIN_EVENTS_RETENTION_DAYS` (default 30) and at most 1 000 000 rows; successful polls (`GET /v2/messages`, `/v2/commands`, `/v2/status`, `/v2/devices`, `/v2/snapshot`) are only counted, not stored as rows |
+| Per stored snapshot: kind `snapshot`, outcome (`stored`, `duplicate`) and the size of `sealed` | as above |
 | Per push: type (`alert`, `result`, `presence`, `liveactivity`, `start`), outcome (`sent`, `failed`, `unregistered`), APNs status and reason, sender (`direct`, `gateway`, `mock`) and APNs environment | as above |
 | WebSocket connect / disconnect with close reason and duration, presence transitions, licence verification outcomes (`ok` with tier / environment, `invalid` with reason, `in_use`), auth bans, admin logins | as above |
 | Daily counters of all of the above per group, route, status, outcome and country | 400 days |
@@ -728,7 +817,7 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 |---|---|---|
 | Clock skew | 300 s | no |
 | Replay window | 600 s | no |
-| Body | 16 KB (v1: 8 KB) | no |
+| Body | 16 KB (v1: 8 KB; snapshot: section 6.6a) | no |
 | Devices per group | 10 | no |
 | Mailbox | 24 h, 500 per group | no |
 | Command queue | 1 h, 200 per group | no |
@@ -736,6 +825,8 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 | Commands per group | 1/s, burst 20 | `RATE_V2_COMMANDS_*` |
 | Gateway pushes per group | 5/s, burst 50 | `RATE_V2_GATEWAY_*` |
 | `POST /v2/activity-state` per group | 1 per 5 s, burst 10 | no |
+| `POST /v2/snapshot` per group | 1 per 5 s, burst 5 | no |
+| Snapshot `sealed` | 192 KB (196 608 base64 characters); body + 1 KB | `V2_SNAPSHOT_MAX_BYTES` |
 | Live Activity pushes per group | at most 1 per 5 s (coalesced; `end` immediate) | no |
 | Push-to-start per phone | 1 per 8 h | no |
 | Group registrations per IP | 6/h, burst 3 | `RATE_V2_GROUPS_*` |

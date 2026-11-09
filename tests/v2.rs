@@ -2193,3 +2193,125 @@ async fn licences_survive_restart() {
         "founder"
     );
 }
+
+fn snapshot_body(mac: &Client, id: &str, items: usize) -> Value {
+    let pt = json!({"v": 1, "type": "snapshot", "id": id, "ts": T0, "compressed": true,
+                    "items": "x".repeat(items)});
+    json!({"id": id, "sealed": mac.seal_json("snapshot", id, &pt, [4; 12])})
+}
+
+#[tokio::test]
+async fn snapshot_replaces_is_never_pushed_nor_in_the_mailbox() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 27).await;
+    let r = phone.get("/v2/snapshot").await;
+    assert_eq!(r.status, 204, "{:?}", r.json);
+
+    // 100 KB of sealed data: far above the 16 KB of the other routes.
+    let r = mac
+        .post("/v2/snapshot", &snapshot_body(&mac, "snap-1", 100_000))
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(r.json["status"], "stored");
+    let r = mac
+        .post("/v2/snapshot", &snapshot_body(&mac, "snap-1", 10))
+        .await;
+    assert_eq!(r.json["status"], "duplicate");
+    let r = mac
+        .post("/v2/snapshot", &snapshot_body(&mac, "snap-2", 10))
+        .await;
+    assert_eq!(r.json["status"], "stored");
+    assert!(s.mock().pushes().is_empty());
+
+    let r = phone.get("/v2/snapshot").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json["id"], "snap-2");
+    assert_eq!(r.json["ts"], T0);
+    let sealed = r.json["sealed"].as_str().unwrap();
+    let pt = common::open(
+        &mac.keys.enc,
+        &common::aad(&mac.group_id, "snapshot", "snap-2"),
+        sealed,
+    )
+    .expect("opens with the snapshot AAD");
+    let pt: Value = serde_json::from_slice(&pt).unwrap();
+    assert_eq!(pt["type"], "snapshot");
+    // The Mac may read it too.
+    assert_eq!(mac.get("/v2/snapshot").await.status, 200);
+
+    let r = phone.get("/v2/messages?since=0").await;
+    assert!(r.json["messages"].as_array().unwrap().is_empty());
+    // `snapshot` is not a mailbox type.
+    let r = mac
+        .post(
+            "/v2/messages",
+            &json!({"id": "x", "type": "snapshot", "sealed": mac.seal_json("snapshot", "x", &json!({}), [5; 12]),
+                    "urgency": "silent"}),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+}
+
+#[tokio::test]
+async fn snapshot_validation_size_and_sender_kind() {
+    let (_d, s) = server(&[("V2_SNAPSHOT_MAX_BYTES", "32768")]).await;
+    let (mac, phone) = setup(&s, 29).await;
+    // Phones cannot post snapshots.
+    let r = phone
+        .post("/v2/snapshot", &snapshot_body(&phone, "p", 10))
+        .await;
+    assert_eq!(r.status, 403);
+    let r = mac
+        .post("/v2/snapshot", &json!({"id": "bad id", "sealed": "AAAA"}))
+        .await;
+    assert_eq!(r.status, 400);
+    let r = mac
+        .post("/v2/snapshot", &json!({"id": "a", "sealed": "not base64!"}))
+        .await;
+    assert_eq!(r.status, 400);
+    let r = mac
+        .post(
+            "/v2/snapshot",
+            &json!({"id": "a", "sealed": "AAAA", "extra": 1}),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    // Above V2_SNAPSHOT_MAX_BYTES but within the body limit: 413 from the handler.
+    let r = mac
+        .post("/v2/snapshot", &snapshot_body(&mac, "big", 24_900))
+        .await;
+    assert_eq!(r.status, 413, "{:?}", r.json);
+    // Far above the body limit: 413 from the body limit layer.
+    let r = mac
+        .post("/v2/snapshot", &snapshot_body(&mac, "huge", 60_000))
+        .await;
+    assert_eq!(r.status, 413);
+    // The larger limit applies only to this route.
+    let mut big = alert_body(&mac, "a-big", "normal", 10);
+    big["sealed"] =
+        json!(mac.seal_json("alert", "a-big", &json!({"x": "y".repeat(20_000)}), [6; 12]));
+    assert_eq!(mac.post("/v2/messages", &big).await.status, 413);
+}
+
+#[tokio::test]
+async fn snapshot_posts_are_rate_limited_per_group() {
+    let (_d, s) = server(&[]).await;
+    let (mac, _phone) = setup(&s, 31).await;
+    for i in 0..5 {
+        let r = mac
+            .post("/v2/snapshot", &snapshot_body(&mac, &format!("r-{i}"), 10))
+            .await;
+        assert_eq!(r.status, 200, "burst {i}: {:?}", r.json);
+    }
+    let r = mac
+        .post("/v2/snapshot", &snapshot_body(&mac, "r-5", 10))
+        .await;
+    assert_eq!(r.status, 429);
+    assert!(r.headers.get("retry-after").is_some());
+    // Another group has its own bucket.
+    let (other, _) = setup(&s, 33).await;
+    let r = other
+        .post("/v2/snapshot", &snapshot_body(&other, "o-1", 10))
+        .await;
+    assert_eq!(r.status, 200);
+}

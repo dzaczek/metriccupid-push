@@ -421,6 +421,11 @@ pub fn overview(now: u64, o: &Overview, rt: &Runtime) -> String {
         }),
     );
     b += &tile(
+        "Snapshots (30 d)",
+        &o.snapshots_30d.to_string(),
+        &format!("stored · {}", fmt_bytes(o.snapshot_bytes_30d)),
+    );
+    b += &tile(
         "Server",
         &format!("v{}", rt.version),
         &format!(

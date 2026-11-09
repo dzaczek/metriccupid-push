@@ -75,6 +75,19 @@ pub struct V2State {
     pub ws_ping: Duration,
     pub presence: Presence,
     pub activities: Activities,
+    /// Max base64 length of a snapshot's `sealed` (`V2_SNAPSHOT_MAX_BYTES`).
+    pub snapshot_max: usize,
+}
+
+/// Body limit of `POST /v2/snapshot`: the sealed blob plus the JSON around it.
+pub fn snapshot_body_limit(snapshot_max: usize) -> usize {
+    snapshot_max + 1024
+}
+
+/// `/v2/snapshot` (PROTOCOL.md section 6.6a). Kept apart from [`routes`] so
+/// only this route gets the larger body limit.
+pub fn snapshot_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/v2/snapshot", post(post_snapshot).get(get_snapshot))
 }
 
 /// Presence pushes expire after this long (a stale "offline" is useless).
@@ -1691,6 +1704,122 @@ async fn get_messages(
     .await
     .unwrap_or_else(|o| o);
     finish("messages.get", ip, started, group.as_deref(), r)
+}
+
+// ------------------------------------------------------------- snapshot ---
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotReq {
+    id: String,
+    sealed: String,
+}
+
+async fn post_snapshot(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "POST",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("mac")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        require_licence(&state, &a.group).await?;
+        if let Err(ra) = state.v2().limits.check_snapshot(&a.group) {
+            return Err((too_many(ra), "rate_limited_group"));
+        }
+        let req: SnapshotReq = parse(&body)?;
+        if !is_token_id(&req.id) {
+            return Err(bad("id must be 1 to 64 characters of A-Z a-z 0-9 _ -"));
+        }
+        let max = state.v2().snapshot_max;
+        if req.sealed.len() > max {
+            return Err((
+                error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+                "payload_too_large",
+            ));
+        }
+        if !is_sealed(&req.sealed, max) {
+            return Err(bad(
+                "sealed must be standard base64 of nonce|ciphertext|tag",
+            ));
+        }
+        let now = state.now();
+        let bytes = req.sealed.len() as u64;
+        let g = a.group.clone();
+        let stored = state
+            .v2()
+            .store
+            .call(move |c| store::put_snapshot(c, &g, &req.id, &req.sealed, now))
+            .await
+            .map_err(storage_error)?;
+        let outcome = if stored { "stored" } else { "duplicate" };
+        state.metrics().record(Event {
+            bytes: Some(bytes),
+            ..Event::new("snapshot").group(&a.group).outcome(outcome)
+        });
+        Ok(ok(StatusCode::OK, json!({ "status": outcome }), outcome))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("snapshot.post", ip, started, group.as_deref(), r)
+}
+
+async fn get_snapshot(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "GET",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(None),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        let now = state.now();
+        let g = a.group.clone();
+        let snap = state
+            .v2()
+            .store
+            .call(move |c| store::snapshot(c, &g, now))
+            .await
+            .map_err(storage_error)?;
+        Ok(match snap {
+            Some(s) => ok(
+                StatusCode::OK,
+                json!({ "id": s.id, "ts": s.received_at, "sealed": s.sealed }),
+                "found",
+            ),
+            None => (StatusCode::NO_CONTENT.into_response(), "empty"),
+        })
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("snapshot.get", ip, started, group.as_deref(), r)
 }
 
 // -------------------------------------------------------------- commands ---

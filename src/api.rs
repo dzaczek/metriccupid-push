@@ -244,6 +244,7 @@ fn build_v2(
         ws_ping: c.ws_ping,
         presence: v2::presence::Presence::new(c.mac_offline_grace),
         activities: v2::activity::Activities::new(),
+        snapshot_max: c.snapshot_max_bytes,
     })
 }
 
@@ -257,6 +258,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/healthz", get(healthz).fallback(not_found))
         .merge(v2::routes(state.mode, state.v2.mock.is_some()))
+        .layer(RequestBodyLimitLayer::new(v2::MAX_BODY_BYTES))
+        // Only the snapshot route takes bodies above 16 KB.
+        .merge(
+            v2::snapshot_routes().layer(RequestBodyLimitLayer::new(v2::snapshot_body_limit(
+                state.v2.snapshot_max,
+            ))),
+        )
         .fallback(not_found)
         .layer(
             ServiceBuilder::new()
@@ -265,7 +273,6 @@ pub fn router(state: Arc<AppState>) -> Router {
                     state.clone(),
                     metrics::track,
                 ))
-                .layer(RequestBodyLimitLayer::new(v2::MAX_BODY_BYTES))
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::REQUEST_TIMEOUT,
                     REQUEST_TIMEOUT,

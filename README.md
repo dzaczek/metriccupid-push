@@ -264,6 +264,7 @@ exposes them at `GET /v2/debug/pushes`.
 | `RATE_V2_GATEWAY_PER_SEC` / `_BURST` | `5` / `50` | Hosted: per-group bucket for gateway pushes. |
 | `RATE_V2_GROUPS_PER_HOUR` / `RATE_V2_GROUPS_BURST` | `6` / `3` | Per-IP bucket for `POST /v2/groups`. |
 | `WS_PING_SECS` | `30` | WebSocket ping interval; idle streams are closed after 2 intervals + 5 s. |
+| `V2_SNAPSHOT_MAX_BYTES` | `196608` | Max base64 length of a snapshot's `sealed` (`POST /v2/snapshot`, the iPhone's Active tab; PROTOCOL.md 6.6a). 1024 to 1048576. Only that route accepts bodies above 16 KB. |
 | `MAC_OFFLINE_GRACE_SECS` | `120` | When a group's last Mac stream drops without a `bye`, wait this long before telling the phones "MetricCupid is offline on your Mac" (reconnects within it stay silent). `0` = immediately. A `bye` (quit, sleep, Phone & Watch turned off) is announced at once. |
 | `APNS_PRODUCTION_URL` / `APNS_SANDBOX_URL` | Apple's | Overrides for tests only. |
 

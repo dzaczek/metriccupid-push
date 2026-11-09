@@ -103,6 +103,8 @@ pub struct V2Config {
     /// Seconds the last Mac of a group may stay offline (stream lost without
     /// a `bye`) before its phones get a presence push. 0 = immediately.
     pub mac_offline_grace: u64,
+    /// Max length (base64 characters) of a snapshot's `sealed`.
+    pub snapshot_max_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +573,7 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
                 .into(),
         ),
         mac_offline_grace: parse_num("MAC_OFFLINE_GRACE_SECS", get("MAC_OFFLINE_GRACE_SECS"), 120)?,
+        snapshot_max_bytes: parse_snapshot_max(get("V2_SNAPSHOT_MAX_BYTES"))?,
     })
 }
 
@@ -712,6 +715,15 @@ fn parse_num<T: std::str::FromStr>(
     }
 }
 
+/// `V2_SNAPSHOT_MAX_BYTES`: 1 KB ..= 1 MB, default 192 KB.
+fn parse_snapshot_max(v: Option<String>) -> Result<usize, ConfigError> {
+    let n: usize = parse_num("V2_SNAPSHOT_MAX_BYTES", v, 192 * 1024)?;
+    if !(1024..=1024 * 1024).contains(&n) {
+        return err("V2_SNAPSHOT_MAX_BYTES must be between 1024 and 1048576");
+    }
+    Ok(n)
+}
+
 fn parse_nonzero(var: &str, v: Option<String>, default: u32) -> Result<NonZeroU32, ConfigError> {
     let n: u32 = parse_num(var, v, default)?;
     NonZeroU32::new(n).ok_or_else(|| ConfigError(format!("{var} must be greater than 0")))
@@ -784,6 +796,15 @@ mod tests {
         assert_eq!(c.v2.rate_commands.burst.get(), 20);
         assert_eq!(c.v2.ws_ping, Duration::from_secs(30));
         assert_eq!(c.v2.mac_offline_grace, 120);
+        assert_eq!(c.v2.snapshot_max_bytes, 192 * 1024);
+    }
+
+    #[test]
+    fn v2_snapshot_max() {
+        let c = cfg(&[("V2_SNAPSHOT_MAX_BYTES", "65536")]).unwrap();
+        assert_eq!(c.v2.snapshot_max_bytes, 65536);
+        assert!(cfg(&[("V2_SNAPSHOT_MAX_BYTES", "10")]).is_err());
+        assert!(cfg(&[("V2_SNAPSHOT_MAX_BYTES", "99999999")]).is_err());
     }
 
     #[test]

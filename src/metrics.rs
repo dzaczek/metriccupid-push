@@ -49,10 +49,17 @@ pub const LATENCY_SAMPLES: usize = 4096;
 pub const CLIENT_HEADER: &str = "x-mc-client";
 
 /// Successful polls: counted per day, not stored as raw rows.
-const POLL_ROUTES: &[&str] = &["messages.get", "commands.get", "status", "devices.list"];
+const POLL_ROUTES: &[&str] = &[
+    "messages.get",
+    "commands.get",
+    "status",
+    "devices.list",
+    "snapshot.get",
+];
 
 /// One metadata event. `kind` values: `api`, `push`, `ws_connect`,
-/// `ws_disconnect`, `presence`, `licence`, `ban`, `admin_login`.
+/// `ws_disconnect`, `presence`, `licence`, `ban`, `admin_login`, `snapshot`
+/// (one per accepted `POST /v2/snapshot`, `bytes` = sealed length).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Event {
     pub ts: u64,

@@ -713,3 +713,57 @@ async fn no_metrics_without_admin_panel() {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+#[tokio::test]
+async fn snapshot_posts_counted_with_the_client_header() {
+    let s = servers(&[]).await;
+    let mut mac = s.mac(40);
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "x-mc-client",
+        "MetricCupid-Mac/1.33.0 (153)".parse().unwrap(),
+    );
+    mac.http = reqwest::Client::builder()
+        .default_headers(h)
+        .build()
+        .unwrap();
+    assert_eq!(mac.create_group().await.status, 201);
+    assert_eq!(mac.register("mac", "Test MacBook", None).await.status, 201);
+    let pt =
+        json!({"v": 1, "type": "snapshot", "id": "s1", "ts": T0, "compressed": true, "items": ""});
+    let sealed = mac.seal_json("snapshot", "s1", &pt, [1; 12]);
+    let len = sealed.len() as i64;
+    let r = mac
+        .post("/v2/snapshot", &json!({"id": "s1", "sealed": sealed}))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.json);
+    assert_eq!(mac.get("/v2/snapshot").await.status, 200);
+    s.flush().await;
+    let gid = mac.group_id.clone();
+    let (posts, bytes, version, gets_raw) = s
+        .db(move |c| {
+            let one = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+            (
+                one("SELECT SUM(count) FROM daily_agg WHERE kind = 'snapshot' AND outcome = 'stored'"),
+                one("SELECT SUM(bytes_sum) FROM daily_agg WHERE kind = 'snapshot'"),
+                c.query_row(
+                    "SELECT app_version FROM client_activity WHERE group_id = ?1 AND device_id = ?2",
+                    [&gid, &id128(41)],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+                one("SELECT COUNT(*) FROM events WHERE route = 'snapshot.get'"),
+            )
+        })
+        .await;
+    assert_eq!(posts, 1);
+    assert_eq!(bytes, len);
+    assert_eq!(version, "MetricCupid-Mac/1.33.0 (153)");
+    assert_eq!(gets_raw, 0, "successful snapshot reads are only counted");
+    let session = s.login().await;
+    let (_, _, body) = s.get("/admin/api/overview", Some(&session)).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["overview"]["snapshots_30d"], 1);
+    let (_, _, html) = s.get("/admin/", Some(&session)).await;
+    assert!(html.contains("Snapshots (30 d)"));
+}

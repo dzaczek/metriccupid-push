@@ -108,6 +108,9 @@ pub struct Overview {
     pub apns_reasons: Vec<Count>,
     pub pushes_by_route: Vec<Count>,
     pub ws_sessions_7d: u64,
+    /// Snapshots stored in the last 30 days, and their sealed bytes.
+    pub snapshots_30d: u64,
+    pub snapshot_bytes_30d: u64,
     pub ws_median_secs_7d: Option<u64>,
     pub event_rows: u64,
 }
@@ -203,7 +206,16 @@ pub fn overview(c: &Connection, now: u64) -> R<Overview> {
         rows.collect::<Result<_, _>>()?
     };
 
+    let (snapshots_30d, snapshot_bytes_30d): (i64, i64) = c.query_row(
+        "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(bytes_sum), 0) FROM daily_agg
+         WHERE kind = 'snapshot' AND outcome = 'stored' AND day >= ?1",
+        [&d30],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
     Ok(Overview {
+        snapshots_30d: u(snapshots_30d),
+        snapshot_bytes_30d: u(snapshot_bytes_30d),
         groups_total: one("SELECT COUNT(*) FROM groups")?,
         active_24h: active_since(c, now - 86_400)?,
         active_7d: active_since(c, now - 7 * 86_400)?,

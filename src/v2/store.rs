@@ -153,6 +153,16 @@ CREATE TABLE client_activity (
     PRIMARY KEY (group_id, device_id)
 ) WITHOUT ROWID;
 "#,
+    // The newest snapshot per group (PROTOCOL.md section 6.6a): one row,
+    // replaced on every post, never in the mailbox.
+    r#"
+CREATE TABLE snapshots (
+    group_id   TEXT PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
+    snap_id    TEXT NOT NULL,
+    sealed     TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+) WITHOUT ROWID;
+"#,
 ];
 
 #[derive(Debug)]
@@ -915,10 +925,73 @@ pub fn activity_tokens(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Delete expired messages and commands; returns (messages, commands) removed.
+/// The stored snapshot of a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub id: String,
+    pub sealed: String,
+    pub received_at: u64,
+}
+
+/// Replace the group's snapshot. `false` if the stored one already has `id`
+/// (a retry): nothing changes.
+pub fn put_snapshot(
+    c: &mut Connection,
+    group_id: &str,
+    id: &str,
+    sealed: &str,
+    now: u64,
+) -> Result<bool, StoreError> {
+    let tx = c.transaction()?;
+    let same: Option<String> = tx
+        .query_row(
+            "SELECT snap_id FROM snapshots WHERE group_id = ?1",
+            [group_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if same.as_deref() == Some(id) {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO snapshots (group_id, snap_id, sealed, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(group_id) DO UPDATE SET snap_id = ?2, sealed = ?3, created_at = ?4",
+        params![group_id, id, sealed, now as i64],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The group's snapshot if it is younger than the mailbox retention.
+pub fn snapshot(
+    c: &mut Connection,
+    group_id: &str,
+    now: u64,
+) -> Result<Option<Snapshot>, StoreError> {
+    Ok(c.query_row(
+        "SELECT snap_id, sealed, created_at FROM snapshots
+         WHERE group_id = ?1 AND created_at > ?2",
+        params![group_id, cutoff(now, MESSAGE_RETENTION_SECS)],
+        |r| {
+            Ok(Snapshot {
+                id: r.get(0)?,
+                sealed: r.get(1)?,
+                received_at: ts(r.get(2)?),
+            })
+        },
+    )
+    .optional()?)
+}
+
+/// Delete expired messages, commands and snapshots; returns (messages,
+/// commands) removed.
 pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreError> {
     let m = c.execute(
         "DELETE FROM messages WHERE created_at <= ?1",
+        [cutoff(now, MESSAGE_RETENTION_SECS)],
+    )?;
+    c.execute(
+        "DELETE FROM snapshots WHERE created_at <= ?1",
         [cutoff(now, MESSAGE_RETENTION_SECS)],
     )?;
     let k = c.execute(
@@ -972,6 +1045,40 @@ mod tests {
         migrate(&mut c).unwrap();
         c.pragma_update(None, "user_version", 99).unwrap();
         assert!(migrate(&mut c).is_err());
+    }
+
+    #[test]
+    fn snapshot_replace_dedup_expiry_and_cascade() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        assert_eq!(snapshot(&mut c, "g", 10).unwrap(), None);
+        assert!(put_snapshot(&mut c, "g", "a", "AAAA", 10).unwrap());
+        assert!(!put_snapshot(&mut c, "g", "a", "BBBB", 11).unwrap());
+        assert!(put_snapshot(&mut c, "g", "b", "CCCC", 12).unwrap());
+        let s = snapshot(&mut c, "g", 13).unwrap().unwrap();
+        assert_eq!(
+            (s.id.as_str(), s.sealed.as_str(), s.received_at),
+            ("b", "CCCC", 12)
+        );
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        // Snapshots never show up in the mailbox.
+        assert!(messages_since(&mut c, "g", 0, 13).unwrap().0.is_empty());
+        let later = 12 + MESSAGE_RETENTION_SECS;
+        assert_eq!(snapshot(&mut c, "g", later).unwrap(), None);
+        cleanup(&mut c, later).unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        put_snapshot(&mut c, "g", "c", "DDDD", later).unwrap();
+        delete_group(&mut c, "g").unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
