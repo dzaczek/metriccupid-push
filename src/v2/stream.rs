@@ -200,13 +200,23 @@ pub async fn run(
 ) {
     let v2 = state.v2();
     let now = state.now();
+    let metrics = state.metrics();
+    let mut ev = crate::metrics::Event::new("ws_connect").group(&group);
+    ev.device_id = Some(device.clone());
+    metrics.record(ev);
     touch(&state, &group, &device, now).await;
     if let Some(note) = v2.presence.connected(&group, now) {
         let (st, g) = (state.clone(), group.clone());
         tokio::spawn(async move { super::push_presence(&st, &g, note).await });
     }
 
-    let (last_seen, bye) = serve(socket, &state, &group, &device, rx).await;
+    let (last_seen, bye, reason) = serve(socket, &state, &group, &device, rx).await;
+    let mut ev = crate::metrics::Event::new("ws_disconnect")
+        .group(&group)
+        .outcome(reason);
+    ev.device_id = Some(device.clone());
+    ev.duration_s = Some(state.now().saturating_sub(now));
+    metrics.record(ev);
 
     v2.hub.unregister(&group, &device, conn_id);
     let last_mac = !v2.hub.group_online(&group);
@@ -230,14 +240,15 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 }
 
 /// Serve one authenticated stream until it closes, is replaced, or goes idle.
-/// Returns when the server last heard from the Mac and the `bye` reason, if any.
+/// Returns when the server last heard from the Mac, the `bye` reason, if any,
+/// and why the stream ended.
 async fn serve(
     mut socket: WebSocket,
     state: &Arc<AppState>,
     group: &str,
     device: &str,
     mut rx: mpsc::Receiver<CommandFrame>,
-) -> (u64, Option<ByeReason>) {
+) -> (u64, Option<ByeReason>, &'static str) {
     let v2 = state.v2();
     let ping_every = v2.ws_ping;
     // No frame (pong included) for two ping intervals: the peer is gone.
@@ -267,7 +278,7 @@ async fn serve(
                     .await
                     .is_err()
                 {
-                    return (seen, None);
+                    return (seen, None, "send_failed");
                 }
                 sent.insert(f.cursor);
             }
@@ -275,7 +286,7 @@ async fn serve(
         Err(e) => {
             tracing::error!(error = %e, "stream: cannot load pending commands");
             close(&mut socket, 1011, "storage error").await;
-            return (seen, None);
+            return (seen, None, "storage_error");
         }
     }
 
@@ -283,7 +294,7 @@ async fn serve(
     // arrive live (and `POST /v2/commands` reports `delivered`).
     let ready = json!({ "type": "ready" }).to_string();
     if socket.send(Message::Text(ready.into())).await.is_err() {
-        return (seen, None);
+        return (seen, None, "send_failed");
     }
 
     let mut ping = tokio::time::interval(ping_every);
@@ -355,7 +366,7 @@ async fn serve(
         }
     };
     tracing::info!(group = %group, reason, "stream closed");
-    (seen, bye)
+    (seen, bye, reason)
 }
 
 #[cfg(test)]

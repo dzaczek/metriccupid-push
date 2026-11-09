@@ -103,6 +103,56 @@ CREATE TABLE group_licences (
 ) WITHOUT ROWID;
 CREATE INDEX group_licences_purchase ON group_licences(app_transaction_id);
 "#,
+    // Admin panel metrics (src/metrics.rs): metadata only, no full IPs.
+    r#"
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY,
+    ts          INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    group_id    TEXT,
+    device_id   TEXT,
+    route       TEXT,
+    status      INTEGER,
+    outcome     TEXT,
+    detail      TEXT,
+    latency_ms  INTEGER,
+    duration_s  INTEGER,
+    country     TEXT,
+    ip_prefix   TEXT,
+    app_version TEXT,
+    apns_status INTEGER,
+    apns_reason TEXT,
+    bytes       INTEGER
+);
+CREATE INDEX events_ts ON events(ts);
+CREATE INDEX events_kind_ts ON events(kind, ts);
+CREATE INDEX events_group_ts ON events(group_id, ts);
+
+CREATE TABLE daily_agg (
+    day            TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    route          TEXT NOT NULL,
+    status         INTEGER NOT NULL,
+    outcome        TEXT NOT NULL,
+    group_id       TEXT NOT NULL,
+    country        TEXT NOT NULL,
+    count          INTEGER NOT NULL,
+    latency_ms_sum INTEGER NOT NULL,
+    bytes_sum      INTEGER NOT NULL,
+    PRIMARY KEY (day, kind, route, status, outcome, group_id, country)
+) WITHOUT ROWID;
+CREATE INDEX daily_agg_group ON daily_agg(group_id, day);
+
+CREATE TABLE client_activity (
+    group_id    TEXT NOT NULL,
+    device_id   TEXT NOT NULL,
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    app_version TEXT,
+    country     TEXT,
+    PRIMARY KEY (group_id, device_id)
+) WITHOUT ROWID;
+"#,
 ];
 
 #[derive(Debug)]
@@ -210,6 +260,7 @@ pub enum Attach {
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    path: std::path::PathBuf,
 }
 
 impl Store {
@@ -227,6 +278,29 @@ impl Store {
         migrate(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            path,
+        })
+    }
+
+    /// The database file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A second, read-only connection to the same database (WAL lets it
+    /// read while the main connection writes). Used by the admin panel so
+    /// its queries never hold the API's connection.
+    pub fn open_reader(&self) -> Result<Self, StoreError> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: self.path.clone(),
         })
     }
 

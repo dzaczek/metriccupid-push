@@ -100,6 +100,20 @@ impl ClientIpResolver {
         }
     }
 
+    /// `CF-IPCountry` (two letters, e.g. `CH`; `XX` / `T1` are Cloudflare's
+    /// unknown / Tor), only when the peer is a trusted Cloudflare address.
+    pub fn country(&self, peer: IpAddr, headers: &HeaderMap) -> Option<String> {
+        let Self::Cloudflare(ranges) = self else {
+            return None;
+        };
+        if !contains(ranges, peer.to_canonical()) {
+            return None;
+        }
+        let v = headers.get("cf-ipcountry")?.to_str().ok()?.trim();
+        (v.len() == 2 && v.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .then(|| v.to_ascii_uppercase())
+    }
+
     pub fn resolve(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
         let peer = peer.to_canonical();
         match self {
@@ -230,6 +244,17 @@ mod tests {
         );
         let bad = hdr(&[("cf-connecting-ip", "not-an-ip")]);
         assert_eq!(r.resolve(ip("162.158.1.1"), &bad), ip("162.158.1.1"));
+    }
+
+    #[test]
+    fn country_only_from_trusted_peer() {
+        let r = ClientIpResolver::Cloudflare(builtin_cloudflare_ranges());
+        let h = hdr(&[("cf-ipcountry", "ch")]);
+        assert_eq!(r.country(ip("162.158.1.1"), &h).as_deref(), Some("CH"));
+        assert_eq!(r.country(ip("192.0.2.9"), &h), None, "spoofed");
+        assert_eq!(ClientIpResolver::Peer.country(ip("162.158.1.1"), &h), None);
+        let bad = hdr(&[("cf-ipcountry", "Switzerland")]);
+        assert_eq!(r.country(ip("162.158.1.1"), &bad), None);
     }
 
     #[test]

@@ -39,8 +39,9 @@ use self::activity::{
 };
 use self::apns::{
     build_payload, build_presence_payload, ApnsEnv, ApnsSender, GatewayApns, GatewayPush,
-    GatewayRegistration, McEnvelope, MessageType, MockApns, PresenceNote, PushContent, PushError,
-    PushJob, Urgency, DEVICE_HEADER, GROUP_HEADER, MAX_PAYLOAD_BYTES, PRESENCE_COLLAPSE_ID,
+    GatewayRegistration, McEnvelope, MessageType, MockApns, OfflineReason, PresenceNote,
+    PushContent, PushError, PushJob, Urgency, DEVICE_HEADER, GROUP_HEADER, MAX_PAYLOAD_BYTES,
+    PRESENCE_COLLAPSE_ID,
 };
 use self::licence::{LicenceError, LicencePolicy, LicenceReq, VerifiedLicence};
 use self::presence::Presence;
@@ -51,6 +52,7 @@ use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME, MAX_STREAMS};
 use crate::api::{error, invalid, json_error, precheck, too_many, AppState, Outcome};
 use crate::config::Mode;
 use crate::limits::{ip_key, V2Limits};
+use crate::metrics::{ApiTag, Event};
 
 /// Max request body for v2 routes.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -280,8 +282,13 @@ fn finish(
     ip: IpAddr,
     started: Instant,
     group: Option<&str>,
-    (response, outcome): Outcome,
+    (mut response, outcome): Outcome,
 ) -> Response {
+    response.extensions_mut().insert(ApiTag {
+        route,
+        outcome,
+        group: group.map(str::to_string),
+    });
     // Never log sealed blobs, tokens or keys.
     tracing::info!(
         route,
@@ -348,6 +355,27 @@ fn licence_required() -> Outcome {
         error(StatusCode::PAYMENT_REQUIRED, "licence_required"),
         "licence_required",
     )
+}
+
+/// A `licence` metrics event: outcome `ok` / `invalid` / `in_use`, detail
+/// the refusal reason or `tier/environment`. Never the purchase id or JWS.
+/// `group` only once the group is authenticated or created: `POST
+/// /v2/groups` is unauthenticated.
+fn record_licence(
+    state: &AppState,
+    group: Option<&str>,
+    route: &'static str,
+    outcome: &'static str,
+    detail: &str,
+) {
+    let mut e = Event::new("licence").route(route).outcome(outcome);
+    if let Some(g) = group {
+        e = e.group(g);
+    }
+    if !detail.is_empty() {
+        e = e.detail(detail);
+    }
+    state.metrics().record(e);
 }
 
 /// `licence` in responses: never the purchase id.
@@ -430,8 +458,11 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
         (_, Mode::SelfHosted) => None,
         (Some(l), Mode::Hosted) => match policy.verify(l) {
             Ok(v) => Some(v),
-            Err(e) if required => return licence_invalid(e),
             Err(e) => {
+                record_licence(state, None, "groups", "invalid", e.code());
+                if required {
+                    return licence_invalid(e);
+                }
                 tracing::info!(reason = e.code(), "open registration: licence ignored");
                 None
             }
@@ -465,10 +496,24 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
                 "group_conflict",
             )
         }
-        Ok((_, Some(Attach::InUse))) if required => return licence_in_use(),
+        Ok((_, Some(Attach::InUse))) if required => {
+            record_licence(state, None, "groups", "in_use", "");
+            return licence_in_use();
+        }
         Ok((c, a)) => (c, a),
         Err(e) => return storage_error(e),
     };
+    match (&verified, attached) {
+        (Some(v), Some(Attach::Attached | Attach::Refreshed)) => record_licence(
+            state,
+            Some(&req.group_id),
+            "groups",
+            "ok",
+            &format!("{}/{}", v.tier, v.environment),
+        ),
+        (Some(_), Some(Attach::InUse)) => record_licence(state, None, "groups", "in_use", ""),
+        _ => {}
+    }
     let licence = match (&verified, attached) {
         (Some(v), Some(Attach::Attached | Attach::Refreshed)) => {
             licence_json(v.tier, v.environment, now)
@@ -603,7 +648,10 @@ async fn put_licence(
         group = Some(a.group.clone());
         let req: LicenceReq = parse(&body)?;
         let v2 = state.v2();
-        let lic = v2.licence.verify(&req).map_err(licence_invalid)?;
+        let lic = v2.licence.verify(&req).map_err(|e| {
+            record_licence(&state, Some(&a.group), "licence.put", "invalid", e.code());
+            licence_invalid(e)
+        })?;
         let (g, max, now) = (a.group.clone(), v2.licence.max_groups, state.now());
         let l = lic.clone();
         let attached = v2
@@ -612,10 +660,20 @@ async fn put_licence(
             .await
             .map_err(storage_error)?;
         let status = match attached {
-            Attach::InUse => return Err(licence_in_use()),
+            Attach::InUse => {
+                record_licence(&state, Some(&a.group), "licence.put", "in_use", "");
+                return Err(licence_in_use());
+            }
             Attach::Attached => "attached",
             Attach::Refreshed => "refreshed",
         };
+        record_licence(
+            &state,
+            Some(&a.group),
+            "licence.put",
+            "ok",
+            &format!("{}/{}", lic.tier, lic.environment),
+        );
         Ok(ok(
             StatusCode::OK,
             json!({ "status": status, "licence": licence_json(lic.tier, lic.environment, now) }),
@@ -1106,6 +1164,16 @@ pub async fn push_presence(state: &AppState, group: &str, note: PresenceNote) {
         PresenceNote::Offline { .. } => "offline",
         PresenceNote::Online { .. } => "online",
     };
+    let mut ev = Event::new("presence").group(group).outcome(state_label);
+    if let PresenceNote::Offline { reason, .. } = note {
+        ev = ev.detail(match reason {
+            OfflineReason::Quit => "quit",
+            OfflineReason::Sleep => "sleep",
+            OfflineReason::Disabled => "disabled",
+            OfflineReason::Lost => "lost",
+        });
+    }
+    state.metrics().record(ev);
     match fan_out(
         state,
         group,

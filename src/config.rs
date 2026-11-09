@@ -144,6 +144,56 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// Admin panel credentials and access rules. `Debug` never prints secrets.
+#[derive(Clone)]
+pub struct AdminConfig {
+    pub bind: SocketAddr,
+    pub user: String,
+    /// argon2id PHC string.
+    pub password_hash: String,
+    /// Decoded TOTP secret (from base32).
+    pub totp_secret: Vec<u8>,
+    /// Empty only with `allow_any`.
+    pub allow_ips: Vec<IpNet>,
+    pub allow_any: bool,
+    pub session_secs: u64,
+    pub events_retention_days: u64,
+}
+
+impl fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("bind", &self.bind)
+            .field("user", &self.user)
+            .field("password_hash", &"<redacted>")
+            .field("totp_secret", &"<redacted>")
+            .field("allow_ips", &self.allow_ips)
+            .field("allow_any", &self.allow_any)
+            .field("session_secs", &self.session_secs)
+            .field("events_retention_days", &self.events_retention_days)
+            .finish()
+    }
+}
+
+/// Whether the admin listener runs. A misconfigured panel does not stop the
+/// public API: it is `Refused` and the reason is logged at startup.
+#[derive(Debug, Clone)]
+pub enum AdminSetting {
+    /// `ADMIN_BIND` not set.
+    Off,
+    Refused(String),
+    On(AdminConfig),
+}
+
+impl AdminSetting {
+    pub fn config(&self) -> Option<&AdminConfig> {
+        match self {
+            Self::On(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub pushover_app_token: String,
@@ -162,6 +212,7 @@ pub struct Config {
     /// `false` when none of the v1 variables are set: `/v1/notify` is then 404.
     pub v1_enabled: bool,
     pub v2: V2Config,
+    pub admin: AdminSetting,
 }
 
 impl fmt::Debug for Config {
@@ -182,6 +233,7 @@ impl fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("v1_enabled", &self.v1_enabled)
             .field("v2", &self.v2)
+            .field("admin", &self.admin)
             .finish()
     }
 }
@@ -309,6 +361,7 @@ impl Config {
         };
 
         let v2 = parse_v2(&get, mode)?;
+        let admin = parse_admin(&get);
 
         Ok(Config {
             pushover_app_token,
@@ -326,8 +379,77 @@ impl Config {
             log_level,
             v1_enabled,
             v2,
+            admin,
         })
     }
+}
+
+/// The admin panel (README "Admin panel"). Off without `ADMIN_BIND`; any
+/// problem refuses the panel only (fail closed), never the public API.
+fn parse_admin(get: &impl Fn(&str) -> Option<String>) -> AdminSetting {
+    if get("ADMIN_BIND").is_none() {
+        return AdminSetting::Off;
+    }
+    match parse_admin_on(get) {
+        Ok(c) => AdminSetting::On(c),
+        Err(e) => AdminSetting::Refused(e.0),
+    }
+}
+
+fn parse_admin_on(get: &impl Fn(&str) -> Option<String>) -> Result<AdminConfig, ConfigError> {
+    let bind = get("ADMIN_BIND")
+        .unwrap_or_default()
+        .parse()
+        .map_err(|_| ConfigError("ADMIN_BIND must be ip:port, e.g. 0.0.0.0:8081".into()))?;
+    let need =
+        |k: &str| get(k).ok_or_else(|| ConfigError(format!("{k} is required with ADMIN_BIND")));
+    let user = need("ADMIN_USER")?;
+    if user.chars().count() > 64 || user.chars().any(char::is_control) {
+        return err("ADMIN_USER must be at most 64 characters without control characters");
+    }
+    // Quotes survive `docker run --env-file`; a PHC string never has them.
+    let password_hash = need("ADMIN_PASSWORD_HASH")?
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_string();
+    if !password_hash.starts_with("$argon2id$")
+        || argon2::password_hash::PasswordHash::new(&password_hash).is_err()
+    {
+        return err(
+            "ADMIN_PASSWORD_HASH must be an argon2id PHC string (metriccupid-push admin-setup)",
+        );
+    }
+    let totp_secret = crate::admin::auth::base32_decode(&need("ADMIN_TOTP_SECRET")?)
+        .filter(|s| s.len() >= 16)
+        .ok_or_else(|| {
+            ConfigError(
+                "ADMIN_TOTP_SECRET must be base32 of at least 16 bytes (admin-setup)".into(),
+            )
+        })?;
+    let allow_ips = match get("ADMIN_ALLOW_IPS") {
+        Some(v) => parse_cidrs("ADMIN_ALLOW_IPS", &v)?,
+        None => Vec::new(),
+    };
+    let allow_any = parse_bool("ADMIN_ALLOW_ANY", get("ADMIN_ALLOW_ANY"), false)?;
+    if allow_ips.is_empty() && !allow_any {
+        return err("ADMIN_ALLOW_IPS is empty; set it (or ADMIN_ALLOW_ANY=true to allow every IP)");
+    }
+    let hours = parse_nonzero("ADMIN_SESSION_HOURS", get("ADMIN_SESSION_HOURS"), 12)?.get();
+    let days = parse_nonzero(
+        "ADMIN_EVENTS_RETENTION_DAYS",
+        get("ADMIN_EVENTS_RETENTION_DAYS"),
+        30,
+    )?
+    .get();
+    Ok(AdminConfig {
+        bind,
+        user,
+        password_hash,
+        totp_secret,
+        allow_ips,
+        allow_any,
+        session_secs: u64::from(hours) * 3600,
+        events_retention_days: u64::from(days),
+    })
 }
 
 fn parse_rate(
@@ -812,6 +934,67 @@ mod tests {
         assert!(cfg(&[("MODE", "pro")]).is_err());
         assert!(cfg(&[("PUSHOVER_API_URL", "ftp://x")]).is_err());
         assert!(cfg(&[("PUSHOVER_APP_TOKEN", "abc&user=x")]).is_err());
+    }
+
+    const PHC: &str = "$argon2id$v=19$m=8,t=1,p=1$BwcHBwcHBwcHBwcHBwcHBw$9t2Q7m2G2Jx1d2c8Uq2m0mJ8l2m3Yk1pZ7c2wq3cXxU";
+
+    fn admin(pairs: &[(&str, &str)]) -> AdminSetting {
+        let mut all = vec![
+            ("ADMIN_BIND", "127.0.0.1:8081"),
+            ("ADMIN_USER", "admin"),
+            ("ADMIN_PASSWORD_HASH", PHC),
+            ("ADMIN_TOTP_SECRET", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+        ];
+        all.extend_from_slice(pairs);
+        cfg(&all).unwrap().admin
+    }
+
+    #[test]
+    fn admin_settings() {
+        assert!(matches!(cfg(&[]).unwrap().admin, AdminSetting::Off));
+        // No allowlist: refused (fail closed), the public API still starts.
+        assert!(
+            matches!(admin(&[]), AdminSetting::Refused(ref e) if e.contains("ADMIN_ALLOW_IPS"))
+        );
+        let AdminSetting::On(a) = admin(&[("ADMIN_ALLOW_IPS", "127.0.0.1/32, 2001:db8::/48")])
+        else {
+            panic!("expected On");
+        };
+        assert_eq!(a.allow_ips.len(), 2);
+        assert_eq!(a.session_secs, 12 * 3600);
+        assert_eq!(a.events_retention_days, 30);
+        assert_eq!(a.totp_secret, b"12345678901234567890");
+        assert!(!format!("{a:?}").contains("argon2id"), "hash redacted");
+        assert!(matches!(
+            admin(&[("ADMIN_ALLOW_ANY", "true")]),
+            AdminSetting::On(ref a) if a.allow_any && a.allow_ips.is_empty()
+        ));
+        // Quoted hash (docker run --env-file keeps quotes).
+        let quoted = format!("'{PHC}'");
+        assert!(matches!(
+            admin(&[("ADMIN_ALLOW_ANY", "true"), ("ADMIN_PASSWORD_HASH", &quoted)]),
+            AdminSetting::On(ref a) if a.password_hash == PHC
+        ));
+        for bad in [
+            ("ADMIN_PASSWORD_HASH", "plaintext"),
+            ("ADMIN_TOTP_SECRET", "not base32!"),
+            ("ADMIN_TOTP_SECRET", "GEZDGNBV"),
+            ("ADMIN_ALLOW_IPS", "nonsense"),
+            ("ADMIN_SESSION_HOURS", "0"),
+            ("ADMIN_BIND", "8081"),
+        ] {
+            assert!(
+                matches!(
+                    admin(&[("ADMIN_ALLOW_ANY", "true"), bad]),
+                    AdminSetting::Refused(_)
+                ),
+                "{bad:?}"
+            );
+        }
+        let mut no_user = cfg(&[("ADMIN_BIND", "127.0.0.1:8081")]).unwrap().admin;
+        assert!(matches!(no_user, AdminSetting::Refused(ref e) if e.contains("ADMIN_USER")));
+        no_user = AdminSetting::Off;
+        assert!(no_user.config().is_none());
     }
 
     #[test]

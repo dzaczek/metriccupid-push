@@ -290,7 +290,8 @@ The server, and anyone who controls it, can see:
 - timing, sizes and counts of messages and commands, and which device sent them;
 - `urgency` (critical / normal / silent) and type (alert / result / command): needed for the APNs
   priority, sound and notification category;
-- client IP addresses (logged together with the group id);
+- client IP addresses (logged together with the group id). With the [admin panel](#admin-panel)
+  enabled, metrics keep only a /24 (IPv4) or /48 (IPv6) prefix and the Cloudflare country;
 - whether and when each Mac is connected (`last_seen`). The server itself sends the phones plaintext
   presence notices ("MetricCupid is offline on your Mac" / "back online"); they contain only the
   state, a reason (`quit`, `sleep`, `disabled`, `lost`) and a time, never alert content.
@@ -392,6 +393,102 @@ Check the relay logs: `client_ip` should show real client addresses, not `172.30
   e.g. 10 requests per 10 s).
 
 The relay's own limits still apply behind Cloudflare.
+
+## Admin panel
+
+An optional analytics panel for the operator, on its **own listener** (`ADMIN_BIND`, e.g. port
+8081): a separate router that has no public API routes, while the public listener has no admin
+routes. Alert content is end-to-end encrypted, so the panel shows **metadata only**: groups, devices
+(kind, name, APNs environment, online, last seen, app version), licences, push volumes and APNs
+errors, message / command / Live Activity counts, HTTP status and latency, WebSocket sessions,
+rate limits, auth failures, bans and admin logins. Plain HTML with inline SVG charts, light / dark,
+no JavaScript; JSON mirrors under `/admin/api/` and a CSV export of the daily aggregates.
+
+| Page | JSON |
+|---|---|
+| `/admin/` overview | `/admin/api/overview` |
+| `/admin/groups` (filters: `active=24h\|7d\|30d\|inactive`, `licence=none\|licensed\|founder`, `country=CH`, `q=<id prefix>`, `sort=created\|last_active\|requests\|pushes\|devices`, `order=asc\|desc`) | `/admin/api/groups` |
+| `/admin/groups/{group_id}` | `/admin/api/groups/{group_id}` |
+| `/admin/pushes` | `/admin/api/pushes` |
+| `/admin/security` | `/admin/api/security` |
+| | `/admin/export/daily.csv` |
+
+### Setup
+
+1. Create the credentials (prompts twice without echo; or pipe the password on stdin):
+   ```sh
+   docker run --rm -it ghcr.io/dzaczek/metriccupid-push:latest admin-setup --user admin
+   # or: cargo run --release -- admin-setup --user admin
+   ```
+   It prints `ADMIN_USER`, `ADMIN_PASSWORD_HASH` (argon2id), a fresh `ADMIN_TOTP_SECRET` and an
+   `otpauth://` URI for your authenticator app (`qrencode -t ansiutf8 '<uri>'` shows it as a QR
+   code). Keep the single quotes around the hash in a Compose env file (`$` would be interpolated);
+   with `docker run --env-file` they are harmless.
+2. Add them to `.env` with `ADMIN_BIND` and `ADMIN_ALLOW_IPS` (below) and restart. The log says
+   `admin panel listening`; if something is missing it says `admin panel NOT started: <reason>`
+   and the public API runs normally.
+3. Open the panel, log in with user, password and the 6-digit code.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADMIN_BIND` | unset (panel off) | Listen address of the panel, e.g. `0.0.0.0:8081`. Never publish this port on the host. |
+| `ADMIN_USER` | required | Login name. |
+| `ADMIN_PASSWORD_HASH` | required | argon2id PHC string from `admin-setup`. |
+| `ADMIN_TOTP_SECRET` | required | Base32 TOTP secret (RFC 6238, SHA-1, 6 digits, 30 s) from `admin-setup`. |
+| `ADMIN_ALLOW_IPS` | required | Comma-separated CIDRs (IPv4 / IPv6; a bare IP is a /32 or /128) allowed to reach the panel, checked on the real client IP from `TRUST_PROXY`. Anyone else gets the same plain `404` as an unknown public route. Empty: the panel does not start. |
+| `ADMIN_ALLOW_ANY` | `false` | `true` allows every IP when `ADMIN_ALLOW_IPS` is empty (only behind Cloudflare Access). |
+| `ADMIN_SESSION_HOURS` | `12` | Absolute session lifetime. Sessions are in memory: a restart logs you out. |
+| `ADMIN_EVENTS_RETENTION_DAYS` | `30` | Raw metric events; daily aggregates are kept 400 days. Cleanup runs hourly. |
+
+### Cloudflare (Tunnel)
+
+1. In the tunnel, add a **second public hostname**, e.g. `push-admin.sysop.cat`, service
+   `http://metriccupid-rust:8081` (the container name and `ADMIN_BIND` port; cloudflared reaches it
+   over the Docker network, nothing is published on the host).
+2. Keep `TRUST_PROXY=cloudflare` and `CF_IPS_EXTRA=<cloudflared network>` (e.g.
+   `172.31.250.0/24`): the allowlist then sees the visitor's `CF-Connecting-IP`. A forged
+   `CF-Connecting-IP` from anywhere else is ignored. Do not put the cloudflared network itself in
+   `ADMIN_ALLOW_IPS`.
+3. Recommended: put a **Cloudflare Access** application (Zero Trust -> Access -> Applications,
+   self-hosted, your e-mail / IdP) in front of the admin hostname as an extra layer. The panel's own
+   allowlist, password and TOTP still apply behind it.
+4. Optional WAF rule on the admin hostname: block everything not starting with `/admin`.
+
+```
+ADMIN_BIND=0.0.0.0:8081
+ADMIN_USER=admin
+ADMIN_PASSWORD_HASH='$argon2id$v=19$m=19456,t=2,p=1$...'
+ADMIN_TOTP_SECRET=...
+ADMIN_ALLOW_IPS=203.0.113.7/32,2001:db8:1234::/48
+```
+
+### Security model
+
+- **Access, in order**: IP allowlist (real client IP via `TRUST_PROXY`, else `404`), login form with
+  user + argon2id password + **mandatory TOTP** (±1 step, a code is accepted once), then a 256-bit
+  random session token in memory, cookie `mc_admin` (`HttpOnly; Secure; SameSite=Strict; Path=/`).
+  The session id is replaced at login (no fixation).
+- **CSRF**: every POST (login, logout) needs the per-session token from a hidden form field;
+  `SameSite=Strict` is defence in depth. All other admin routes are read-only GETs.
+- **Brute force**: 5 failed logins per IP (IPv6 /64) within 15 min, or 20 in total, lock logins for
+  15 min. One message for every failure; constant-time comparisons; one argon2 check at a time.
+- **Headers on every response**: `Content-Security-Policy: default-src 'none'; style-src 'self';
+  img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`. No scripts, CDNs or web fonts.
+- Passwords and TOTP codes are never logged; failed logins log the /24 or /48 network and a reason.
+
+### Metrics
+
+Recorded in the existing request paths with a short in-memory push; a task writes them every 5 s
+in one SQLite transaction (tables `events`, `daily_agg`, `client_activity`; PROTOCOL.md 10.1 lists
+exactly what is stored). Buffers are bounded (10 000 pending events, 1 000 raw rows per flush,
+50 000 counters, 4 096 latency samples; the excess is counted as `dropped` on the overview), and the
+`events` table is capped at 1 000 000 rows. Successful polls are counted per day but not stored
+row by row. Full client IPs are never stored: only a /24 or /48 prefix and the Cloudflare country.
+App versions come from the `X-MC-Client` header (PROTOCOL.md 5.3). Metrics are only collected
+while the panel is enabled. The panel queries a separate read-only SQLite connection, so it never
+blocks the API.
 
 ## Security model and limits
 

@@ -254,6 +254,22 @@ produce the same signature and one of them is refused as a replay, and a TLS-ter
 change `X-MC-Device` (for example to take over another Mac's stream) or the `since` cursor without
 breaking the signature.
 
+### 5.3 Client identification: `X-MC-Client`
+
+Clients SHOULD send, on every v2 request (including `POST /v2/groups` and the `GET /v2/stream`
+upgrade):
+
+```
+X-MC-Client: MetricCupid-Mac/1.32.0 (151)
+X-MC-Client: MetricCupid-iOS/1.32.0 (4)
+```
+
+Format: `MetricCupid-<platform>/<marketing version> (<build>)`, at most 64 printable ASCII
+characters; platforms `Mac`, `iOS`, `watchOS`. The header is informational only: it is **not**
+signed, the server never makes a decision based on it, and a missing or malformed value is ignored
+(not an error). The server records it per device for the operator's admin panel (section 10.1), so
+the operator can see which app versions are still in use before changing the protocol.
+
 ## 6. HTTP API
 
 All bodies are JSON (`Content-Type: application/json`), at most 16 KB (`413` above). Unknown
@@ -689,6 +705,22 @@ nothing but the group registration.
 
 A server operator, or anyone who obtains `auth_key`, can delete or withhold messages and inject
 garbage that receivers drop, but cannot read or forge content.
+
+### 10.1 Operator metrics (admin panel)
+
+When the operator enables the admin panel (`ADMIN_BIND`, README "Admin panel"), the server also
+keeps operational metadata in its database. Without the panel nothing below is collected.
+
+| Stored | Retention |
+|---|---|
+| Per request: time, route, HTTP status, outcome label, latency, request size, group and (signed) device id once authenticated, `X-MC-Client` (section 5.3), Cloudflare country (`CF-IPCountry`, only from a trusted proxy), and the client network truncated to **/24 (IPv4) or /48 (IPv6)** | raw rows `ADMIN_EVENTS_RETENTION_DAYS` (default 30) and at most 1 000 000 rows; successful polls (`GET /v2/messages`, `/v2/commands`, `/v2/status`, `/v2/devices`) are only counted, not stored as rows |
+| Per push: type (`alert`, `result`, `presence`, `liveactivity`, `start`), outcome (`sent`, `failed`, `unregistered`), APNs status and reason, sender (`direct`, `gateway`, `mock`) and APNs environment | as above |
+| WebSocket connect / disconnect with close reason and duration, presence transitions, licence verification outcomes (`ok` with tier / environment, `invalid` with reason, `in_use`), auth bans, admin logins | as above |
+| Daily counters of all of the above per group, route, status, outcome and country | 400 days |
+| Per device: first / last request time, last `X-MC-Client`, last country | until the group is deleted |
+
+Never stored: full client IP addresses, message or command contents (they are ciphertext anyway),
+APNs or activity tokens, the licence JWS or purchase id, request bodies.
 
 ## 11. Limits
 

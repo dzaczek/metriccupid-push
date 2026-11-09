@@ -25,6 +25,8 @@ COPY --from=builder --chown=65532:65532 /data /data
 VOLUME ["/data"]
 USER nonroot:nonroot
 EXPOSE 8080
+# Admin panel, only when ADMIN_BIND is set (documentation only; never publish it).
+EXPOSE 8081
 ENV BIND=0.0.0.0:8080 \
     DATA_DIR=/data
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

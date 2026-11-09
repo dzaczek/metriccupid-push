@@ -3,11 +3,13 @@
 //! two-way Mac <-> iPhone communication (v2, see PROTOCOL.md).
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod client_ip;
 pub mod config;
 pub mod limits;
+pub mod metrics;
 pub mod pushover;
 pub mod v2;
 
@@ -64,6 +66,30 @@ pub fn spawn_activities(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             v2::activity_tick(&state).await;
         }
     })
+}
+
+/// Spawn the metrics tasks (admin panel enabled only): flush the buffers
+/// every few seconds, apply retention hourly.
+pub fn spawn_metrics(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
+    if !state.metrics().enabled() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut flush = tokio::time::interval(metrics::FLUSH_INTERVAL);
+        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut cleanup = tokio::time::interval(metrics::CLEANUP_INTERVAL);
+        cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = flush.tick() => state.metrics().flush(&state.v2().store).await,
+                _ = cleanup.tick() => match state.metrics().cleanup(&state.v2().store).await {
+                    Ok(n) if n > 0 => tracing::debug!(events = n, "metrics retention cleanup"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "metrics retention cleanup failed"),
+                },
+            }
+        }
+    }))
 }
 
 /// Serve the API on `listener` until `shutdown` resolves.

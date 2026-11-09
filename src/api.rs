@@ -23,6 +23,7 @@ use crate::auth::Authenticator;
 use crate::client_ip::ClientIpResolver;
 use crate::config::{ApnsMode, Config, Mode};
 use crate::limits::{ip_key, AuthBans, Clock, ExpiringSet, RateLimits, RetryAfter, V2Limits};
+use crate::metrics::{self, ApiTag, Event, MeteredSender, Metrics};
 use crate::pushover::{Message, PushoverClient, SendError};
 use crate::v2::apns::{ApnsSender, DirectApns, GatewayApns, MockApns};
 use crate::v2::licence::{AppTransactionVerifier, LicencePolicy};
@@ -52,6 +53,7 @@ pub struct AppState {
     pushover: PushoverClient,
     clock: Arc<dyn Clock>,
     v2: V2State,
+    metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -67,7 +69,16 @@ impl AppState {
         )
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
         let l = &config.limits;
-        let v2 = build_v2(config, clock.clone())?;
+        // Metrics are only collected while the admin panel is enabled.
+        let metrics = Arc::new(Metrics::new(
+            config.admin.config().is_some(),
+            config
+                .admin
+                .config()
+                .map_or(30, |a| a.events_retention_days),
+            clock.clone(),
+        ));
+        let v2 = build_v2(config, clock.clone(), metrics.clone())?;
         Ok(Self {
             mode: config.mode,
             v1_enabled: config.v1_enabled,
@@ -81,6 +92,7 @@ impl AppState {
             pushover,
             clock,
             v2,
+            metrics,
         })
     }
 
@@ -111,6 +123,15 @@ impl AppState {
         &self.v2
     }
 
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
+    /// Cloudflare's `CF-IPCountry`, only from a trusted proxy.
+    pub fn client_country(&self, peer: SocketAddr, headers: &HeaderMap) -> Option<String> {
+        self.resolver.country(peer.ip(), headers)
+    }
+
     pub fn auth(&self) -> &Authenticator {
         &self.auth
     }
@@ -128,6 +149,7 @@ impl AppState {
     pub fn auth_failed(&self, ip: IpAddr, now: u64, reason: &str) -> Outcome {
         if self.bans.record_failure(ip_key(ip), now) {
             tracing::warn!(client_ip = %ip, "auth failure threshold reached, IP banned");
+            self.metrics.record(Event::new("ban").ip(ip).detail(reason));
         }
         tracing::debug!(client_ip = %ip, reason, "auth failed");
         // Generic body: do not tell the client which check failed.
@@ -163,7 +185,11 @@ impl AppState {
     }
 }
 
-fn build_v2(config: &Config, clock: Arc<dyn Clock>) -> Result<V2State, String> {
+fn build_v2(
+    config: &Config,
+    clock: Arc<dyn Clock>,
+    metrics: Arc<Metrics>,
+) -> Result<V2State, String> {
     let c = &config.v2;
     let store = Store::open(&c.data_dir).map_err(|e| format!("DATA_DIR: {e}"))?;
     let mut mock = None;
@@ -193,6 +219,15 @@ fn build_v2(config: &Config, clock: Arc<dyn Clock>) -> Result<V2State, String> {
             g
         }
     };
+    let sender: Arc<dyn ApnsSender> = Arc::new(MeteredSender {
+        inner: sender,
+        metrics,
+        via: match c.apns_mode {
+            ApnsMode::Direct => "direct",
+            ApnsMode::Mock => "mock",
+            ApnsMode::Gateway => "gateway",
+        },
+    });
     Ok(V2State {
         store,
         hub: Hub::new(),
@@ -226,6 +261,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    metrics::track,
+                ))
                 .layer(RequestBodyLimitLayer::new(v2::MAX_BODY_BYTES))
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::REQUEST_TIMEOUT,
@@ -355,7 +394,12 @@ async fn notify(
 ) -> Response {
     let started = Instant::now();
     let ip = state.resolver.resolve(peer.ip(), &headers);
-    let (response, outcome) = handle_notify(&state, ip, &headers, &body).await;
+    let (mut response, outcome) = handle_notify(&state, ip, &headers, &body).await;
+    response.extensions_mut().insert(ApiTag {
+        route: "notify",
+        outcome,
+        group: None,
+    });
     // Never log secrets, tokens, user keys or message contents.
     tracing::info!(
         client_ip = %ip,

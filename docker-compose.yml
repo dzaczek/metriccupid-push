@@ -12,6 +12,8 @@ services:
     ports:
       # Loopback only. Expose publicly only behind a reverse proxy / Cloudflare.
       - "127.0.0.1:8080:8080"
+      # The admin panel (ADMIN_BIND=0.0.0.0:8081, README "Admin panel") is reached by
+      # cloudflared over the `relay` network only: do not add a ports entry for 8081.
     read_only: true
     volumes:
       # v2 SQLite database: the only writable path.
