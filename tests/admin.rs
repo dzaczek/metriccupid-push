@@ -553,6 +553,9 @@ async fn metrics_recorded_and_pages_render_with_seeded_data() {
         .await;
     assert_eq!(r.status, 200, "{}", r.json);
     assert_eq!(r.json["pushed"], 1);
+    // A heartbeat: one background push.
+    let r = mac.post("/v2/heartbeat", &json!({"id": "hb-1"})).await;
+    assert_eq!(r.status, 200, "{}", r.json);
     // A few polls and an auth failure.
     assert_eq!(phone.get("/v2/messages?since=0").await.status, 200);
     let mut bad = mac.clone();
@@ -561,6 +564,17 @@ async fn metrics_recorded_and_pages_render_with_seeded_data() {
     s.flush().await;
 
     let gid = mac.group_id.clone();
+    let background: i64 = s
+        .db(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'push' AND route = 'background' AND outcome = 'sent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        })
+        .await;
+    assert_eq!(background, 1, "background push recorded with its own type");
     let (push, api, poll_raw, agg_polls, version, unauthorized) = s
         .db(move |c| {
             let one = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };

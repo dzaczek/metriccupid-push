@@ -597,7 +597,14 @@ pub struct Pushes {
     pub recent_failures: Vec<EventRow>,
 }
 
-pub const PUSH_TYPES: [&str; 5] = ["alert", "result", "presence", "liveactivity", "start"];
+pub const PUSH_TYPES: [&str; 6] = [
+    "alert",
+    "result",
+    "presence",
+    "liveactivity",
+    "start",
+    "background",
+];
 
 pub fn pushes(c: &Connection, now: u64) -> R<Pushes> {
     let d30 = since_day(now, 30);

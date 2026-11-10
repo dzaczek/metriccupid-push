@@ -476,13 +476,15 @@ pub async fn track(
     response
 }
 
-/// Push type label: `alert`, `result`, `presence`, `liveactivity`, `start`.
+/// Push type label: `alert`, `result`, `presence`, `liveactivity`, `start`,
+/// `background`.
 pub fn push_type(job: &PushJob) -> &'static str {
     match &job.content {
         PushContent::Sealed(m) => m.t.as_str(),
         PushContent::Presence(_) => "presence",
         PushContent::Activity(n) if n.event == ActivityEvent::Start => "start",
         PushContent::Activity(_) => "liveactivity",
+        PushContent::Background(_) => "background",
     }
 }
 

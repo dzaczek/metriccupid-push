@@ -224,6 +224,27 @@ pub fn build_presence_payload(note: PresenceNote) -> String {
     json!({ "aps": aps, "mc_presence": note }).to_string()
 }
 
+/// A background (`content-available`) push that wakes the phone app so it
+/// refreshes widgets from the mailbox (PROTOCOL.md, "Heartbeat"). Carries no
+/// alert content and shows nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundNote {
+    pub id: String,
+}
+
+/// `mc.t` of a background push.
+pub const BACKGROUND_TYPE: &str = "heartbeat";
+
+/// Build the APNs payload of a background push: no alert, sound or badge.
+pub fn build_background_payload(note: &BackgroundNote) -> String {
+    json!({
+        "aps": { "content-available": 1 },
+        "mc": { "id": note.id, "t": BACKGROUND_TYPE },
+    })
+    .to_string()
+}
+
 /// What a push carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushContent {
@@ -233,6 +254,8 @@ pub enum PushContent {
     Presence(PresenceNote),
     /// A Live Activity update, start or end (`apns-push-type: liveactivity`).
     Activity(ActivityNote),
+    /// A background wake-up (`apns-push-type: background`).
+    Background(BackgroundNote),
 }
 
 /// One push to one device.
@@ -258,6 +281,7 @@ impl PushJob {
             PushContent::Sealed(mc) => build_payload(mc, self.urgency),
             PushContent::Presence(note) => build_presence_payload(*note),
             PushContent::Activity(note) => build_activity_payload(note),
+            PushContent::Background(note) => build_background_payload(note),
         }
     }
 
@@ -268,6 +292,8 @@ impl PushJob {
             PushContent::Presence(PresenceNote::Online { .. }) => 5,
             PushContent::Activity(_) if self.urgency == Urgency::Critical => 10,
             PushContent::Activity(_) => 5,
+            // Apple requires 5 for background pushes.
+            PushContent::Background(_) => 5,
         }
     }
 
@@ -275,6 +301,7 @@ impl PushJob {
     pub fn push_type(&self) -> &'static str {
         match self.content {
             PushContent::Activity(_) => "liveactivity",
+            PushContent::Background(_) => "background",
             _ => "alert",
         }
     }
@@ -292,6 +319,7 @@ impl PushJob {
             PushContent::Sealed(mc) => mc.t.as_str(),
             PushContent::Presence(_) => "presence",
             PushContent::Activity(_) => "activity",
+            PushContent::Background(_) => "background",
         }
     }
 }
@@ -582,8 +610,8 @@ impl ApnsSender for MockApns {
 
 // --------------------------------------------------------------- gateway ---
 
-/// Body of `POST /v2/gateway/push`: exactly one of `message`, `presence` or
-/// `activity`.
+/// Body of `POST /v2/gateway/push`: exactly one of `message`, `presence`,
+/// `activity` or `background`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayPush {
@@ -595,6 +623,8 @@ pub struct GatewayPush {
     pub presence: Option<PresenceNote>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ActivityNote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundNote>,
     pub urgency: Urgency,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapse_id: Option<String>,
@@ -644,11 +674,12 @@ impl GatewayApns {
     }
 
     async fn send_inner(&self, job: &PushJob) -> Result<(), PushError> {
-        let (mut message, mut presence, mut activity) = (None, None, None);
+        let (mut message, mut presence, mut activity, mut background) = (None, None, None, None);
         match &job.content {
             PushContent::Sealed(mc) => message = Some(mc.clone()),
             PushContent::Presence(note) => presence = Some(*note),
             PushContent::Activity(note) => activity = Some(note.clone()),
+            PushContent::Background(note) => background = Some(note.clone()),
         }
         let body = serde_json::to_string(&GatewayPush {
             device_token: job.device_token.clone(),
@@ -656,6 +687,7 @@ impl GatewayApns {
             message,
             presence,
             activity,
+            background,
             urgency: job.urgency,
             collapse_id: job.collapse_id.clone(),
             expiration: job.expiration,
@@ -771,6 +803,28 @@ mod tests {
         assert_eq!(on["aps"]["interruption-level"], "passive");
         assert!(on["aps"].get("sound").is_none());
         assert_eq!(on["mc_presence"], json!({"state": "online", "since": 9}));
+    }
+
+    #[test]
+    fn background_payload_shape_and_headers() {
+        let job = PushJob {
+            group_id: "g".into(),
+            auth_key: [0; 32],
+            device_token: "aa".into(),
+            env: ApnsEnv::Production,
+            content: PushContent::Background(BackgroundNote { id: "hb-1".into() }),
+            urgency: Urgency::Normal,
+            collapse_id: None,
+            expiration: 0,
+        };
+        let p: Value = serde_json::from_str(&job.payload()).unwrap();
+        assert_eq!(
+            p,
+            json!({"aps": {"content-available": 1}, "mc": {"id": "hb-1", "t": "heartbeat"}})
+        );
+        assert_eq!(job.push_type(), "background");
+        assert_eq!(job.priority(), 5);
+        assert_eq!(job.topic_suffix(), "");
     }
 
     struct FixedClock(u64);

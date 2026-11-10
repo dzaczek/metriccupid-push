@@ -18,6 +18,7 @@ Mac --POST /v2/messages (sealed result, same collapse id)--> server --APNs--> iP
 Mac --POST /v2/messages (sealed summary)--> server mailbox --> iPhone app / widget read it when they run
 Mac --POST /v2/snapshot (sealed, every active alert)--> server keeps the newest --> iPhone Active tab (GET /v2/snapshot)
 Mac --POST /v2/activity-state (plaintext counts)--> server --APNs liveactivity--> Dynamic Island / Lock Screen
+Mac --POST /v2/heartbeat (no content)--> server --APNs background--> iPhone app wakes, syncs, reloads widgets
 ```
 
 - The group secret never leaves the user's devices (synced with iCloud Keychain). The server stores
@@ -152,7 +153,7 @@ UTF-8 JSON object. Common fields:
 | `state` | string | `firing` or `resolved` |
 | `actions` | array of string | commands the Mac will accept for this alert, subset of `ack`, `unack`, `mute`, `unmute`, `open` |
 | `display_name` | string, optional | human name of the host (Icinga host `display_name`, Zabbix visible name); receivers show it instead of `host` when present |
-| `kind` | string, optional | `digest`, see below; absent for an ordinary alert |
+| `kind` | string, optional | `digest` or `source`, see below; absent for an ordinary alert |
 
 **Digest.** To avoid a flood of pushes during an outage, a Mac MAY send the first few new alerts of a
 burst one by one and then a single `alert` with `kind: "digest"` standing for the rest. Its
@@ -169,6 +170,20 @@ e.g. `5 critical: web01, db02 and 3 more`, plus:
 Receivers that do not know `kind` show `title` and `summary` like any alert. The bundled alerts are
 not sent individually; the Mac sends a later state change of one of them only if it escalates to
 critical (then as an ordinary alert message). They are always in the `snapshot`.
+
+**Source notice.** When one of the Mac's data sources (an Icinga, Alertmanager, ... instance)
+stays not `ok` (see `sources` below) for 2 min, the Mac that runs iPhone actions MAY send one `alert`
+with `kind: "source"`, and one more when the source is `ok` again; nothing is sent for an outage
+shorter than 2 min. `alert_id` is `metriccupid:source:<source id>` (the same for both, so the
+recovery replaces the problem notification through the collapse id), `source` is `metriccupid`,
+`host` is empty, `actions` is `["open"]`. Problem: `severity: "warning"`, `state: "firing"`, urgency
+`normal`, `title` e.g. `Icinga (prod) unreachable`, `summary` e.g. `Unreachable since 14:05 —
+connection refused. Alerts from it may be missing.` Recovery: `severity: "ok"`, `state: "resolved"`,
+urgency `silent`, `title` e.g. `Icinga (prod) reconnected`. Several sources changing in the same
+check are bundled into one message per direction with `alert_id` `metriccupid:sources:<random>`
+(e.g. `3 sources lost their connection`). A recovery is only sent for a problem that was sent.
+Receivers MUST NOT count source notices as alerts (widgets, summaries); receivers that do not know
+`kind` show `title` and `summary` like any alert. The Mac lets the user turn these off.
 
 `command` (phone to Mac):
 
@@ -235,10 +250,38 @@ Item, at most 2000, in the Mac's list order (worst severity first, newest first)
 | `url` | string, optional | as in `alert` |
 | `actions` | array of string | as in `alert` |
 
-Names are cut to 128 characters. The Mac sends a snapshot when the list changes (debounced about
-5 s, at most one per 10 s) and every 5 min while linked, even when nothing changed, so a phone can
-tell an old snapshot ("Mac offline?") from an empty list. Only the Mac that runs iPhone actions
-sends snapshots. Receivers keep the snapshot with the highest `ts`.
+Optional plaintext fields (outside `items`, not compressed), sent by Macs from 1.33.2; receivers
+MUST accept snapshots without them:
+
+| Field | Type | Rule |
+|---|---|---|
+| `sources` | array, at most 50 | the Mac's **enabled** data sources and their connection, problems first |
+| `sources_disabled` | int, optional | how many configured sources are turned off on the Mac |
+
+Source:
+
+| Field | Type | Rule |
+|---|---|---|
+| `id` | string, at most 64 | opaque, stable per source on the Mac |
+| `name` | string, at most 128 | the source's name in the Mac's settings |
+| `type` | string | `alertmanager`, `icinga2`, `icingaweb`, `grafana`, `zabbix`, `opensearch` (more may follow) |
+| `status` | string | `ok`; `degraded` (reached, but the request failed: HTTP error, unreadable answer); `unreachable` (no connection: DNS, refused, timeout, TLS); `auth_failed` (401 / 403); `error` (anything else). Receivers MUST treat unknown values as a problem, like `error` |
+| `last_success` | int, optional | Unix time of the last successful poll |
+| `down_since` | int, optional | not `ok` only: Unix time the current failure streak began |
+| `last_error` | string, optional | not `ok` only: short reason, at most 120 characters. Senders MUST remove credentials: URLs are cut to `scheme://host[:port]` (no user info, path or query), bearer / basic credentials and `token=` / `password=`-style values are dropped |
+| `consecutive_failures` | int | failed polls in a row (0 when `ok`) |
+| `latency_ms` | int, optional | duration of the last poll, when it succeeded |
+| `alert_count` | int | alerts from this source in `items` |
+| `demo` | bool, optional | `true`: the Mac shows sample data for it |
+
+Receivers SHOULD show a source as unknown ("not current", grey) when the snapshot itself is not
+current, and warn that alerts from a source that is not `ok` may be missing from the list.
+
+Names are cut to 128 characters. The Mac sends a snapshot when the list or a source's `status`
+changes (debounced about 5 s, at most one per 10 s; `last_success`, `latency_ms` and
+`consecutive_failures` alone don't count as a change) and every 5 min while linked, even when
+nothing changed, so a phone can tell an old snapshot ("Mac offline?") from an empty list. Only the
+Mac that runs iPhone actions sends snapshots. Receivers keep the snapshot with the highest `ts`.
 
 Receivers MUST ignore unknown fields. Senders SHOULD encode compact JSON.
 
@@ -518,6 +561,51 @@ or `204` (no body) when the group has none (or it is older than 24 h). Phones SH
 they come to the foreground, on pull-to-refresh and after a push while open; and SHOULD show a
 snapshot whose plaintext `ts` is older than 15 min as possibly stale ("Mac offline?").
 
+### 6.6b `POST /v2/heartbeat` (Mac)
+
+Widgets and the Live Activity turn "not current" when the phone hears nothing for a while
+(snapshot 6 min, summary / Live Activity 17 min), but summaries and snapshots are never pushed, so
+an idle phone app would not fetch them. The heartbeat wakes the phone app in the background so it
+syncs the mailbox, fetches the snapshot and reloads its widgets:
+
+```json
+{"id": "aGVhcnRiZWF0LTAwMDAwMQ"}
+```
+
+`id` is 1 to 64 characters of `A-Z a-z 0-9 _ -` (a fresh random id each time). Nothing is stored.
+The server pushes to every phone of the group with a token:
+
+```json
+{"aps": {"content-available": 1}, "mc": {"id": "<id>", "t": "heartbeat"}}
+```
+
+APNs headers: `apns-push-type: background`, `apns-priority: 5` (required by Apple for background
+pushes), `apns-topic` = `APNS_TOPIC`, `apns-expiration` = now + 900 s, no collapse id. No alert,
+sound or badge; the Notification Service Extension does not run. Answer:
+
+```json
+{"status": "sent", "pushed": 1, "failed": 0, "unregistered": 0}
+```
+
+`400` for a bad body, `403` from a phone, `402` as for messages, `429 rate_limited` above 1 per
+10 min per group (burst 3).
+
+The Mac that runs iPhone actions sends a heartbeat every 15 min while linked and once after waking
+from sleep, each time right after a fresh snapshot (its summary heartbeat, 4.3, goes out at the same
+time), and backs off like every other send after `402` (13.2). A Mac MUST treat `404` (an older
+server) as "not supported" and stop trying until the link restarts.
+
+On the phone, the app handles it in `application(_:didReceiveRemoteNotification:fetchCompletionHandler:)`
+(`UIBackgroundModes` `remote-notification`): mailbox sync, `GET /v2/snapshot`, `GET /v2/status`
+within about 25 s, then it reloads the widgets and moves the local Live Activity's stale date on.
+It SHOULD also schedule a `BGAppRefreshTask` (earliest 15 min) doing the same, as a fallback.
+
+**Best effort.** Apple throttles background pushes: iOS delivers a few per hour at most, delays or
+drops them under load, in Low Power Mode and on a poor battery, coalesces them, and does not
+deliver them at all after the user force-quits the app (until it is opened again). Background App
+Refresh may be off. Receivers MUST NOT treat a missing heartbeat as an error; the freshness rules
+(6.6a) stay as they are and simply grey out what turned stale.
+
 ### 6.7 `POST /v2/commands` (phone)
 
 ```json
@@ -755,16 +843,17 @@ X-MC-Timestamp, X-MC-Signature, X-MC-Group      (no X-MC-Device; device_id line 
 ```
 
 A presence notice (section 7a) carries `"presence": {"state": "offline", "reason": "lost", "since":
-1700000000}` instead of `message`. A Live Activity push (section 6.10) carries `"activity": {"event":
+1700000000}` instead of `message`; a heartbeat (6.6b) carries `"background": {"id": "<id>"}`. A Live Activity push (section 6.10) carries `"activity": {"event":
 "update", "timestamp": 1700000005, "state": {<content-state>}, "stale_date": 1700002405,
 "dismissal_date": <optional>}` with `device_token` = the activity token; the gateway validates the
 state like `POST /v2/activity-state` (and its times within 24 h of now) and maps `urgency: "critical"`
-to priority 10, anything else to 5. Exactly one of `message`, `presence` and `activity` is required
+to priority 10, anything else to 5. Exactly one of `message`, `presence`, `activity` and
+`background` is required
 (`400` otherwise); a `message` with `t: "summary"` is refused (summaries are never pushed).
 `expiration` is 0 or at most 24 h ahead. The gateway builds the APNs payload itself from `message`
 and `urgency` (section 6.5) or from `presence` (fixed texts, section 7a), so it cannot be used to
 send arbitrary notification text, and sends it with its own key. A gateway older than this version
-rejects `presence` or `activity` (`400`): the self-hosted server then logs the failure and the phones
+rejects `presence`, `activity` or `background` (`400`): the self-hosted server then logs the failure and the phones
 get no presence push (`GET /v2/status` still works) or no Live Activity update. Answers: `200 {"status":"sent"}`, `410 {"error":"unregistered"}` (the self-hosted
 server removes the token), `502 upstream_error`, `400`, `401`, `413`, `429` (per group, default
 5/s, burst 50).
@@ -789,6 +878,7 @@ nothing but the group registration.
 | Whether and when each Mac is connected (`last_seen`), and why it disconnected (`bye` reason) | yes: the server uses it for presence pushes (section 7a), which are plaintext but contain nothing else |
 | `summary` contents | no (ciphertext; only that one was sent, and when) |
 | `snapshot` contents | no (ciphertext; its size, which roughly tracks how many alerts are active, and when) |
+| Heartbeats (6.6b) | that and when the Mac sent one (no content) |
 | Live Activity state: counts of critical / warning / unknown alerts and their changes over time | **yes, plaintext** (section 6.10): ActivityKit applies it without the extension, so it cannot be encrypted. Also visible to APNs (Apple). |
 | Live Activity lines (severity + host / service, up to 4 × 40 characters) | **yes, plaintext**, only if the user turns on "Show host names on the lock screen (sent unencrypted)" on the Mac (off by default) |
 | Live Activity push tokens and start tokens, when each activity started | yes |
@@ -805,7 +895,7 @@ keeps operational metadata in its database. Without the panel nothing below is c
 |---|---|
 | Per request: time, route, HTTP status, outcome label, latency, request size, group and (signed) device id once authenticated, `X-MC-Client` (section 5.3), Cloudflare country (`CF-IPCountry`, only from a trusted proxy), and the client network truncated to **/24 (IPv4) or /48 (IPv6)** | raw rows `ADMIN_EVENTS_RETENTION_DAYS` (default 30) and at most 1 000 000 rows; successful polls (`GET /v2/messages`, `/v2/commands`, `/v2/status`, `/v2/devices`, `/v2/snapshot`) are only counted, not stored as rows |
 | Per stored snapshot: kind `snapshot`, outcome (`stored`, `duplicate`) and the size of `sealed` | as above |
-| Per push: type (`alert`, `result`, `presence`, `liveactivity`, `start`), outcome (`sent`, `failed`, `unregistered`), APNs status and reason, sender (`direct`, `gateway`, `mock`) and APNs environment | as above |
+| Per push: type (`alert`, `result`, `presence`, `liveactivity`, `start`, `background`), outcome (`sent`, `failed`, `unregistered`), APNs status and reason, sender (`direct`, `gateway`, `mock`) and APNs environment | as above |
 | WebSocket connect / disconnect with close reason and duration, presence transitions, licence verification outcomes (`ok` with tier / environment, `invalid` with reason, `in_use`), auth bans, admin logins (with the verified Cloudflare Access e-mail when `ADMIN_CF_ACCESS_*` is set) and admin requests refused by the allowlist or Access check | as above |
 | Daily counters of all of the above per group, route, status, outcome and country | 400 days |
 | Per device: first / last request time, last `X-MC-Client`, last country | until the group is deleted |
@@ -828,6 +918,7 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 | Gateway pushes per group | 5/s, burst 50 | `RATE_V2_GATEWAY_*` |
 | `POST /v2/activity-state` per group | 1 per 5 s, burst 10 | no |
 | `POST /v2/snapshot` per group | 1 per 5 s, burst 5 | no |
+| `POST /v2/heartbeat` per group | 1 per 10 min, burst 3 | no |
 | Snapshot `sealed` | 192 KB (196 608 base64 characters); body + 1 KB | `V2_SNAPSHOT_MAX_BYTES` |
 | Live Activity pushes per group | at most 1 per 5 s (coalesced; `end` immediate) | no |
 | Push-to-start per phone | 1 per 8 h | no |

@@ -2353,3 +2353,103 @@ async fn closed_gateway_refuses_registrations_and_pushes() {
     assert_eq!(r.status, 403, "{:?}", r.json);
     assert_eq!(r.json["error"], "gateway_closed");
 }
+
+#[tokio::test]
+async fn heartbeat_sends_background_push_and_is_rate_limited() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 35).await;
+    phone
+        .as_device(&id128(38))
+        .register("ios", "iPad", Some(TOKEN_B))
+        .await;
+
+    let r = mac.post("/v2/heartbeat", &json!({"id": "hb-1"})).await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(
+        r.json,
+        json!({"status": "sent", "pushed": 2, "failed": 0, "unregistered": 0})
+    );
+    let pushes = s.mock().pushes();
+    assert_eq!(pushes.len(), 2);
+    let p = &pushes[0];
+    assert_eq!(p.push_type, "background");
+    assert_eq!(p.priority, 5);
+    assert_eq!(p.topic_suffix, "");
+    assert_eq!(p.expiration, T0 + 900);
+    assert!(p.collapse_id.is_none());
+    assert_eq!(
+        p.payload,
+        json!({"aps": {"content-available": 1}, "mc": {"id": "hb-1", "t": "heartbeat"}})
+    );
+    // Nothing is stored in the mailbox.
+    let r = phone.get("/v2/messages?since=0").await;
+    assert!(r.json["messages"].as_array().unwrap().is_empty());
+
+    // Validation and sender kind.
+    assert_eq!(
+        phone
+            .post("/v2/heartbeat", &json!({"id": "hb-p"}))
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        mac.post("/v2/heartbeat", &json!({"id": "bad id"}))
+            .await
+            .status,
+        400
+    );
+    assert_eq!(
+        mac.post("/v2/heartbeat", &json!({"id": "x", "aps": {}}))
+            .await
+            .status,
+        400
+    );
+
+    // Burst 3 per group, then 429 (one per 10 min).
+    for i in 2..=3 {
+        let r = mac
+            .post("/v2/heartbeat", &json!({"id": format!("hb-{i}")}))
+            .await;
+        assert_eq!(r.status, 200, "burst {i}: {:?}", r.json);
+    }
+    let r = mac.post("/v2/heartbeat", &json!({"id": "hb-4"})).await;
+    assert_eq!(r.status, 429);
+    let ra: u64 = r.headers["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!(ra > 60, "retry-after {ra}");
+}
+
+#[tokio::test]
+async fn heartbeat_needs_a_licence_on_the_hosted_server() {
+    let (_d, s) = server(&[("MODE", "hosted")]).await;
+    let (mac, _) = beta_group(&s, 172).await;
+    let r = mac.post("/v2/heartbeat", &json!({"id": "hb-1"})).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
+    assert!(s.mock().pushes().is_empty());
+}
+
+#[tokio::test]
+async fn heartbeat_goes_through_the_gateway() {
+    let (_d1, hosted) = server(&[
+        ("MODE", "hosted"),
+        ("HOSTED_OPEN_REGISTRATION", "true"),
+        ("GATEWAY_OPEN", "true"),
+    ])
+    .await;
+    let (_d2, selfhosted) =
+        server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
+    let (mac, _phone) = setup(&selfhosted, 174).await;
+    let r = mac.post("/v2/heartbeat", &json!({"id": "hb-gw"})).await;
+    assert_eq!(r.json["pushed"], 1, "{:?}", r.json);
+    let pushes = hosted.mock().pushes();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0].push_type, "background");
+    assert_eq!(pushes[0].priority, 5);
+    assert_eq!(
+        pushes[0].payload,
+        json!({"aps": {"content-available": 1}, "mc": {"id": "hb-gw", "t": "heartbeat"}})
+    );
+}

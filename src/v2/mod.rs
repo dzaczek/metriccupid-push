@@ -38,10 +38,10 @@ use self::activity::{
     ACTIVITY_TTL_SECS, MAX_STALE_SECS, MIN_STALE_SECS,
 };
 use self::apns::{
-    build_payload, build_presence_payload, ApnsEnv, ApnsSender, GatewayApns, GatewayPush,
-    GatewayRegistration, McEnvelope, MessageType, MockApns, OfflineReason, PresenceNote,
-    PushContent, PushError, PushJob, Urgency, DEVICE_HEADER, GROUP_HEADER, MAX_PAYLOAD_BYTES,
-    PRESENCE_COLLAPSE_ID,
+    build_background_payload, build_payload, build_presence_payload, ApnsEnv, ApnsSender,
+    BackgroundNote, GatewayApns, GatewayPush, GatewayRegistration, McEnvelope, MessageType,
+    MockApns, OfflineReason, PresenceNote, PushContent, PushError, PushJob, Urgency, DEVICE_HEADER,
+    GROUP_HEADER, MAX_PAYLOAD_BYTES, PRESENCE_COLLAPSE_ID,
 };
 use self::licence::{LicenceError, LicencePolicy, LicenceReq, VerifiedLicence};
 use self::presence::Presence;
@@ -114,6 +114,7 @@ pub fn routes(mode: Mode, mock: bool) -> Router<Arc<AppState>> {
             put(put_start_token).delete(delete_start_token),
         )
         .route("/v2/activity-state", post(post_activity_state))
+        .route("/v2/heartbeat", post(post_heartbeat))
         .route("/v2/stream", get(open_stream));
     if mode == Mode::Hosted {
         r = r
@@ -1082,6 +1083,77 @@ async fn post_message(
     .await
     .unwrap_or_else(|o| o);
     finish("messages.post", ip, started, group.as_deref(), r)
+}
+
+// ------------------------------------------------------------- heartbeat ---
+
+/// A background push older than this is useless: the next one is due.
+pub const HEARTBEAT_TTL_SECS: u64 = 900;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeartbeatReq {
+    id: String,
+}
+
+/// `POST /v2/heartbeat` (Mac): wake every phone with a background push so it
+/// refreshes its widgets from the mailbox. Nothing is stored.
+async fn post_heartbeat(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let ip = state.client_ip(peer, &headers);
+    let mut group = None;
+    let r = async {
+        let a = authenticate(
+            &state,
+            ip,
+            "POST",
+            &uri,
+            &headers,
+            &body,
+            DeviceRule::Registered(Some("mac")),
+        )
+        .await?;
+        group = Some(a.group.clone());
+        require_licence(&state, &a.group).await?;
+        let req: HeartbeatReq = parse(&body)?;
+        if !is_token_id(&req.id) {
+            return Err(bad("id must be 1 to 64 characters of A-Z a-z 0-9 _ -"));
+        }
+        if let Err(ra) = state.v2().limits.check_heartbeat(&a.group) {
+            return Err((too_many(ra), "rate_limited_group"));
+        }
+        let expiration = state.now() + HEARTBEAT_TTL_SECS;
+        let (pushed, failed, unregistered) = fan_out(
+            &state,
+            &a.group,
+            a.key,
+            PushContent::Background(BackgroundNote { id: req.id }),
+            Urgency::Normal,
+            None,
+            expiration,
+        )
+        .await
+        .map_err(storage_error)?;
+        Ok(ok(
+            StatusCode::OK,
+            json!({
+                "status": "sent",
+                "pushed": pushed,
+                "failed": failed,
+                "unregistered": unregistered,
+            }),
+            "sent",
+        ))
+    }
+    .await
+    .unwrap_or_else(|o| o);
+    finish("heartbeat.post", ip, started, group.as_deref(), r)
 }
 
 /// Push to every iOS device of the group concurrently; forget dead tokens.
@@ -2086,8 +2158,8 @@ async fn gateway_push(
         let token = normalize_apns_token(&req.device_token)
             .ok_or_else(|| bad("device_token must be 64 to 200 hex characters"))?;
         let now = state.now();
-        let content = match (req.message, req.presence, req.activity) {
-            (Some(m), None, None) => {
+        let content = match (req.message, req.presence, req.activity, req.background) {
+            (Some(m), None, None, None) => {
                 if !is_token_id(&m.id)
                     || !is_sealed(&m.s, MAX_PAYLOAD_BYTES)
                     || m.t == MessageType::Summary
@@ -2098,8 +2170,14 @@ async fn gateway_push(
                 }
                 PushContent::Sealed(m)
             }
-            (None, Some(p), None) => PushContent::Presence(p),
-            (None, None, Some(n)) => {
+            (None, Some(p), None, None) => PushContent::Presence(p),
+            (None, None, None, Some(b)) => {
+                if !is_token_id(&b.id) {
+                    return Err(bad("background must be {id} with a valid id"));
+                }
+                PushContent::Background(b)
+            }
+            (None, None, Some(n), None) => {
                 n.state.validate().map_err(bad)?;
                 let near = |t: u64| t.abs_diff(now) <= MAX_TTL_SECS;
                 if !near(n.timestamp)
@@ -2112,7 +2190,7 @@ async fn gateway_push(
             }
             _ => {
                 return Err(bad(
-                    "exactly one of message, presence or activity is required",
+                    "exactly one of message, presence, activity or background is required",
                 ))
             }
         };
@@ -2130,6 +2208,7 @@ async fn gateway_push(
             PushContent::Sealed(m) => build_payload(m, req.urgency).len(),
             PushContent::Presence(p) => build_presence_payload(*p).len(),
             PushContent::Activity(n) => activity::build_activity_payload(n).len(),
+            PushContent::Background(b) => build_background_payload(b).len(),
         };
         if payload_len > MAX_PAYLOAD_BYTES {
             return Err((

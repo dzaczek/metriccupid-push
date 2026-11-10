@@ -257,6 +257,7 @@ pub struct V2Limits {
     gateway: DefaultKeyedRateLimiter<String>,
     activity: DefaultKeyedRateLimiter<String>,
     snapshot: DefaultKeyedRateLimiter<String>,
+    heartbeat: DefaultKeyedRateLimiter<String>,
     groups: DefaultKeyedRateLimiter<IpAddr>,
 }
 
@@ -276,6 +277,14 @@ pub fn snapshot_quota() -> Quota {
         .allow_burst(std::num::NonZeroU32::new(5).expect("non-zero"))
 }
 
+/// `POST /v2/heartbeat` per group: one per 10 min, burst 3. Apple throttles
+/// background pushes to a few per hour anyway; the Mac sends one per 15 min.
+pub fn heartbeat_quota() -> Quota {
+    Quota::with_period(Duration::from_secs(600))
+        .expect("non-zero period")
+        .allow_burst(std::num::NonZeroU32::new(3).expect("non-zero"))
+}
+
 fn hourly(r: HourlyRate) -> Quota {
     Quota::per_hour(r.per_hour).allow_burst(r.burst)
 }
@@ -288,6 +297,7 @@ impl V2Limits {
             gateway: RateLimiter::keyed(quota(c.rate_gateway)),
             activity: RateLimiter::keyed(activity_quota()),
             snapshot: RateLimiter::keyed(snapshot_quota()),
+            heartbeat: RateLimiter::keyed(heartbeat_quota()),
             groups: RateLimiter::keyed(hourly(c.rate_groups)),
         }
     }
@@ -322,6 +332,12 @@ impl V2Limits {
             .map_err(retry_after)
     }
 
+    pub fn check_heartbeat(&self, group: &str) -> Result<(), RetryAfter> {
+        self.heartbeat
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
     pub fn check_group_registration(&self, ip: IpAddr) -> Result<(), RetryAfter> {
         self.groups.check_key(&ip).map_err(retry_after)
     }
@@ -333,6 +349,7 @@ impl V2Limits {
             &self.gateway,
             &self.activity,
             &self.snapshot,
+            &self.heartbeat,
         ] {
             l.retain_recent();
             l.shrink_to_fit();
