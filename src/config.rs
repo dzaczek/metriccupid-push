@@ -159,8 +159,33 @@ pub struct AdminConfig {
     /// Empty only with `allow_any`.
     pub allow_ips: Vec<IpNet>,
     pub allow_any: bool,
+    /// `ADMIN_ALLOW_ANY_WITHOUT_ACCESS`; `None` when unset.
+    pub allow_any_without_access: Option<bool>,
+    /// Cloudflare Access JWT check (`ADMIN_CF_ACCESS_*`), off when `None`.
+    pub cf_access: Option<CfAccessConfig>,
     pub session_secs: u64,
     pub events_retention_days: u64,
+}
+
+/// Cloudflare Access application the admin hostname sits behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfAccessConfig {
+    /// Team domain, e.g. `j23.cloudflareaccess.com`.
+    pub team_domain: String,
+    /// Accepted application AUD tags.
+    pub auds: Vec<String>,
+}
+
+impl CfAccessConfig {
+    /// Expected `iss` claim.
+    pub fn issuer(&self) -> String {
+        format!("https://{}", self.team_domain)
+    }
+
+    /// The team's JWKS endpoint.
+    pub fn certs_url(&self) -> String {
+        format!("https://{}/cdn-cgi/access/certs", self.team_domain)
+    }
 }
 
 impl fmt::Debug for AdminConfig {
@@ -172,6 +197,8 @@ impl fmt::Debug for AdminConfig {
             .field("totp_secret", &"<redacted>")
             .field("allow_ips", &self.allow_ips)
             .field("allow_any", &self.allow_any)
+            .field("allow_any_without_access", &self.allow_any_without_access)
+            .field("cf_access", &self.cf_access)
             .field("session_secs", &self.session_secs)
             .field("events_retention_days", &self.events_retention_days)
             .finish()
@@ -436,6 +463,19 @@ fn parse_admin_on(get: &impl Fn(&str) -> Option<String>) -> Result<AdminConfig, 
     if allow_ips.is_empty() && !allow_any {
         return err("ADMIN_ALLOW_IPS is empty; set it (or ADMIN_ALLOW_ANY=true to allow every IP)");
     }
+    let cf_access = parse_cf_access(get("ADMIN_CF_ACCESS_TEAM"), get("ADMIN_CF_ACCESS_AUD"))?;
+    let allow_any_without_access = match get("ADMIN_ALLOW_ANY_WITHOUT_ACCESS") {
+        None => None,
+        v => Some(parse_bool("ADMIN_ALLOW_ANY_WITHOUT_ACCESS", v, false)?),
+    };
+    // Unset is tolerated for now (startup warning); an explicit `false`
+    // refuses an open panel that has no Access check.
+    if allow_any && cf_access.is_none() && allow_any_without_access == Some(false) {
+        return err(
+            "ADMIN_ALLOW_ANY=true needs ADMIN_CF_ACCESS_TEAM and ADMIN_CF_ACCESS_AUD \
+             (or ADMIN_ALLOW_ANY_WITHOUT_ACCESS=true)",
+        );
+    }
     let hours = parse_nonzero("ADMIN_SESSION_HOURS", get("ADMIN_SESSION_HOURS"), 12)?.get();
     let days = parse_nonzero(
         "ADMIN_EVENTS_RETENTION_DAYS",
@@ -450,9 +490,59 @@ fn parse_admin_on(get: &impl Fn(&str) -> Option<String>) -> Result<AdminConfig, 
         totp_secret,
         allow_ips,
         allow_any,
+        allow_any_without_access,
+        cf_access,
         session_secs: u64::from(hours) * 3600,
         events_retention_days: u64::from(days),
     })
+}
+
+/// `ADMIN_CF_ACCESS_TEAM` (`j23` or `j23.cloudflareaccess.com`) and
+/// `ADMIN_CF_ACCESS_AUD` (comma-separated AUD tags): both or neither.
+fn parse_cf_access(
+    team: Option<String>,
+    aud: Option<String>,
+) -> Result<Option<CfAccessConfig>, ConfigError> {
+    let (team, aud) = match (team, aud) {
+        (None, None) => return Ok(None),
+        (Some(t), Some(a)) => (t, a),
+        _ => return err("ADMIN_CF_ACCESS_TEAM and ADMIN_CF_ACCESS_AUD must be set together"),
+    };
+    let team = team.to_ascii_lowercase();
+    let team = team
+        .strip_prefix("https://")
+        .unwrap_or(&team)
+        .trim_end_matches('/');
+    let ok_host = !team.is_empty()
+        && team.len() <= 253
+        && team.split('.').all(|l| {
+            !l.is_empty()
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if !ok_host {
+        return err("ADMIN_CF_ACCESS_TEAM must be a team name (e.g. `j23`) or team domain");
+    }
+    let team_domain = if team.contains('.') {
+        team.to_string()
+    } else {
+        format!("{team}.cloudflareaccess.com")
+    };
+    let auds: Vec<String> = aud
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if auds.is_empty()
+        || auds
+            .iter()
+            .any(|a| a.len() > 256 || !a.bytes().all(|b| b.is_ascii_alphanumeric()))
+    {
+        return err("ADMIN_CF_ACCESS_AUD must be one or more comma-separated AUD tags");
+    }
+    Ok(Some(CfAccessConfig { team_domain, auds }))
 }
 
 fn parse_rate(
@@ -1013,6 +1103,59 @@ mod tests {
                 ),
                 "{bad:?}"
             );
+        }
+        // ADMIN_ALLOW_ANY without Access: started (warning) unless explicitly refused.
+        assert!(matches!(
+            admin(&[("ADMIN_ALLOW_ANY", "true"), ("ADMIN_ALLOW_ANY_WITHOUT_ACCESS", "true")]),
+            AdminSetting::On(ref a) if a.allow_any_without_access == Some(true)
+        ));
+        assert!(matches!(
+            admin(&[("ADMIN_ALLOW_ANY", "true"), ("ADMIN_ALLOW_ANY_WITHOUT_ACCESS", "false")]),
+            AdminSetting::Refused(ref e) if e.contains("ADMIN_CF_ACCESS_TEAM")
+        ));
+        const AUD: &str = "1a7f85adede665228b2c7b9f5067d974c7358fe920ea774d63c115716a041b6f";
+        for team in [
+            "j23",
+            "J23.cloudflareaccess.com",
+            "https://j23.cloudflareaccess.com/",
+        ] {
+            let AdminSetting::On(a) = admin(&[
+                ("ADMIN_ALLOW_ANY", "true"),
+                ("ADMIN_ALLOW_ANY_WITHOUT_ACCESS", "false"),
+                ("ADMIN_CF_ACCESS_TEAM", team),
+                ("ADMIN_CF_ACCESS_AUD", &format!(" {AUD} , other1 ")),
+            ]) else {
+                panic!("expected On for {team}");
+            };
+            let c = a.cf_access.unwrap();
+            assert_eq!(c.team_domain, "j23.cloudflareaccess.com");
+            assert_eq!(c.issuer(), "https://j23.cloudflareaccess.com");
+            assert_eq!(
+                c.certs_url(),
+                "https://j23.cloudflareaccess.com/cdn-cgi/access/certs"
+            );
+            assert_eq!(c.auds, vec![AUD.to_string(), "other1".to_string()]);
+        }
+        for bad in [
+            vec![("ADMIN_CF_ACCESS_TEAM", "j23")],
+            vec![("ADMIN_CF_ACCESS_AUD", AUD)],
+            vec![
+                ("ADMIN_CF_ACCESS_TEAM", "j23/x"),
+                ("ADMIN_CF_ACCESS_AUD", AUD),
+            ],
+            vec![
+                ("ADMIN_CF_ACCESS_TEAM", "j23"),
+                ("ADMIN_CF_ACCESS_AUD", ","),
+            ],
+            vec![
+                ("ADMIN_CF_ACCESS_TEAM", "j23"),
+                ("ADMIN_CF_ACCESS_AUD", "a b"),
+            ],
+            vec![("ADMIN_ALLOW_ANY_WITHOUT_ACCESS", "maybe")],
+        ] {
+            let mut pairs = vec![("ADMIN_ALLOW_ANY", "true")];
+            pairs.extend(bad.iter().copied());
+            assert!(matches!(admin(&pairs), AdminSetting::Refused(_)), "{bad:?}");
         }
         let mut no_user = cfg(&[("ADMIN_BIND", "127.0.0.1:8081")]).unwrap().admin;
         assert!(matches!(no_user, AdminSetting::Refused(ref e) if e.contains("ADMIN_USER")));

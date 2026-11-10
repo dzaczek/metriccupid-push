@@ -125,12 +125,23 @@ async fn async_main(config: Config) -> Result<(), String> {
                     bind = %a.bind,
                     allow_ips = a.allow_ips.len(),
                     allow_any = a.allow_any,
+                    cf_access = a.cf_access.is_some(),
                     "admin panel listening"
                 );
-                if a.allow_any {
-                    tracing::warn!(
-                        "ADMIN_ALLOW_ANY=true: the admin login is reachable from any IP"
-                    );
+                match (&a.cf_access, a.allow_any, a.allow_any_without_access) {
+                    (Some(c), _, _) => {
+                        tracing::info!(team = %c.team_domain, auds = c.auds.len(), "admin: Cloudflare Access JWT required");
+                        if admin_state.refresh_access_keys().await != Some(true) {
+                            tracing::error!("admin: no Cloudflare Access keys; every admin request gets 404 until they can be fetched (retried every minute)");
+                        }
+                    }
+                    (None, true, Some(true)) => tracing::warn!(
+                        "SECURITY: ADMIN_ALLOW_ANY=true and ADMIN_ALLOW_ANY_WITHOUT_ACCESS=true: the admin login is reachable from any IP WITHOUT Cloudflare Access verification"
+                    ),
+                    (None, true, _) => tracing::warn!(
+                        "SECURITY: ADMIN_ALLOW_ANY=true without Cloudflare Access verification: the admin login is reachable from any IP. Set ADMIN_CF_ACCESS_TEAM and ADMIN_CF_ACCESS_AUD, or ADMIN_ALLOW_ANY_WITHOUT_ACCESS=true to accept this explicitly (=false refuses to start the panel)"
+                    ),
+                    (None, false, _) => {}
                 }
                 admin::spawn_cleanup(admin_state.clone());
                 Some(tokio::spawn(admin::serve(

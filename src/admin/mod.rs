@@ -2,8 +2,8 @@
 //! "Admin panel". The public router has no admin routes and this router has
 //! no public API routes.
 //!
-//! Access control, in order: IP allowlist on the real client IP (else a
-//! plain 404), login with password (argon2id) and TOTP, server-side session
+//! Access control, in order: IP allowlist on the real client IP and, when
+//! configured, a valid Cloudflare Access JWT (else a plain 404), login with password (argon2id) and TOTP, server-side session
 //! cookie, per-session CSRF token on every POST. Every response carries
 //! strict security headers. Pages show metadata only.
 
@@ -11,6 +11,7 @@
 // response, built on the cold path only.
 #![allow(clippy::result_large_err)]
 
+pub mod access;
 pub mod auth;
 pub mod pages;
 pub mod queries;
@@ -36,6 +37,7 @@ use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
+use self::access::{AccessVerifier, Identity};
 use self::auth::{csrf_ok, ct_str_eq, totp_match, verify_password, Lockout, Session, Sessions};
 use self::pages::{Page, Runtime};
 use self::queries::GroupFilter;
@@ -70,6 +72,8 @@ pub struct AdminState {
     last_totp_step: Mutex<u64>,
     /// argon2 needs ~19 MB per check: one at a time.
     verify_gate: Semaphore,
+    /// Cloudflare Access JWT check (`ADMIN_CF_ACCESS_*`).
+    access: Option<AccessVerifier>,
 }
 
 /// The resolved client IP, set by the allowlist middleware.
@@ -78,6 +82,24 @@ struct ClientIp(IpAddr);
 
 impl AdminState {
     pub fn new(app: Arc<AppState>, config: &Config) -> Result<Self, String> {
+        Self::build(app, config, None)
+    }
+
+    /// Like `new`, but the Cloudflare Access keys come from `certs_url`
+    /// (tests serve a mock JWKS). The expected `iss` is unchanged.
+    pub fn new_with_access_certs_url(
+        app: Arc<AppState>,
+        config: &Config,
+        certs_url: String,
+    ) -> Result<Self, String> {
+        Self::build(app, config, Some(certs_url))
+    }
+
+    fn build(
+        app: Arc<AppState>,
+        config: &Config,
+        certs_url: Option<String>,
+    ) -> Result<Self, String> {
         let cfg = config
             .admin
             .config()
@@ -88,8 +110,14 @@ impl AdminState {
             .store
             .open_reader()
             .map_err(|e| format!("admin: cannot open database reader: {e}"))?;
+        let access = match (&cfg.cf_access, certs_url) {
+            (None, _) => None,
+            (Some(c), None) => Some(AccessVerifier::new(c)?),
+            (Some(c), Some(url)) => Some(AccessVerifier::with_certs_url(c, url)?),
+        };
         let v2 = &config.v2;
         Ok(Self {
+            access,
             app,
             sessions: Sessions::new(cfg.session_secs),
             lockout: Lockout::default(),
@@ -127,6 +155,14 @@ impl AdminState {
 
     fn allowed(&self, ip: IpAddr) -> bool {
         self.cfg.allow_any || self.cfg.allow_ips.iter().any(|n| n.contains(&ip))
+    }
+
+    /// Fetch the Cloudflare Access keys if due. `None` when Access is off,
+    /// else whether usable keys are cached afterwards.
+    pub async fn refresh_access_keys(&self) -> Option<bool> {
+        let a = self.access.as_ref()?;
+        a.refresh(self.now(), true).await;
+        Some(a.key_count() > 0)
     }
 
     pub fn cleanup(&self) {
@@ -177,10 +213,18 @@ impl AdminState {
         country: Option<String>,
         outcome: &'static str,
         detail: &str,
+        identity: &Identity,
     ) {
         let mut e = Event::new("admin_login").ip(ip).outcome(outcome);
-        if !detail.is_empty() {
-            e = e.detail(detail);
+        // The verified Cloudflare Access e-mail is the only identity kept.
+        let detail = match (detail, identity.email.as_deref()) {
+            ("", None) => None,
+            (d, None) => Some(d.to_string()),
+            ("", Some(m)) => Some(m.to_string()),
+            (d, Some(m)) => Some(format!("{d} {m}")),
+        };
+        if let Some(d) = detail {
+            e = e.detail(d);
         }
         e.country = country;
         self.app.metrics().record(e);
@@ -214,6 +258,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/export/daily.csv", get(export_csv))
         .route("/admin/style.css", get(style))
         .fallback(not_found)
+        .layer(from_fn_with_state(state.clone(), cf_access))
         .layer(from_fn_with_state(state.clone(), allowlist))
         .layer(
             ServiceBuilder::new()
@@ -242,7 +287,8 @@ pub async fn serve(
     .await
 }
 
-/// Expire sessions and lockouts once a minute.
+/// Expire sessions and lockouts once a minute; refresh the Cloudflare
+/// Access keys when due (hourly, or every minute while none are cached).
 pub fn spawn_cleanup(state: Arc<AdminState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -250,6 +296,7 @@ pub fn spawn_cleanup(state: Arc<AdminState>) -> tokio::task::JoinHandle<()> {
         loop {
             tick.tick().await;
             state.cleanup();
+            state.refresh_access_keys().await;
         }
     })
 }
@@ -280,6 +327,41 @@ async fn allowlist(
         return not_found_response();
     }
     req.extensions_mut().insert(ClientIp(ip));
+    next.run(req).await
+}
+
+/// Cloudflare Access JWT (after the allowlist): missing or invalid is the
+/// same plain 404.
+async fn cf_access(
+    State(s): State<Arc<AdminState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let identity = match &s.access {
+        None => Identity::default(),
+        Some(v) => {
+            let res = match access::token(req.headers()) {
+                None => Err(access::AccessError::Missing),
+                Some(t) => v.verify(t, s.now()).await,
+            };
+            match res {
+                Ok(id) => id,
+                Err(e) => {
+                    let ip = req
+                        .extensions()
+                        .get::<ClientIp>()
+                        .map_or_else(|| s.app.client_ip(peer, req.headers()), |c| c.0);
+                    tracing::debug!(client_ip = %ip, reason = e.label(), "admin: Cloudflare Access check failed");
+                    let mut ev = Event::new("admin_denied").ip(ip).detail(e.label());
+                    ev.country = s.app.client_country(peer, req.headers());
+                    s.app.metrics().record(ev);
+                    return not_found_response();
+                }
+            }
+        }
+    };
+    req.extensions_mut().insert(identity);
     next.run(req).await
 }
 
@@ -422,6 +504,7 @@ async fn login(
     State(s): State<Arc<AdminState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     axum::Extension(ClientIp(ip)): axum::Extension<ClientIp>,
+    axum::Extension(identity): axum::Extension<Identity>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
@@ -430,7 +513,7 @@ async fn login(
     // CSRF first: the form must come from a page this server rendered.
     let Some((pre_token, pre)) = session(&s, &headers).filter(|(_, p)| csrf_ok(p, &form.csrf))
     else {
-        s.record_login(ip, country, "csrf", "");
+        s.record_login(ip, country, "csrf", "", &identity);
         return fresh_login(
             &s,
             StatusCode::FORBIDDEN,
@@ -438,7 +521,7 @@ async fn login(
         );
     };
     let fail = |outcome: &'static str, detail: &str| {
-        s.record_login(ip, country.clone(), outcome, detail);
+        s.record_login(ip, country.clone(), outcome, detail, &identity);
         login_page(StatusCode::UNAUTHORIZED, Some(LOGIN_ERROR), &pre.csrf, None)
     };
     // Locked out: refuse before any expensive work, with the same message.
@@ -483,7 +566,7 @@ async fn login(
     }
     s.sessions.remove(&pre_token);
     let token = s.sessions.create_authed(now);
-    s.record_login(ip, country, "ok", "");
+    s.record_login(ip, country, "ok", "", &identity);
     tracing::info!(network = %ip_prefix(ip), "admin login");
     (
         StatusCode::SEE_OTHER,

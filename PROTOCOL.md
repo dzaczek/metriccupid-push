@@ -806,7 +806,7 @@ keeps operational metadata in its database. Without the panel nothing below is c
 | Per request: time, route, HTTP status, outcome label, latency, request size, group and (signed) device id once authenticated, `X-MC-Client` (section 5.3), Cloudflare country (`CF-IPCountry`, only from a trusted proxy), and the client network truncated to **/24 (IPv4) or /48 (IPv6)** | raw rows `ADMIN_EVENTS_RETENTION_DAYS` (default 30) and at most 1 000 000 rows; successful polls (`GET /v2/messages`, `/v2/commands`, `/v2/status`, `/v2/devices`, `/v2/snapshot`) are only counted, not stored as rows |
 | Per stored snapshot: kind `snapshot`, outcome (`stored`, `duplicate`) and the size of `sealed` | as above |
 | Per push: type (`alert`, `result`, `presence`, `liveactivity`, `start`), outcome (`sent`, `failed`, `unregistered`), APNs status and reason, sender (`direct`, `gateway`, `mock`) and APNs environment | as above |
-| WebSocket connect / disconnect with close reason and duration, presence transitions, licence verification outcomes (`ok` with tier / environment, `invalid` with reason, `in_use`), auth bans, admin logins | as above |
+| WebSocket connect / disconnect with close reason and duration, presence transitions, licence verification outcomes (`ok` with tier / environment, `invalid` with reason, `in_use`), auth bans, admin logins (with the verified Cloudflare Access e-mail when `ADMIN_CF_ACCESS_*` is set) and admin requests refused by the allowlist or Access check | as above |
 | Daily counters of all of the above per group, route, status, outcome and country | 400 days |
 | Per device: first / last request time, last `X-MC-Client`, last country | until the group is deleted |
 

@@ -176,6 +176,16 @@ fn csrf(html: &str) -> String {
 }
 
 async fn servers(overrides: &[(&str, &str)]) -> Servers {
+    servers_opts(overrides, None, reqwest::header::HeaderMap::new()).await
+}
+
+/// `certs_url`: serve the Cloudflare Access JWKS from there; `headers` go on
+/// every request of `Servers::http`.
+async fn servers_opts(
+    overrides: &[(&str, &str)],
+    certs_url: Option<String>,
+    headers: reqwest::header::HeaderMap,
+) -> Servers {
     let dir = tempfile::tempdir().unwrap();
     let hash = test_hash();
     let mut env: HashMap<String, String> = HashMap::from([
@@ -198,7 +208,14 @@ async fn servers(overrides: &[(&str, &str)]) -> Servers {
     let clock = Arc::new(TestClock(AtomicU64::new(T0)));
     let resolver = ClientIpResolver::from_config(&config.trust_proxy).await;
     let state = Arc::new(AppState::new(&config, resolver, clock.clone()).unwrap());
-    let admin_state = Arc::new(AdminState::new(state.clone(), &config).expect("admin on"));
+    let admin_state = Arc::new(
+        match certs_url {
+            None => AdminState::new(state.clone(), &config),
+            Some(u) => AdminState::new_with_access_certs_url(state.clone(), &config, u),
+        }
+        .expect("admin on"),
+    );
+    admin_state.refresh_access_keys().await;
 
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let al = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -214,6 +231,7 @@ async fn servers(overrides: &[(&str, &str)]) -> Servers {
         state,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .default_headers(headers)
             .build()
             .unwrap(),
     }
@@ -794,4 +812,323 @@ async fn licence_refusal_reasons_are_visible_on_the_security_page() {
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["security"]["licence_reasons"][0]["count"], 1, "{v}");
     assert!(body.contains("groups invalid malformed"));
+}
+
+// ------------------------------------------------------ Cloudflare Access ---
+
+const CF_TEAM: &str = "j23";
+const CF_ISS: &str = "https://j23.cloudflareaccess.com";
+const CF_AUD: &str = "1a7f85adede665228b2c7b9f5067d974c7358fe920ea774d63c115716a041b6f";
+/// 2048-bit RSA test keys (PKCS#8 DER, base64); ring cannot generate RSA keys.
+const RSA_KEY_1: &str = "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCTzXaIofeEduEGlJCr/OljNHPkyNUrTDH1LFf6E20uTBQlS2ygB+NXAv3zwdIsHYltAtBGbQtae/o5DHmbOpzEXwD1TbmOUX1KsineX0J/CA+9+xTJ4CtoHu+2YKQUDe1T3mnEQwa6hCXPubepWmp5kJFmvd2r7fPJCsaNwlnwfnJzAOKubHt1jTD4x4InAY/VrvhBwUHvcr7Xi+8Z4DNjnbyCKpOYfaWcfJo+LH3GxzGwbNCM2ATufehSO0CbVPnedoOLPgaIPMM8Oucx/licF5rcfZ8nU2q9UiLV7grosxzpQZ1As10bksv7h2b3uSp8Cc2Um+4Abu8NEV8IV6xZAgMBAAECggEAAsVTfb49K9n0RmS0mmgBLBK7292HLLeewomuE7195Ep/oJXB/ihuGTlKIq61To4DMuyRlDBpI3odhI8ST753WX5HQB7QsrVRk8i0djtZvZRPtaNzJ7gXHqDHcUDTv2uynkoWHrX7w074GOVsM88pHdXmLYOAfoxu1iVokX6Qo9+23tUisYl8rIOeyYtTjmZnadduBNKn7K85VAsmUFDGFMxevE60Y61b4vZDNT0wTNzK0QI+7kFyTSEa9oF3aDNsB049G3jflShlaeqJ+QDhiYP8VR2G4FCTHX8mjGJg4GgpWzbuQYWpqcUGsz3ZXodSFL17rr2yD7gptjZZCSC5XQKBgQDMu79gxGBQGG8RBkmNNEKtvyRnepa4U3duESIcuwmc8u8tn9S1zI3NYKX5eFaVYn52asgS8URDFRV63LNcE7DtwNAMAIqakeL7kQTzPO6PPlfJRdBZwvztrH5VKKYgwUgjTklj5q28irgCLVFTZDMfSWgxdT9PneLuhwWcy6b0VwKBgQC40DeQHBn2BYAenv8U+AE5d8GlL+A+prPXyHBqQbC1CMd+HYDabMP4Vrp2iVOQ3ejdvFuzIGUs3yhQiRHO7dFscDD8n6qorI0rVAotZTGYm+aF+M4x4U5QddSAouC38MaqDkMOCrv+SF2riVXpqEzITJnv7DunjMx24aG7Qwh2zwKBgAyOGu9hO5LN3MnLe+k34jrrdN0PrHyDSdirHk9qvO0uDLLckVvQvoVwvtzsn0qr7ptucvSObSQ7/8Q4Epu77Wa3I0sJIXbXKXdJ7mbIPsz0AsgqCtvmVEJzCJBKXN23XKglneSNeewNCbnAc7NMesIZa1VVHlvQj+EW0KZL6uIjAoGAaLKUd5Bj6KrvDOnX6gIhd3PvgOwhZny772d+v8NdHwHNOhXutE7fqiU/1v0vGSeNz2fwrwaQKp51UUKFkyvI81yPc93kKVAvXTdr2JG2ShUvv//WmA1id1R5QTKEic/eS+JufFr6azCF2DKiOA9/CA3VO0Uh+mZaQpLKM7Li7aMCgYAoj19NZ4xeaOqY89t3OE1PTjCA9kCGSls1e5Vd4g9nIA+g6MyvvlM0SnlI8qO99/CNCAoc62IBz635r3a/HRJ+8sa80l/rlnoUR5T4xiOJcSEZewLm9KK3PhBLdfsSVi/uAumEghcpRAP3oa6+gnBqwZKlKUtXY0dnFYDu+NNfrA==";
+const RSA_KEY_2: &str = "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCuoPYi8U1UdDIg5yR0fXSI425pe7PxiHwTEnBd6wD5asJUaGyW9gFvOiQEISetSUMHdH9JbnR8neWSaIS9CgAYzqEU22tQi1G0w4i8HtyjT+cxKzZcFhYk/4H/Vw2aZbfo0yb++AQ90tMioI+gpOexCoVkh/nbF36BlexM6wAl5o7GX8cIWgvk+YPzUuJtWWOtBUXxZ9Z3XpODN1RWZyVyhC8ueGZ3aWFqAbVdNj/kMtUmoT81Pgm1Wu9pae6vwIGTjmtMWlYJeTnQ8Ed8fHDca+5lHb5Xl8twB2bTVvOCNeyw+d6ZMCgzsF+jJQo0NhmDsVrC4p2WhH5XTzv+s63FAgMBAAECggEABI6eRbyq0jKjEUE+7gxNE3pt6fJIuJuhc0T2qjjFAn1C+31rIghi8rJfeL0dwjOofGQRo0qu3wam1EqGdkFxzbPst7TfKM+t7uvwYEpk4x0lcR7J0R7hbo89ZvqwV/BiG4ERIjO6NpvPFzb98IkFI9VctEopHsrO6hZNv5cdXp/J2i2TjukUEmaIK0ni7IfF3sAae5pNu3k7Voy7VFQM24DtL7BPUaPckRscluaKirj108iT1RfW2Hn/RrCoHnjAqGhSKGfGh6QAfrWl21S98FZKhig29RKBzizvTL2mguhCUulHmTGMJtgsWOv82LMgOxOD3HY1XFXK+UMVRyd3CQKBgQDfb5MwkxQZl8FbZSouuRWiBvhcFOjT7fOsVPdcoV+cjEM+3HnifEHJhT2niXoi6p5QTkVcbWx3OxwEqi6GTBk3+A1+aFCiv1PB5nUW9kazc+7qdcHQS09rXtXSZW7ThkC7zFZJ1mfPmosobpOQ2FLhoCCuX1AQuX/pFDcHZieoGQKBgQDIFGMGICgMpkRPWcxQZm+hFqfNpvDLtdeaYx2rlT0+f2CIDARG/dwCLOM790P/vyo8D7gv6wGq+ozKYwkkVoAWgNNHt1RKfBll/zD5EaCczWEoPdVh+VpRhTOasJlj0hSD+wn29W3r8UyN5YV/GAJdBKVzn8XrRWaUut8+eh/YjQKBgFtGJQauzoM17xL63KSBj0jFOCfFkucgSW6YtwPsGDbHRaEkR9YxlF5SQ8Fw86fX2BxOHR+Iw8phJyzwqFjMNXEbr8d3rZkON5T6I9LhgDhGn86/lBEW8raV4xszvHZEXaVZ79Xx9C5mn3pA0Z9V/2WUGEWjQf3TCWGZlHE9Ve3hAoGAVvpV2fHctzMIex5kbYc6e+Lna8Vo5IXWhm0UFuU3zJV/F2Vx7pKpM+Djn8vsKZ+m8pk6zsnw3a0xy0GmVb+syxuRvZl68S5ltCtt1LjPA5tc4yuOOZs2oj2vo02mQPiwpndZa5xh/rHVP9JJaGi9jkZYzpzkY1S2NW3PYs+gTHkCgYAYNe93AOm6qd3/+kopOT4Yz6HWOCtQrLmgumnJd9Zq3YVoXDTh1dmrCdUblkao6cWX4YvcoTbHfIQjOZZrAwiF07I4i7fB/XY0Yjv9ocZNcgl0pswtFbgNzeGYY+pfv8uc+6A1deB4RDxsC1tNw6BGTQPwPfAu14xDI3+2I4fk3A==";
+
+struct AccessKey {
+    kid: &'static str,
+    pair: ring::signature::RsaKeyPair,
+}
+
+impl AccessKey {
+    fn new(kid: &'static str, pkcs8_b64: &str) -> Self {
+        use base64::Engine;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(pkcs8_b64)
+            .unwrap();
+        Self {
+            kid,
+            pair: ring::signature::RsaKeyPair::from_pkcs8(&der).unwrap(),
+        }
+    }
+
+    fn jwk(&self) -> Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let c = ring::signature::RsaPublicKeyComponents::<Vec<u8>>::from(self.pair.public());
+        json!({
+            "kid": self.kid, "kty": "RSA", "alg": "RS256", "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(&c.n), "e": URL_SAFE_NO_PAD.encode(&c.e),
+        })
+    }
+
+    fn sign(&self, claims: &Value) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let h = URL_SAFE_NO_PAD.encode(json!({ "alg": "RS256", "kid": self.kid }).to_string());
+        let p = URL_SAFE_NO_PAD.encode(claims.to_string());
+        let input = format!("{h}.{p}");
+        let mut sig = vec![0u8; self.pair.public().modulus_len()];
+        self.pair
+            .sign(
+                &ring::signature::RSA_PKCS1_SHA256,
+                &ring::rand::SystemRandom::new(),
+                input.as_bytes(),
+                &mut sig,
+            )
+            .unwrap();
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig))
+    }
+}
+
+fn cf_claims() -> Value {
+    json!({
+        "aud": [CF_AUD], "iss": CF_ISS, "email": "ops@example.com", "sub": "user-1",
+        "iat": T0 - 10, "nbf": T0 - 10, "exp": T0 + 86_400, "type": "app",
+    })
+}
+
+async fn jwks_mock(keys: &[&AccessKey]) -> wiremock::MockServer {
+    let m = wiremock::MockServer::start().await;
+    mount_jwks(&m, keys).await;
+    m
+}
+
+async fn mount_jwks(m: &wiremock::MockServer, keys: &[&AccessKey]) {
+    use wiremock::matchers::{method, path};
+    let keys: Vec<Value> = keys.iter().map(|k| k.jwk()).collect();
+    wiremock::Mock::given(method("GET"))
+        .and(path("/cdn-cgi/access/certs"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "keys": keys, "public_cert": {}, "public_certs": [] })),
+        )
+        .mount(m)
+        .await;
+}
+
+/// Admin servers behind Access; `Servers::http` sends `token` (if any).
+async fn access_servers(jwks: &wiremock::MockServer, token: Option<&str>) -> Servers {
+    let mut h = reqwest::header::HeaderMap::new();
+    if let Some(t) = token {
+        h.insert("cf-access-jwt-assertion", t.parse().unwrap());
+    }
+    servers_opts(
+        &[
+            ("ADMIN_CF_ACCESS_TEAM", CF_TEAM),
+            ("ADMIN_CF_ACCESS_AUD", &format!("other,{CF_AUD}")),
+        ],
+        Some(format!("{}/cdn-cgi/access/certs", jwks.uri())),
+        h,
+    )
+    .await
+}
+
+async fn status_with(s: &Servers, path: &str, header: Option<(&str, &str)>) -> u16 {
+    let mut r = reqwest::Client::new().get(format!("{}{path}", s.admin));
+    if let Some((k, v)) = header {
+        r = r.header(k, v);
+    }
+    let resp = r.send().await.unwrap();
+    let st = resp.status().as_u16();
+    if st == 404 {
+        assert_security_headers(resp.headers());
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body, json!({ "error": "not_found" }));
+    }
+    st
+}
+
+#[tokio::test]
+async fn cf_access_valid_token_reaches_login_and_email_is_recorded() {
+    let k1 = AccessKey::new("k1", RSA_KEY_1);
+    let jwks = jwks_mock(&[&k1]).await;
+    let s = access_servers(&jwks, Some(&k1.sign(&cf_claims()))).await;
+    assert_eq!(s.get("/admin/login", None).await.0, 200);
+    let token = s.login().await;
+    assert_eq!(s.get("/admin/", Some(&token)).await.0, 200);
+    // Without the Access token even a valid session gets 404.
+    let r = reqwest::Client::new()
+        .get(format!("{}/admin/", s.admin))
+        .header("cookie", format!("mc_admin={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    s.flush().await;
+    let rows: Vec<(String, Option<String>)> = s
+        .db(|c| {
+            let mut st = c
+                .prepare("SELECT kind, detail FROM events WHERE kind IN ('admin_login', 'admin_denied') ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        })
+        .await;
+    assert_eq!(
+        rows,
+        [
+            ("admin_login".into(), Some("ops@example.com".into())),
+            ("admin_denied".into(), Some("cf_access_missing".into())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cf_access_refuses_missing_and_invalid_tokens() {
+    let k1 = AccessKey::new("k1", RSA_KEY_1);
+    let k2 = AccessKey::new("k2", RSA_KEY_2);
+    let jwks = jwks_mock(&[&k1]).await;
+    let s = access_servers(&jwks, None).await;
+    let hdr = "cf-access-jwt-assertion";
+    let with = |f: &dyn Fn(&mut Value)| {
+        let mut c = cf_claims();
+        f(&mut c);
+        k1.sign(&c)
+    };
+    let valid = k1.sign(&cf_claims());
+    for path in ["/admin/login", "/admin/", "/nope"] {
+        assert_eq!(status_with(&s, path, None).await, 404, "missing on {path}");
+    }
+    assert_eq!(
+        status_with(&s, "/admin/login", Some((hdr, &valid))).await,
+        200
+    );
+    let bad: Vec<(&str, String)> = vec![
+        ("wrong aud", with(&|c| c["aud"] = json!(["someone-else"]))),
+        (
+            "no aud",
+            with(&|c| drop(c.as_object_mut().unwrap().remove("aud"))),
+        ),
+        (
+            "wrong iss",
+            with(&|c| c["iss"] = json!("https://evil.cloudflareaccess.com")),
+        ),
+        ("expired", with(&|c| c["exp"] = json!(T0 - 61))),
+        (
+            "no exp",
+            with(&|c| drop(c.as_object_mut().unwrap().remove("exp"))),
+        ),
+        ("nbf future", with(&|c| c["nbf"] = json!(T0 + 61))),
+        ("iat future", with(&|c| c["iat"] = json!(T0 + 61))),
+        // Signed by a key that is not in the JWKS but claims kid k1.
+        ("bad signature", {
+            let forged = AccessKey {
+                kid: "k1",
+                pair: k2.pair,
+            };
+            forged.sign(&cf_claims())
+        }),
+        ("tampered", {
+            let mut p: Vec<&str> = valid.split('.').collect();
+            let other = with(&|c| c["email"] = json!("root@example.com"));
+            p[1] = other.split('.').nth(1).unwrap();
+            p.join(".")
+        }),
+        ("garbage", "not.a.jwt".into()),
+    ];
+    for (name, tok) in &bad {
+        assert_eq!(
+            status_with(&s, "/admin/login", Some((hdr, tok))).await,
+            404,
+            "{name}"
+        );
+    }
+    // Leeway: 60 s either side is accepted.
+    let edge = with(&|c| {
+        c["exp"] = json!(T0 - 59);
+        c["nbf"] = json!(T0 + 59);
+        c["aud"] = json!(CF_AUD);
+    });
+    assert_eq!(
+        status_with(&s, "/admin/login", Some((hdr, &edge))).await,
+        200
+    );
+}
+
+#[tokio::test]
+async fn cf_access_cookie_fallback() {
+    let k1 = AccessKey::new("k1", RSA_KEY_1);
+    let jwks = jwks_mock(&[&k1]).await;
+    let s = access_servers(&jwks, None).await;
+    let tok = k1.sign(&cf_claims());
+    let cookie = format!("x=1; CF_Authorization={tok}");
+    assert_eq!(
+        status_with(&s, "/admin/login", Some(("cookie", &cookie))).await,
+        200
+    );
+    let bad = format!("CF_Authorization={}", k1.sign(&json!({ "iss": CF_ISS })));
+    assert_eq!(
+        status_with(&s, "/admin/login", Some(("cookie", &bad))).await,
+        404
+    );
+}
+
+#[tokio::test]
+async fn cf_access_unknown_kid_refreshes_keys_rate_limited() {
+    let k1 = AccessKey::new("k1", RSA_KEY_1);
+    let k2 = AccessKey::new("k2", RSA_KEY_2);
+    let jwks = jwks_mock(&[&k1]).await;
+    let s = access_servers(&jwks, None).await;
+    let hdr = "cf-access-jwt-assertion";
+    let t2 = k2.sign(&cf_claims());
+    let fetches = || async { jwks.received_requests().await.unwrap().len() };
+    assert_eq!(fetches().await, 1, "fetched at startup");
+
+    // Rotation: Cloudflare now publishes k2 as well.
+    jwks.reset().await;
+    mount_jwks(&jwks, &[&k1, &k2]).await;
+    // Within a minute of the last fetch: no refetch, still refused.
+    assert_eq!(status_with(&s, "/admin/login", Some((hdr, &t2))).await, 404);
+    assert_eq!(fetches().await, 0);
+    s.set_time(T0 + 61);
+    assert_eq!(status_with(&s, "/admin/login", Some((hdr, &t2))).await, 200);
+    assert_eq!(fetches().await, 1, "unknown kid triggered one refresh");
+    // Known keys: no more fetches; another unknown kid is rate-limited.
+    let k3 = AccessKey {
+        kid: "k3",
+        pair: AccessKey::new("x", RSA_KEY_1).pair,
+    };
+    for _ in 0..3 {
+        assert_eq!(status_with(&s, "/admin/login", Some((hdr, &t2))).await, 200);
+        let t3 = k3.sign(&cf_claims());
+        assert_eq!(status_with(&s, "/admin/login", Some((hdr, &t3))).await, 404);
+    }
+    assert_eq!(fetches().await, 1);
+}
+
+#[tokio::test]
+async fn cf_access_without_keys_fails_closed_but_public_api_runs() {
+    use wiremock::matchers::method;
+    let k1 = AccessKey::new("k1", RSA_KEY_1);
+    let jwks = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .mount(&jwks)
+        .await;
+    let s = access_servers(&jwks, None).await;
+    let tok = k1.sign(&cf_claims());
+    let hdr = "cf-access-jwt-assertion";
+    assert_eq!(
+        status_with(&s, "/admin/login", Some((hdr, &tok))).await,
+        404
+    );
+    let health = reqwest::get(format!("{}/healthz", s.public)).await.unwrap();
+    assert_eq!(health.status(), 200);
+    // Cloudflare is back: the next attempt (a minute later) recovers.
+    jwks.reset().await;
+    mount_jwks(&jwks, &[&k1]).await;
+    s.set_time(T0 + 61);
+    assert_eq!(
+        status_with(&s, "/admin/login", Some((hdr, &tok))).await,
+        200
+    );
+}
+
+#[tokio::test]
+async fn cf_access_disabled_keeps_existing_behaviour() {
+    // Env unset: an Access header is neither needed nor checked.
+    let s = servers(&[]).await;
+    assert_eq!(status_with(&s, "/admin/login", None).await, 200);
+    assert_eq!(
+        status_with(
+            &s,
+            "/admin/login",
+            Some(("cf-access-jwt-assertion", "garbage"))
+        )
+        .await,
+        200
+    );
+    s.login().await;
 }

@@ -438,7 +438,10 @@ no JavaScript; JSON mirrors under `/admin/api/` and a CSV export of the daily ag
 | `ADMIN_PASSWORD_HASH` | required | argon2id PHC string from `admin-setup`. |
 | `ADMIN_TOTP_SECRET` | required | Base32 TOTP secret (RFC 6238, SHA-1, 6 digits, 30 s) from `admin-setup`. |
 | `ADMIN_ALLOW_IPS` | required | Comma-separated CIDRs (IPv4 / IPv6; a bare IP is a /32 or /128) allowed to reach the panel, checked on the real client IP from `TRUST_PROXY`. Anyone else gets the same plain `404` as an unknown public route. Empty: the panel does not start. |
-| `ADMIN_ALLOW_ANY` | `false` | `true` allows every IP when `ADMIN_ALLOW_IPS` is empty (only behind Cloudflare Access). |
+| `ADMIN_ALLOW_ANY` | `false` | `true` allows every IP when `ADMIN_ALLOW_IPS` is empty. Only together with `ADMIN_CF_ACCESS_*` (or `ADMIN_ALLOW_ANY_WITHOUT_ACCESS=true`). |
+| `ADMIN_CF_ACCESS_TEAM` | unset | Cloudflare Zero Trust team name (`j23`) or team domain (`j23.cloudflareaccess.com`). With `ADMIN_CF_ACCESS_AUD`, every admin request must carry a valid Cloudflare Access JWT, else `404` (see below). Set both or neither. |
+| `ADMIN_CF_ACCESS_AUD` | unset | Application Audience (AUD) tag(s) of the Access application, comma-separated. |
+| `ADMIN_ALLOW_ANY_WITHOUT_ACCESS` | unset | `ADMIN_ALLOW_ANY=true` without `ADMIN_CF_ACCESS_*`: unset starts the panel with a loud `SECURITY` warning (a future release will refuse), `true` accepts it explicitly (still warns), `false` refuses to start the panel. |
 | `ADMIN_SESSION_HOURS` | `12` | Absolute session lifetime. Sessions are in memory: a restart logs you out. |
 | `ADMIN_EVENTS_RETENTION_DAYS` | `30` | Raw metric events; daily aggregates are kept 400 days. Cleanup runs hourly. |
 
@@ -452,7 +455,9 @@ no JavaScript; JSON mirrors under `/admin/api/` and a CSV export of the daily ag
    `CF-Connecting-IP` from anywhere else is ignored. Do not put the cloudflared network itself in
    `ADMIN_ALLOW_IPS`.
 3. Recommended: put a **Cloudflare Access** application (Zero Trust -> Access -> Applications,
-   self-hosted, your e-mail / IdP) in front of the admin hostname as an extra layer. The panel's own
+   self-hosted, your e-mail / IdP) in front of the admin hostname as an extra layer, and set
+   `ADMIN_CF_ACCESS_TEAM` + `ADMIN_CF_ACCESS_AUD` (the AUD tag is on the application's Overview
+   page) so the server itself refuses requests that did not pass Access. The panel's own
    allowlist, password and TOTP still apply behind it.
 4. Optional WAF rule on the admin hostname: block everything not starting with `/admin`.
 
@@ -462,11 +467,34 @@ ADMIN_USER=admin
 ADMIN_PASSWORD_HASH='$argon2id$v=19$m=19456,t=2,p=1$...'
 ADMIN_TOTP_SECRET=...
 ADMIN_ALLOW_IPS=203.0.113.7/32,2001:db8:1234::/48
+# or, behind Cloudflare Access instead of an IP allowlist:
+# ADMIN_ALLOW_ANY=true
+# ADMIN_CF_ACCESS_TEAM=myteam
+# ADMIN_CF_ACCESS_AUD=<application AUD tag>
 ```
+
+### Cloudflare Access JWT check
+
+With `ADMIN_CF_ACCESS_TEAM` and `ADMIN_CF_ACCESS_AUD` set, the server verifies the token Access
+adds to every request, following Cloudflare's
+[Validate JWTs](https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/)
+guide:
+
+- Token from the `Cf-Access-Jwt-Assertion` header, else the `CF_Authorization` cookie.
+- RS256 only; the key is picked by `kid` from `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`
+  (JWKS `keys`). `iss` must be `https://<team>.cloudflareaccess.com`, `aud` must contain a configured
+  AUD tag, `exp` is required and `exp` / `nbf` / `iat` are checked with 60 s leeway.
+- Keys are cached in memory and refreshed hourly and on an unknown `kid` (key rotation), at most
+  one fetch per minute. If they cannot be fetched (also at startup) the panel answers `404` to
+  everything and retries every minute; the public API is not affected.
+- Missing or invalid token: the same plain `404` as the allowlist, logged as `admin_denied` with the
+  reason (`cf_access_missing`, `cf_access_expired`, ...). Tokens are never logged. The verified
+  `email` claim is stored with admin login events (Security page); no other claim is kept.
 
 ### Security model
 
-- **Access, in order**: IP allowlist (real client IP via `TRUST_PROXY`, else `404`), login form with
+- **Access, in order**: IP allowlist (real client IP via `TRUST_PROXY`, else `404`), Cloudflare
+  Access JWT when configured (else `404`), login form with
   user + argon2id password + **mandatory TOTP** (±1 step, a code is accepted once), then a 256-bit
   random session token in memory, cookie `mc_admin` (`HttpOnly; Secure; SameSite=Strict; Path=/`).
   The session id is replaced at login (no fixation).
