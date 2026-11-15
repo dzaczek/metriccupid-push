@@ -92,6 +92,9 @@ fn run() -> ExitCode {
 }
 
 async fn async_main(config: Config) -> Result<(), String> {
+    for w in metriccupid_push::config::cf_extra_warnings(&config.trust_proxy) {
+        tracing::warn!("SECURITY: {w}");
+    }
     let resolver = ClientIpResolver::from_config(&config.trust_proxy).await;
     let state = Arc::new(AppState::new(&config, resolver, Arc::new(SystemClock))?);
     spawn_cleanup(state.clone());

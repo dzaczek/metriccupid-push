@@ -73,7 +73,8 @@ none of them set, `/v1/notify` returns `404` and only v2 runs. The v2 variables 
 | `BIND` | `0.0.0.0:8080` | Listen address. |
 | `TRUST_PROXY` | `none` | How to find the client IP: `none` (TCP peer), `cloudflare`, or `xff:<cidr>[,<cidr>...]`. See [Client IP](#client-ip). |
 | `CF_REFRESH` | `false` | With `cloudflare`: fetch `cloudflare.com/ips-v4` and `ips-v6` at startup; on any error the built-in list is used. |
-| `CF_IPS_EXTRA` | empty | With `cloudflare`: extra CIDRs trusted to send `CF-Connecting-IP` (e.g. the cloudflared container network). |
+| `CF_IPS_EXTRA` | empty | With `cloudflare`: extra CIDRs trusted to send `CF-Connecting-IP`: the cloudflared container's own address as a `/32` (e.g. `172.30.53.20/32`, fixed in `docker-compose.yml`). An entry that contains a Docker bridge gateway (`x.y.z.1` of its network, e.g. a whole `/24`) is refused at startup, because host-published connections arrive from that address and could then forge the header; other subnets broader than `/29` (IPv6 `/125`) outside Cloudflare log a `SECURITY` warning. |
+| `CF_IPS_EXTRA_ALLOW_SUBNET` | `false` | `true` accepts a `CF_IPS_EXTRA` entry that contains the bridge gateway (only if nothing else can reach the relay through it). |
 | `MODE` | `selfhosted` | `selfhosted` or `hosted`. In `hosted`, `/v1/notify` returns `501`; v2 runs with the licence gate and the gateway endpoint (see [v2 configuration](#v2-configuration)). |
 | `ALLOW_EMERGENCY` | `false` | Allow priority `2` (Pushover emergency: repeats every 60 s for up to 1 h until acknowledged). Otherwise `403`. |
 | `DEDUP_WINDOW_SECS` | `300` | A second request with the same `dedup_key` inside this window is answered `deduplicated` and not sent. `0` disables. |
@@ -254,15 +255,24 @@ exposes them at `GET /v2/debug/pushes`.
 | `APNS_TOPIC` | `cat.sysop.MetricCupid` | iOS app bundle id (`apns-topic`). |
 | `GATEWAY_URL` | `https://push-metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. |
 | `GATEWAY_OPEN` | `false` | Hosted only: relay APNs for self-hosted servers (`/v2/gateway/push`). Off by default; while off, gateway registrations and pushes get `403 gateway_closed`, so self-hosters need their own APNs key. |
+| `GATEWAY_REQUIRE_LICENCE` | `false` | Hosted gateway, strict mode: a `gateway: true` registration needs a valid licence (`402 licence_required` without one, `403` for an invalid or revoked one). Off (compatible): a licence is optional and only doubles the gateway quotas. Shipped Macs (1.33.3) never send a licence to a self-hosted server, so turn this on only after a Mac release that does. |
+| `GATEWAY_SANDBOX_LICENCES_COUNT` | `true` | TestFlight (`sandbox`) licences count as licensed for the gateway (quotas, strict mode). `false`: only App Store (`production`) purchases do. |
+| `GATEWAY_ACTIVITY_LINES` | `false` | Keep the Live Activity host/service `lines` on gateway pushes. Off: they are dropped (counts, `start` and its fixed alert stay), so gateway callers cannot put arbitrary text on a Lock Screen. |
+| `GATEWAY_APNS_SANDBOX` | `false` | Accept gateway pushes with `env: sandbox` (Xcode development builds only); otherwise `400`. App Store and TestFlight builds use production APNs. |
+| `GATEWAY_GLOBAL_PER_SEC` / `_BURST` | `20` / `100` | Bucket shared by all gateway pushes. Gateway pushes do not draw from `RATE_GLOBAL_*`, so they cannot starve hosted users. |
+| `GATEWAY_GROUP_PER_HOUR` / `_BURST` | `600` / `100` | Per gateway group and hour, on top of `RATE_V2_GATEWAY_*`. Licensed groups get twice both. |
+| `GATEWAY_MAX_TOKENS_PER_GROUP` | `30` | Distinct device / activity tokens one gateway group may push to; more get `429 token_limit`. |
+| `GATEWAY_MAX_GROUPS` | `2000` | Gateway groups in total; new ones beyond get `503 gateway_full`. |
+| `LICENCE_REVOKED_TX` | empty | Comma-separated purchase ids (`appTransactionId`) refused with `403 licence_invalid` (`reason: revoked`). Never logged. |
 | `DATA_DIR` | `/data` | Directory for the SQLite database (`metriccupid-push.sqlite3`, WAL). Must be writable. |
 | `LICENCE_MODE` | `app_transaction` in hosted, `open` self-hosted | `MODE=hosted` only. `app_transaction`: a group needs a verified App Store purchase of the app (StoreKit `AppTransaction` JWS) to register and to send; unlicensed groups can still read. `open`: anyone (open beta). Self-hosted servers never require a licence. See PROTOCOL.md section 13. |
 | `HOSTED_OPEN_REGISTRATION` | `false` | Alias: `true` means `LICENCE_MODE=open` (an error together with `LICENCE_MODE=app_transaction`). |
 | `LICENCE_ALLOW_SANDBOX` | `true` | Accept TestFlight (`Sandbox`) transactions. `Xcode` transactions are always refused. Set `false` after the beta. |
-| `LICENCE_MAX_GROUPS` | `3` | Groups one purchase may be attached to; more get `403 licence_in_use`. |
+| `LICENCE_MAX_GROUPS` | `3` | Groups one purchase may be attached to; more get `403 licence_in_use`. Independently, one purchase is attached to at most 3 new groups per 24 h (deleting a group does not give that back). |
 | `LICENCE_GRACE_UNTIL` | empty | RFC 3339 time or `YYYY-MM-DD` (UTC). Until then groups without a licence may still send, so beta groups keep working while their Macs attach one. |
 | `RATE_V2_MESSAGES_PER_SEC` / `_BURST` | `2` / `60` | Per-group bucket for `POST /v2/messages`. |
 | `RATE_V2_COMMANDS_PER_SEC` / `_BURST` | `1` / `20` | Per-group bucket for `POST /v2/commands`. |
-| `RATE_V2_GATEWAY_PER_SEC` / `_BURST` | `5` / `50` | Hosted: per-group bucket for gateway pushes. |
+| `RATE_V2_GATEWAY_PER_SEC` / `_BURST` | `1` / `30` | Hosted: per-group bucket for gateway pushes (licensed groups: twice). |
 | `RATE_V2_GROUPS_PER_HOUR` / `RATE_V2_GROUPS_BURST` | `6` / `3` | Per-IP bucket for `POST /v2/groups`. |
 | `WS_PING_SECS` | `30` | WebSocket ping interval; idle streams are closed after 2 intervals + 5 s. |
 | `V2_SNAPSHOT_MAX_BYTES` | `196608` | Max base64 length of a snapshot's `sealed` (`POST /v2/snapshot`, the iPhone's Active tab; PROTOCOL.md 6.6a). 1024 to 1048576. Only that route accepts bodies above 16 KB. |
@@ -360,10 +370,12 @@ No inbound port, the origin IP stays private.
    ```
    TUNNEL_TOKEN=<token>
    TRUST_PROXY=cloudflare
-   CF_IPS_EXTRA=172.30.53.0/24
+   CF_IPS_EXTRA=172.30.53.20/32
    ```
-   `172.30.53.0/24` is the Compose network (fixed in `docker-compose.yml`). Requests reach the relay
-   from the cloudflared container, and `CF-Connecting-IP` is set by Cloudflare's edge.
+   `172.30.53.20` is the cloudflared container's fixed address (`docker-compose.yml`). Trust only that
+   address, not the whole Compose network: connections to the host-published port arrive from the
+   network's gateway (`172.30.53.1`) and could otherwise forge `CF-Connecting-IP`. The relay refuses
+   a `CF_IPS_EXTRA` that contains the gateway unless `CF_IPS_EXTRA_ALLOW_SUBNET=true`.
 4. `docker compose --profile tunnel up -d`
 
 Check the relay logs: `client_ip` should show real client addresses, not `172.30.53.x`. If you leave
@@ -450,8 +462,9 @@ no JavaScript; JSON mirrors under `/admin/api/` and a CSV export of the daily ag
 1. In the tunnel, add a **second public hostname**, e.g. `push-admin.sysop.cat`, service
    `http://metriccupid-rust:8081` (the container name and `ADMIN_BIND` port; cloudflared reaches it
    over the Docker network, nothing is published on the host).
-2. Keep `TRUST_PROXY=cloudflare` and `CF_IPS_EXTRA=<cloudflared network>` (e.g.
-   `172.31.250.0/24`): the allowlist then sees the visitor's `CF-Connecting-IP`. A forged
+2. Keep `TRUST_PROXY=cloudflare` and `CF_IPS_EXTRA=<cloudflared container address>/32` (e.g.
+   `172.31.250.20/32`, with a fixed `ipv4_address` for cloudflared; not the whole network): the
+   allowlist then sees the visitor's `CF-Connecting-IP`. A forged
    `CF-Connecting-IP` from anywhere else is ignored. Do not put the cloudflared network itself in
    `ADMIN_ALLOW_IPS`.
 3. Recommended: put a **Cloudflare Access** application (Zero Trust -> Access -> Applications,

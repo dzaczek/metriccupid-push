@@ -91,6 +91,8 @@ async fn server_at(data: &Path, overrides: &[(&str, &str)], clock: Arc<TestClock
         ("RATE_V2_GROUPS_BURST".into(), "20".into()),
         ("RATE_V2_MESSAGES_BURST".into(), "100".into()),
         ("RATE_V2_COMMANDS_BURST".into(), "100".into()),
+        // Test devices register with `apns_env: sandbox`.
+        ("GATEWAY_APNS_SANDBOX".into(), "true".into()),
     ]);
     for (k, v) in overrides {
         env.insert(k.to_string(), v.to_string());
@@ -1049,6 +1051,22 @@ async fn gateway_rejects_unknown_groups_licence_and_rate() {
         .call(move |conn| store::create_group(conn, &g, &key, T0))
         .await
         .unwrap();
+    // A plain hosted group is not a gateway group.
+    let mut j0 = job.clone();
+    j0["message"]["id"] = json!("j0");
+    let r = c.post("/v2/gateway/push", &j0).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("not_gateway_group"))
+    );
+    let g = c.group_id.clone();
+    hosted
+        .state
+        .v2()
+        .store
+        .call(move |conn| store::put_gateway_group(conn, &g, false, T0))
+        .await
+        .unwrap();
     let mut evil = job.clone();
     evil["payload"] = json!({"aps": {"alert": "Your account is locked"}});
     assert_eq!(c.post("/v2/gateway/push", &evil).await.status, 400);
@@ -1953,6 +1971,15 @@ async fn one_purchase_links_at_most_three_groups_and_delete_frees_one() {
     );
     assert_eq!(first.get("/v2/status").await.status, 401, "group is gone");
 
+    // The freed slot is usable, but only 3 new attaches per purchase per 24 h.
+    let r = fourth
+        .create_group_with(json!({"licence": lic("shared")}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("licence_in_use"))
+    );
+    s.set_time(T0 + 86_401);
     let r = fourth
         .create_group_with(json!({"licence": lic("shared")}))
         .await;
@@ -2452,4 +2479,513 @@ async fn heartbeat_goes_through_the_gateway() {
         pushes[0].payload,
         json!({"aps": {"content-available": 1}, "mc": {"id": "hb-gw", "t": "heartbeat"}})
     );
+}
+
+// ------------------------------------------------- gateway hardening (0.2.1)
+
+const GW_OPEN: &[(&str, &str)] = &[
+    ("MODE", "hosted"),
+    ("HOSTED_OPEN_REGISTRATION", "true"),
+    ("GATEWAY_OPEN", "true"),
+];
+
+fn with<'a>(base: &[(&'a str, &'a str)], more: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut v = base.to_vec();
+    v.extend_from_slice(more);
+    v
+}
+
+/// A gateway group registered directly on the hosted server (as a
+/// self-hosted server would), signing jobs with an empty device line.
+async fn gw_group(s: &Server, seed: u8, extra: Value) -> Client {
+    let c = s.group(seed);
+    let mut body = json!({"gateway": true});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let r = c.create_group_with(body).await;
+    assert!(matches!(r.status, 200 | 201), "{:?}", r.json);
+    Client {
+        device_id: String::new(),
+        ..c
+    }
+}
+
+fn gw_msg(token: &str, id: &str) -> Value {
+    json!({
+        "device_token": token, "env": "production",
+        "message": {"id": id, "t": "alert", "s": STANDARD.encode([0u8; 40])},
+        "urgency": "normal", "expiration": 0,
+    })
+}
+
+fn tok(n: u32) -> String {
+    format!("{n:064x}")
+}
+
+async fn member(s: &Server, group: &str) -> Option<bool> {
+    let g = group.to_string();
+    s.state
+        .v2()
+        .store
+        .call(move |c| store::gateway_member(c, &g))
+        .await
+        .unwrap()
+}
+
+fn sandbox_licence(id: &str) -> Value {
+    let mut p = common::licence::app_transaction(id, T0);
+    p["receiptType"] = json!("Sandbox");
+    json!({"kind": "app_transaction", "jws": common::licence::CHAIN.sign(&p)})
+}
+
+// 0.6 test 1 (lead #1)
+#[tokio::test]
+async fn gateway_drops_live_activity_lines_but_keeps_start_alert() {
+    let job = |lines: bool| {
+        let mut state = json!({"critical": 2, "warning": 0, "unknown": 0, "mac_online": true,
+                               "updated_at": T0});
+        if lines {
+            state["lines"] = json!([{"severity": "critical", "text": "Call +1 555 0100 now"}]);
+        }
+        json!({"device_token": ACT_A, "env": "production", "urgency": "critical", "expiration": 0,
+               "activity": {"event": "start", "timestamp": T0, "state": state}})
+    };
+    let (_d, s) = server(GW_OPEN).await;
+    let gw = gw_group(&s, 1, json!({})).await;
+    let r = gw.post("/v2/gateway/push", &job(true)).await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    let p = activity_pushes(&s).pop().unwrap();
+    let aps = &p.payload["aps"];
+    assert!(aps["content-state"].get("lines").is_none(), "{aps}");
+    assert_eq!(aps["content-state"]["critical"], 2);
+    assert_eq!(aps["event"], "start");
+    assert_eq!(
+        aps["alert"],
+        json!({"title": "MetricCupid", "body": "2 critical alerts"})
+    );
+
+    // GATEWAY_ACTIVITY_LINES=true keeps them.
+    let (_d2, s2) = server(&with(GW_OPEN, &[("GATEWAY_ACTIVITY_LINES", "true")])).await;
+    let gw = gw_group(&s2, 1, json!({})).await;
+    assert_eq!(gw.post("/v2/gateway/push", &job(true)).await.status, 200);
+    let p = activity_pushes(&s2).pop().unwrap();
+    assert_eq!(
+        p.payload["aps"]["content-state"]["lines"][0]["text"],
+        "Call +1 555 0100 now"
+    );
+}
+
+// 0.6 test 2 (G1)
+#[tokio::test]
+async fn hosted_group_cannot_use_the_gateway() {
+    let (_d, s) = server(GW_OPEN).await;
+    let (mac, _) = setup(&s, 10).await;
+    let gw = Client {
+        device_id: String::new(),
+        ..mac.clone()
+    };
+    let r = gw.post("/v2/gateway/push", &gw_msg(TOKEN_B, "x")).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("not_gateway_group"))
+    );
+    assert!(s.mock().pushes().is_empty());
+}
+
+// 0.6 test 3 (G5)
+#[tokio::test]
+async fn closed_gateway_refuses_registration_even_with_a_licence() {
+    let (_d, s) = server(HOSTED).await;
+    let c = s.group(12);
+    let r = c
+        .create_group_with(json!({"gateway": true, "licence": lic("p-closed")}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("gateway_closed"))
+    );
+    let g = c.group_id.clone();
+    let key = s
+        .state
+        .v2()
+        .store
+        .call(move |conn| store::group_key(conn, &g))
+        .await
+        .unwrap();
+    assert_eq!(key, None, "no group created");
+}
+
+#[tokio::test]
+async fn gateway_group_count_is_capped() {
+    let (_d, s) = server(&with(GW_OPEN, &[("GATEWAY_MAX_GROUPS", "1")])).await;
+    let first = gw_group(&s, 14, json!({})).await;
+    let r = s
+        .group(16)
+        .create_group_with(json!({"gateway": true}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (503, Some("gateway_full"))
+    );
+    assert_eq!(member(&s, &id128(16)).await, None);
+    // A retry by an existing member still works.
+    gw_group(&s, 14, json!({})).await;
+    assert_eq!(member(&s, &first.group_id).await, Some(false));
+}
+
+// 0.6 test 4 (G3)
+#[tokio::test]
+async fn gateway_refuses_hosted_device_and_activity_tokens() {
+    let (_d, s) = server(GW_OPEN).await;
+    let (_mac, phone) = setup(&s, 20).await;
+    assert_eq!(put_token(&phone, "", ACT_A, None).await, 201);
+    let gw = gw_group(&s, 30, json!({})).await;
+    for (t, id) in [(TOKEN_A, "a"), (ACT_A, "b")] {
+        let r = gw.post("/v2/gateway/push", &gw_msg(t, id)).await;
+        assert_eq!(
+            (r.status, r.json["error"].as_str()),
+            (403, Some("token_bound")),
+            "{t}"
+        );
+    }
+    assert!(s.mock().pushes().is_empty());
+    assert_eq!(
+        gw.post("/v2/gateway/push", &gw_msg(TOKEN_B, "c"))
+            .await
+            .status,
+        200
+    );
+}
+
+// 0.6 test 5 (G3)
+#[tokio::test]
+async fn gateway_token_binding_moves_only_after_24h_idle() {
+    let (_d, s) = server(GW_OPEN).await;
+    let a = gw_group(&s, 40, json!({})).await;
+    let b = gw_group(&s, 42, json!({})).await;
+    assert_eq!(
+        a.post("/v2/gateway/push", &gw_msg(TOKEN_B, "a1"))
+            .await
+            .status,
+        200
+    );
+    let r = b.post("/v2/gateway/push", &gw_msg(TOKEN_B, "b1")).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("token_bound"))
+    );
+    s.set_time(T0 + 86_400);
+    assert_eq!(
+        b.post("/v2/gateway/push", &gw_msg(TOKEN_B, "b2"))
+            .await
+            .status,
+        403
+    );
+    s.set_time(T0 + 86_401);
+    assert_eq!(
+        b.post("/v2/gateway/push", &gw_msg(TOKEN_B, "b3"))
+            .await
+            .status,
+        200
+    );
+    let r = a.post("/v2/gateway/push", &gw_msg(TOKEN_B, "a2")).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("token_bound"))
+    );
+    // 410 forgets the binding, so the token is free again.
+    s.mock().mark_unregistered(TOKEN_B);
+    assert_eq!(
+        b.post("/v2/gateway/push", &gw_msg(TOKEN_B, "b4"))
+            .await
+            .status,
+        410
+    );
+    let n: i64 = s
+        .state
+        .v2()
+        .store
+        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM gateway_tokens", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+// 0.6 test 6 (G6)
+#[tokio::test]
+async fn gateway_caps_tokens_per_group_and_rebinds_per_day() {
+    let (_d, s) = server(&with(
+        GW_OPEN,
+        &[
+            ("RATE_V2_GATEWAY_BURST", "100"),
+            ("GATEWAY_GLOBAL_BURST", "1000"),
+        ],
+    ))
+    .await;
+    let c = gw_group(&s, 50, json!({})).await;
+    for i in 0..30 {
+        let r = c
+            .post("/v2/gateway/push", &gw_msg(&tok(i), &format!("c{i}")))
+            .await;
+        assert_eq!(r.status, 200, "{i}: {:?}", r.json);
+    }
+    let r = c.post("/v2/gateway/push", &gw_msg(&tok(30), "c30")).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (429, Some("token_limit"))
+    );
+    // A known token still works at the cap.
+    assert_eq!(
+        c.post("/v2/gateway/push", &gw_msg(&tok(0), "c0b"))
+            .await
+            .status,
+        200
+    );
+
+    let a = gw_group(&s, 52, json!({})).await;
+    let b = gw_group(&s, 54, json!({})).await;
+    for i in 100..111 {
+        let r = a
+            .post("/v2/gateway/push", &gw_msg(&tok(i), &format!("a{i}")))
+            .await;
+        assert_eq!(r.status, 200, "{i}: {:?}", r.json);
+    }
+    s.set_time(T0 + 86_401);
+    for i in 100..110 {
+        let r = b
+            .post("/v2/gateway/push", &gw_msg(&tok(i), &format!("b{i}")))
+            .await;
+        assert_eq!(r.status, 200, "rebind {i}: {:?}", r.json);
+    }
+    let r = b.post("/v2/gateway/push", &gw_msg(&tok(110), "b110")).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (429, Some("rebind_limit"))
+    );
+}
+
+// 0.6 test 7 (G4)
+#[tokio::test]
+async fn drained_gateway_bucket_does_not_starve_hosted_users() {
+    let (_d, s) = server(&with(
+        GW_OPEN,
+        &[
+            ("RATE_GLOBAL_PER_SEC", "1"),
+            ("RATE_GLOBAL_BURST", "10"),
+            ("GATEWAY_GLOBAL_PER_SEC", "1"),
+            ("GATEWAY_GLOBAL_BURST", "20"),
+        ],
+    ))
+    .await;
+    let gw = gw_group(&s, 60, json!({})).await;
+    // More gateway pushes than the hosted bucket holds.
+    for i in 0..20 {
+        let r = gw
+            .post("/v2/gateway/push", &gw_msg(TOKEN_B, &format!("g{i}")))
+            .await;
+        assert_eq!(r.status, 200, "{i}: {:?}", r.json);
+    }
+    let r = gw.post("/v2/gateway/push", &gw_msg(TOKEN_B, "g20")).await;
+    assert_eq!(r.status, 429);
+    assert!(r.headers.contains_key("retry-after"));
+    let (mac, _) = setup(&s, 62).await;
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "h1", "normal", 10))
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+}
+
+// 0.6 test 8
+#[tokio::test]
+async fn strict_gateway_needs_a_licence_and_honours_revocations() {
+    let (_d, s) = server(&with(
+        HOSTED,
+        &[
+            ("GATEWAY_OPEN", "true"),
+            ("GATEWAY_REQUIRE_LICENCE", "true"),
+            ("LICENCE_REVOKED_TX", "revoked-1"),
+        ],
+    ))
+    .await;
+    let r = s
+        .group(70)
+        .create_group_with(json!({"gateway": true}))
+        .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
+    assert_eq!(member(&s, &id128(70)).await, None);
+    let ok = s
+        .group(72)
+        .create_group_with(json!({"gateway": true, "licence": lic("p-gw")}))
+        .await;
+    assert_eq!(ok.status, 201, "{:?}", ok.json);
+    assert_eq!(member(&s, &id128(72)).await, Some(true), "licensed=1");
+    let r = s
+        .group(74)
+        .create_group_with(json!({"gateway": true, "licence": lic("revoked-1")}))
+        .await;
+    assert_eq!(
+        (
+            r.status,
+            r.json["error"].as_str(),
+            r.json["reason"].as_str()
+        ),
+        (403, Some("licence_invalid"), Some("revoked"))
+    );
+    assert!(!r.json.to_string().contains("revoked-1"));
+    // Revocation applies to hosted registrations too.
+    let r = s
+        .group(76)
+        .create_group_with(json!({"licence": lic("revoked-1")}))
+        .await;
+    assert_eq!(r.status, 403);
+
+    // A shipped Mac on a self-hosted server sends no licence: 402.
+    let (_d2, selfhosted) = server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &s.base)]).await;
+    let r = selfhosted.group(78).create_group().await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
+}
+
+#[tokio::test]
+async fn compatible_gateway_records_licence_and_doubles_quotas() {
+    let (_d, s) = server(&with(GW_OPEN, &[("RATE_V2_GATEWAY_BURST", "2")])).await;
+    let plain = gw_group(&s, 80, json!({})).await;
+    let paid = gw_group(&s, 82, json!({"licence": lic("p-compat")})).await;
+    assert_eq!(member(&s, &plain.group_id).await, Some(false));
+    assert_eq!(member(&s, &paid.group_id).await, Some(true));
+    let sent = |c: &Client, base: u32| {
+        let c = c.clone();
+        async move {
+            let mut n = 0;
+            for i in 0..10 {
+                let t = tok(base + i);
+                if c.post("/v2/gateway/push", &gw_msg(&t, &format!("q{i}")))
+                    .await
+                    .status
+                    != 200
+                {
+                    break;
+                }
+                n += 1;
+            }
+            n
+        }
+    };
+    assert_eq!(sent(&plain, 0).await, 2);
+    assert_eq!(sent(&paid, 100).await, 4, "licensed: 2x burst");
+}
+
+/// Coordinator decision: TestFlight licences count as licensed unless
+/// GATEWAY_SANDBOX_LICENCES_COUNT=false.
+#[tokio::test]
+async fn sandbox_licences_count_for_the_gateway_unless_switched_off() {
+    for (count, licensed) in [(None, true), (Some("true"), true), (Some("false"), false)] {
+        let mut env = with(GW_OPEN, &[("RATE_V2_GATEWAY_BURST", "2")]);
+        if let Some(v) = count {
+            env.push(("GATEWAY_SANDBOX_LICENCES_COUNT", v));
+        }
+        let (_d, s) = server(&env).await;
+        let gw = gw_group(&s, 84, json!({"licence": sandbox_licence("sb-1")})).await;
+        assert_eq!(member(&s, &gw.group_id).await, Some(licensed), "{count:?}");
+        let mut n = 0;
+        for i in 0..10 {
+            if gw
+                .post("/v2/gateway/push", &gw_msg(&tok(i), &format!("s{i}")))
+                .await
+                .status
+                != 200
+            {
+                break;
+            }
+            n += 1;
+        }
+        assert_eq!(n, if licensed { 4 } else { 2 }, "{count:?}");
+
+        // Strict mode follows the same switch.
+        let mut env = with(
+            HOSTED,
+            &[
+                ("GATEWAY_OPEN", "true"),
+                ("GATEWAY_REQUIRE_LICENCE", "true"),
+            ],
+        );
+        if let Some(v) = count {
+            env.push(("GATEWAY_SANDBOX_LICENCES_COUNT", v));
+        }
+        let (_d2, strict) = server(&env).await;
+        let r = strict
+            .group(86)
+            .create_group_with(json!({"gateway": true, "licence": sandbox_licence("sb-2")}))
+            .await;
+        assert_eq!(
+            r.status,
+            if licensed { 201 } else { 402 },
+            "{count:?}: {:?}",
+            r.json
+        );
+    }
+}
+
+// 0.6 test 9
+#[tokio::test]
+async fn gateway_refuses_sandbox_apns_env_by_default() {
+    let (_d, s) = server(&with(GW_OPEN, &[("GATEWAY_APNS_SANDBOX", "false")])).await;
+    let gw = gw_group(&s, 90, json!({})).await;
+    let mut job = gw_msg(TOKEN_B, "sb");
+    job["env"] = json!("sandbox");
+    let r = gw.post("/v2/gateway/push", &job).await;
+    assert_eq!(r.status, 400, "{:?}", r.json);
+    assert_eq!(
+        gw.post("/v2/gateway/push", &gw_msg(TOKEN_B, "pr"))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(s.mock().pushes().len(), 1);
+}
+
+// 0.6 test 11
+#[tokio::test]
+async fn self_hosted_alert_reaches_hosted_debug_pushes_through_hardened_gateway() {
+    let (_d1, hosted) = server(GW_OPEN).await;
+    let (_d2, selfhosted) =
+        server(&[("APNS_MODE", "gateway"), ("GATEWAY_URL", &hosted.base)]).await;
+    let (mac, _phone) = setup(&selfhosted, 100).await;
+    assert_eq!(member(&hosted, &mac.group_id).await, Some(false));
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "e2e-1", "critical", 20))
+        .await;
+    assert_eq!(r.json["pushed"], 1, "{:?}", r.json);
+    let text = reqwest::get(format!("{}/v2/debug/pushes", hosted.base))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let pushes = v["pushes"].as_array().unwrap();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0]["device_token"], TOKEN_A);
+    assert_eq!(pushes[0]["group_id"], mac.group_id.as_str());
+    let g = mac.group_id.clone();
+    let bound: String = hosted
+        .state
+        .v2()
+        .store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT token FROM gateway_tokens WHERE group_id = ?1",
+                [g],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(bound, TOKEN_A);
 }

@@ -17,7 +17,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use x509_parser::certificate::X509Certificate;
 
-use crate::config::LicenceMode;
+use crate::config::{LicenceMode, RevokedTx};
 
 /// Apple Root CA - G3, DER, from https://www.apple.com/certificateauthority/.
 /// SHA-256 pinned in the tests below.
@@ -65,6 +65,8 @@ pub enum LicenceError {
     WrongApp,
     /// `Xcode`, unknown, or `Sandbox` while `LICENCE_ALLOW_SANDBOX=false`.
     Environment,
+    /// The purchase id is in `LICENCE_REVOKED_TX`.
+    Revoked,
 }
 
 impl LicenceError {
@@ -80,6 +82,7 @@ impl LicenceError {
             Self::WrongBundle => "wrong_bundle",
             Self::WrongApp => "wrong_app",
             Self::Environment => "environment",
+            Self::Revoked => "revoked",
         }
     }
 }
@@ -122,9 +125,36 @@ pub struct LicencePolicy {
     /// self-hosted servers. Closed by default so nobody uses the operator's
     /// APNs key and quota without being let in explicitly.
     pub gateway_open: bool,
+    /// `GATEWAY_REQUIRE_LICENCE`: gateway registrations need a production
+    /// licence (strict). Off (compatible): a licence only raises the quotas.
+    pub gateway_require_licence: bool,
+    /// `GATEWAY_ACTIVITY_LINES`: keep Live Activity text lines on gateway pushes.
+    pub gateway_activity_lines: bool,
+    /// `GATEWAY_APNS_SANDBOX`: accept gateway pushes with `env=sandbox`.
+    pub gateway_apns_sandbox: bool,
+    /// `GATEWAY_SANDBOX_LICENCES_COUNT`: a TestFlight licence counts as
+    /// licensed for the gateway.
+    pub gateway_sandbox_licences_count: bool,
+    pub gateway_max_tokens_per_group: u32,
+    pub gateway_max_groups: u32,
+    /// `LICENCE_REVOKED_TX`. Never logged.
+    pub revoked: RevokedTx,
 }
 
 impl LicencePolicy {
+    /// The purchase is on the revocation list.
+    pub fn is_revoked(&self, lic: &VerifiedLicence) -> bool {
+        self.revoked.0.contains(&lic.app_transaction_id)
+    }
+
+    /// The licence counts for the gateway's higher quotas and strict mode:
+    /// production always, TestFlight (`sandbox`) while
+    /// `GATEWAY_SANDBOX_LICENCES_COUNT=true` (default).
+    pub fn gateway_licensed(&self, lic: &VerifiedLicence) -> bool {
+        lic.environment == "production"
+            || (lic.environment == "sandbox" && self.gateway_sandbox_licences_count)
+    }
+
     /// `POST /v2/groups` needs a licence (except gateway registrations).
     pub fn required_for_new_groups(&self) -> bool {
         self.mode == LicenceMode::AppTransaction
@@ -139,7 +169,11 @@ impl LicencePolicy {
         if req.kind != KIND_APP_TRANSACTION {
             return Err(LicenceError::UnsupportedKind);
         }
-        self.verifier.verify(&req.jws)
+        let v = self.verifier.verify(&req.jws)?;
+        if self.is_revoked(&v) {
+            return Err(LicenceError::Revoked);
+        }
+        Ok(v)
     }
 }
 

@@ -241,7 +241,15 @@ fn build_v2(
             max_groups: c.licence_max_groups,
             grace_until: c.licence_grace_until,
             gateway_open: c.gateway_open,
+            gateway_require_licence: c.gateway_require_licence,
+            gateway_activity_lines: c.gateway_activity_lines,
+            gateway_apns_sandbox: c.gateway_apns_sandbox,
+            gateway_sandbox_licences_count: c.gateway_sandbox_licences_count,
+            gateway_max_tokens_per_group: c.gateway_max_tokens_per_group,
+            gateway_max_groups: c.gateway_max_groups,
+            revoked: c.licence_revoked.clone(),
         },
+        gateway_sends: tokio::sync::Semaphore::new(v2::GATEWAY_MAX_IN_FLIGHT),
         ws_ping: c.ws_ping,
         presence: v2::presence::Presence::new(c.mac_offline_grace),
         activities: v2::activity::Activities::new(),
@@ -436,7 +444,7 @@ async fn handle_notify(
     }
 
     let now = state.clock.now();
-    if let Err(o) = precheck(state, ip, now) {
+    if let Err(o) = precheck(state, ip, now, GlobalClass::Hosted) {
         return o;
     }
 
@@ -515,10 +523,26 @@ async fn handle_notify(
     }
 }
 
+/// Which global bucket a request draws from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalClass {
+    /// Every route except the gateway: `RATE_GLOBAL_*`.
+    Hosted,
+    /// `POST /v2/gateway/push`: skips the hosted bucket; the gateway's own
+    /// `GATEWAY_GLOBAL_*` bucket is checked once the caller is known to be a
+    /// gateway group, so gateway traffic cannot starve hosted users.
+    Gateway,
+}
+
 /// Ban, per-IP and global checks, done before any authentication work.
 // The error is the finished HTTP response; it is only built on the cold path.
 #[allow(clippy::result_large_err)]
-pub(crate) fn precheck(state: &AppState, ip: IpAddr, now: u64) -> Result<(), Outcome> {
+pub(crate) fn precheck(
+    state: &AppState,
+    ip: IpAddr,
+    now: u64,
+    class: GlobalClass,
+) -> Result<(), Outcome> {
     let key = ip_key(ip);
     if let Some(secs) = state.bans.banned_for(key, now) {
         return Err((too_many(RetryAfter(secs)), "banned"));
@@ -526,8 +550,10 @@ pub(crate) fn precheck(state: &AppState, ip: IpAddr, now: u64) -> Result<(), Out
     if let Err(ra) = state.limits.check_ip(key) {
         return Err((too_many(ra), "rate_limited_ip"));
     }
-    if let Err(ra) = state.limits.check_global() {
-        return Err((too_many(ra), "rate_limited_global"));
+    if class == GlobalClass::Hosted {
+        if let Err(ra) = state.limits.check_global() {
+            return Err((too_many(ra), "rate_limited_global"));
+        }
     }
     Ok(())
 }

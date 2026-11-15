@@ -255,6 +255,14 @@ pub struct V2Limits {
     messages: DefaultKeyedRateLimiter<String>,
     commands: DefaultKeyedRateLimiter<String>,
     gateway: DefaultKeyedRateLimiter<String>,
+    /// Licensed gateway groups: twice `gateway` / `gateway_hourly`.
+    gateway_licensed: DefaultKeyedRateLimiter<String>,
+    gateway_hourly: DefaultKeyedRateLimiter<String>,
+    gateway_hourly_licensed: DefaultKeyedRateLimiter<String>,
+    /// All gateway pushes together (`GATEWAY_GLOBAL_*`).
+    gateway_global: DefaultDirectRateLimiter,
+    /// Token re-bindings per gateway group (10 per day).
+    gateway_rebind: DefaultKeyedRateLimiter<String>,
     activity: DefaultKeyedRateLimiter<String>,
     snapshot: DefaultKeyedRateLimiter<String>,
     heartbeat: DefaultKeyedRateLimiter<String>,
@@ -289,12 +297,38 @@ fn hourly(r: HourlyRate) -> Quota {
     Quota::per_hour(r.per_hour).allow_burst(r.burst)
 }
 
+/// Re-bindings of idle gateway tokens to another group, per group and day.
+pub const GATEWAY_REBINDS_PER_DAY: u32 = 10;
+
+/// One re-binding per 2.4 h, burst 10: at most 10 per day.
+pub fn gateway_rebind_quota() -> Quota {
+    let n = std::num::NonZeroU32::new(GATEWAY_REBINDS_PER_DAY).expect("non-zero");
+    Quota::with_period(Duration::from_secs(86_400 / u64::from(n.get())))
+        .expect("non-zero period")
+        .allow_burst(n)
+}
+
+fn double(n: std::num::NonZeroU32) -> std::num::NonZeroU32 {
+    n.saturating_mul(std::num::NonZeroU32::new(2).expect("non-zero"))
+}
+
 impl V2Limits {
     pub fn new(c: &V2Config) -> Self {
         Self {
             messages: RateLimiter::keyed(quota(c.rate_messages)),
             commands: RateLimiter::keyed(quota(c.rate_commands)),
             gateway: RateLimiter::keyed(quota(c.rate_gateway)),
+            gateway_licensed: RateLimiter::keyed(quota(Rate {
+                per_sec: double(c.rate_gateway.per_sec),
+                burst: double(c.rate_gateway.burst),
+            })),
+            gateway_hourly: RateLimiter::keyed(hourly(c.gateway_group_hourly)),
+            gateway_hourly_licensed: RateLimiter::keyed(hourly(HourlyRate {
+                per_hour: double(c.gateway_group_hourly.per_hour),
+                burst: double(c.gateway_group_hourly.burst),
+            })),
+            gateway_global: RateLimiter::direct(quota(c.gateway_global)),
+            gateway_rebind: RateLimiter::keyed(gateway_rebind_quota()),
             activity: RateLimiter::keyed(activity_quota()),
             snapshot: RateLimiter::keyed(snapshot_quota()),
             heartbeat: RateLimiter::keyed(heartbeat_quota()),
@@ -314,8 +348,27 @@ impl V2Limits {
             .map_err(retry_after)
     }
 
-    pub fn check_gateway(&self, group: &str) -> Result<(), RetryAfter> {
-        self.gateway
+    /// Per-group gateway buckets: per second, then per hour; licensed
+    /// groups get twice both.
+    pub fn check_gateway(&self, group: &str, licensed: bool) -> Result<(), RetryAfter> {
+        let key = group.to_string();
+        let (sec, hour) = if licensed {
+            (&self.gateway_licensed, &self.gateway_hourly_licensed)
+        } else {
+            (&self.gateway, &self.gateway_hourly)
+        };
+        sec.check_key(&key).map_err(retry_after)?;
+        hour.check_key(&key).map_err(retry_after)
+    }
+
+    /// The gateway's own global bucket.
+    pub fn check_gateway_global(&self) -> Result<(), RetryAfter> {
+        self.gateway_global.check().map_err(retry_after)
+    }
+
+    /// One more re-binding of an idle token to `group`.
+    pub fn check_gateway_rebind(&self, group: &str) -> Result<(), RetryAfter> {
+        self.gateway_rebind
             .check_key(&group.to_string())
             .map_err(retry_after)
     }
@@ -347,6 +400,10 @@ impl V2Limits {
             &self.messages,
             &self.commands,
             &self.gateway,
+            &self.gateway_licensed,
+            &self.gateway_hourly,
+            &self.gateway_hourly_licensed,
+            &self.gateway_rebind,
             &self.activity,
             &self.snapshot,
             &self.heartbeat,

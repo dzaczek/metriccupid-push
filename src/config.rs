@@ -96,6 +96,24 @@ pub struct V2Config {
     /// Unix seconds until which unlicensed groups may still send.
     pub licence_grace_until: Option<u64>,
     pub gateway_open: bool,
+    /// `GATEWAY_REQUIRE_LICENCE`: gateway registrations need a production
+    /// licence (strict mode). Off: a licence only raises the quotas.
+    pub gateway_require_licence: bool,
+    /// `GATEWAY_ACTIVITY_LINES`: keep Live Activity `lines` on gateway pushes.
+    pub gateway_activity_lines: bool,
+    /// `GATEWAY_APNS_SANDBOX`: accept gateway pushes with `env=sandbox`.
+    pub gateway_apns_sandbox: bool,
+    /// `GATEWAY_SANDBOX_LICENCES_COUNT`: TestFlight licences count as
+    /// licensed for the gateway (quotas, strict mode).
+    pub gateway_sandbox_licences_count: bool,
+    /// All gateway pushes together, apart from the hosted global bucket.
+    pub gateway_global: Rate,
+    /// Per gateway group and hour, on top of `rate_gateway`.
+    pub gateway_group_hourly: HourlyRate,
+    pub gateway_max_tokens_per_group: u32,
+    pub gateway_max_groups: u32,
+    /// `LICENCE_REVOKED_TX`: refused purchase ids.
+    pub licence_revoked: RevokedTx,
     pub rate_messages: Rate,
     pub rate_commands: Rate,
     pub rate_gateway: Rate,
@@ -106,6 +124,17 @@ pub struct V2Config {
     pub mac_offline_grace: u64,
     /// Max length (base64 characters) of a snapshot's `sealed`.
     pub snapshot_max_bytes: usize,
+}
+
+/// Revoked App Store purchase ids. `Debug` prints only the count: the ids
+/// are never logged.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RevokedTx(pub std::collections::HashSet<String>);
+
+impl fmt::Debug for RevokedTx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RevokedTx({} ids)", self.0.len())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +365,7 @@ impl Config {
             get("TRUST_PROXY").as_deref(),
             get("CF_REFRESH").as_deref(),
             get("CF_IPS_EXTRA").as_deref(),
+            get("CF_IPS_EXTRA_ALLOW_SUBNET"),
         )?;
 
         let pushover_api_url =
@@ -652,9 +682,54 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
             })
             .transpose()?,
         gateway_open: parse_bool("GATEWAY_OPEN", get("GATEWAY_OPEN"), false)?,
+        gateway_require_licence: parse_bool(
+            "GATEWAY_REQUIRE_LICENCE",
+            get("GATEWAY_REQUIRE_LICENCE"),
+            false,
+        )?,
+        gateway_activity_lines: parse_bool(
+            "GATEWAY_ACTIVITY_LINES",
+            get("GATEWAY_ACTIVITY_LINES"),
+            false,
+        )?,
+        gateway_apns_sandbox: parse_bool(
+            "GATEWAY_APNS_SANDBOX",
+            get("GATEWAY_APNS_SANDBOX"),
+            false,
+        )?,
+        gateway_sandbox_licences_count: parse_bool(
+            "GATEWAY_SANDBOX_LICENCES_COUNT",
+            get("GATEWAY_SANDBOX_LICENCES_COUNT"),
+            true,
+        )?,
+        gateway_global: Rate {
+            per_sec: parse_nonzero("GATEWAY_GLOBAL_PER_SEC", get("GATEWAY_GLOBAL_PER_SEC"), 20)?,
+            burst: parse_nonzero("GATEWAY_GLOBAL_BURST", get("GATEWAY_GLOBAL_BURST"), 100)?,
+        },
+        gateway_group_hourly: HourlyRate {
+            per_hour: parse_nonzero("GATEWAY_GROUP_PER_HOUR", get("GATEWAY_GROUP_PER_HOUR"), 600)?,
+            burst: parse_nonzero("GATEWAY_GROUP_BURST", get("GATEWAY_GROUP_BURST"), 100)?,
+        },
+        gateway_max_tokens_per_group: parse_nonzero(
+            "GATEWAY_MAX_TOKENS_PER_GROUP",
+            get("GATEWAY_MAX_TOKENS_PER_GROUP"),
+            30,
+        )?
+        .get(),
+        gateway_max_groups: parse_nonzero("GATEWAY_MAX_GROUPS", get("GATEWAY_MAX_GROUPS"), 2000)?
+            .get(),
+        licence_revoked: RevokedTx(
+            get("LICENCE_REVOKED_TX")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
         rate_messages: parse_rate(get, "V2_MESSAGES", 2, 60)?,
         rate_commands: parse_rate(get, "V2_COMMANDS", 1, 20)?,
-        rate_gateway: parse_rate(get, "V2_GATEWAY", 5, 50)?,
+        rate_gateway: parse_rate(get, "V2_GATEWAY", 1, 30)?,
         rate_groups: HourlyRate {
             per_hour: parse_nonzero("RATE_V2_GROUPS_PER_HOUR", get("RATE_V2_GROUPS_PER_HOUR"), 6)?,
             burst: parse_nonzero("RATE_V2_GROUPS_BURST", get("RATE_V2_GROUPS_BURST"), 3)?,
@@ -750,16 +825,32 @@ fn parse_trust_proxy(
     mode: Option<&str>,
     cf_refresh: Option<&str>,
     cf_extra: Option<&str>,
+    cf_extra_allow_subnet: Option<String>,
 ) -> Result<TrustProxy, ConfigError> {
     match mode {
         None | Some("none") => Ok(TrustProxy::None),
-        Some("cloudflare") => Ok(TrustProxy::Cloudflare {
-            refresh: parse_bool("CF_REFRESH", cf_refresh.map(str::to_string), false)?,
-            extra: match cf_extra {
+        Some("cloudflare") => {
+            let extra = match cf_extra {
                 Some(v) => parse_cidrs("CF_IPS_EXTRA", v)?,
                 None => Vec::new(),
-            },
-        }),
+            };
+            let allow_subnet =
+                parse_bool("CF_IPS_EXTRA_ALLOW_SUBNET", cf_extra_allow_subnet, false)?;
+            if !allow_subnet {
+                if let Some(n) = extra.iter().find(|n| contains_bridge_gateway(n)) {
+                    return err(format!(
+                        "CF_IPS_EXTRA: `{n}` contains the Docker bridge gateway address; every \
+                         host-published connection comes from it, so anyone could forge \
+                         CF-Connecting-IP. Trust only the cloudflared container (a /32, e.g. \
+                         172.30.53.20/32) or set CF_IPS_EXTRA_ALLOW_SUBNET=true"
+                    ));
+                }
+            }
+            Ok(TrustProxy::Cloudflare {
+                refresh: parse_bool("CF_REFRESH", cf_refresh.map(str::to_string), false)?,
+                extra,
+            })
+        }
         Some(v) if v.starts_with("xff:") => {
             let nets = parse_cidrs("TRUST_PROXY", &v[4..])?;
             if nets.is_empty() {
@@ -769,6 +860,49 @@ fn parse_trust_proxy(
         }
         Some(_) => err("TRUST_PROXY must be `none`, `cloudflare` or `xff:<cidr>[,<cidr>...]`"),
     }
+}
+
+/// `net` is outside Cloudflare's ranges.
+fn outside_cloudflare(net: &IpNet) -> bool {
+    !crate::client_ip::builtin_cloudflare_ranges()
+        .iter()
+        .any(|cf| cf.contains(net))
+}
+
+/// `net` (outside Cloudflare's ranges) contains the `.1` / `::1` address
+/// Docker gives a bridge network's gateway: `x.y.z.1` of its network
+/// address (IPv4) or the network address with the last 16 bits set to 1
+/// (IPv6). Loopback is never a bridge gateway (cloudflared on the host).
+fn contains_bridge_gateway(net: &IpNet) -> bool {
+    let gw: std::net::IpAddr = match net {
+        IpNet::V4(n) => (u32::from(n.network()) & !0xff | 1).to_be_bytes().into(),
+        IpNet::V6(n) => (u128::from(n.network()) & !0xffff | 1).to_be_bytes().into(),
+    };
+    !gw.is_loopback() && outside_cloudflare(net) && net.contains(&gw)
+}
+
+/// Startup warnings for `CF_IPS_EXTRA` entries broader than one container
+/// (IPv4 shorter than /29, IPv6 shorter than /125) outside Cloudflare.
+pub fn cf_extra_warnings(tp: &TrustProxy) -> Vec<String> {
+    let TrustProxy::Cloudflare { extra, .. } = tp else {
+        return Vec::new();
+    };
+    extra
+        .iter()
+        .filter(|n| {
+            let broad = match n {
+                IpNet::V4(v) => v.prefix_len() < 29,
+                IpNet::V6(v) => v.prefix_len() < 125,
+            };
+            broad && outside_cloudflare(n)
+        })
+        .map(|n| {
+            format!(
+                "CF_IPS_EXTRA: `{n}` is a whole subnet outside Cloudflare; every address in it \
+                 may set CF-Connecting-IP. Prefer the cloudflared container's /32"
+            )
+        })
+        .collect()
 }
 
 /// Parse a comma-separated CIDR list; a bare IP is accepted as a /32 or /128.
@@ -1026,7 +1160,7 @@ mod tests {
         );
         let c = cfg(&[
             ("TRUST_PROXY", "cloudflare"),
-            ("CF_IPS_EXTRA", "2001:db8::/32"),
+            ("CF_IPS_EXTRA", "2001:db8::20/128"),
         ])
         .unwrap();
         assert!(
@@ -1035,6 +1169,97 @@ mod tests {
         assert!(cfg(&[("TRUST_PROXY", "xff:")]).is_err());
         assert!(cfg(&[("TRUST_PROXY", "xff:notacidr")]).is_err());
         assert!(cfg(&[("TRUST_PROXY", "everything")]).is_err());
+    }
+
+    #[test]
+    fn cf_ips_extra_bridge_subnet_is_refused_unless_allowed() {
+        let cf = |extra: &str, allow: Option<&str>| {
+            let mut p = vec![("TRUST_PROXY", "cloudflare"), ("CF_IPS_EXTRA", extra)];
+            if let Some(a) = allow {
+                p.push(("CF_IPS_EXTRA_ALLOW_SUBNET", a));
+            }
+            cfg(&p)
+        };
+        // The whole compose network contains its gateway .1: refused.
+        for bad in [
+            "172.31.250.0/24",
+            "172.30.0.0/16",
+            "172.30.53.1",
+            "fd00:1::/64",
+        ] {
+            let e = cf(bad, None).unwrap_err();
+            assert!(e.0.contains("CF_IPS_EXTRA_ALLOW_SUBNET"), "{bad}: {e}");
+        }
+        // Explicit opt-in keeps the old behaviour, with a warning.
+        let c = cf("172.31.250.0/24", Some("true")).unwrap();
+        assert_eq!(cf_extra_warnings(&c.trust_proxy).len(), 1);
+        assert!(cf("172.31.250.0/24", Some("maybe")).is_err());
+        // One container: accepted, no warning.
+        let c = cf("172.31.250.20/32", None).unwrap();
+        assert!(cf_extra_warnings(&c.trust_proxy).is_empty());
+        // A subnet without the gateway: accepted, but warned about.
+        let c = cf("172.31.250.16/28", None).unwrap();
+        assert_eq!(cf_extra_warnings(&c.trust_proxy).len(), 1);
+        // Cloudflare's own ranges are never refused or warned about.
+        let c = cf("162.158.0.0/16", None).unwrap();
+        assert!(cf_extra_warnings(&c.trust_proxy).is_empty());
+        // cloudflared on the same host (no Docker bridge): accepted.
+        assert!(cf("127.0.0.1", None).is_ok());
+        assert!(cf("::1", None).is_ok());
+        assert!(cf_extra_warnings(&TrustProxy::None).is_empty());
+    }
+
+    #[test]
+    fn gateway_settings() {
+        let v = cfg(&[]).unwrap().v2;
+        assert!(!v.gateway_open);
+        assert!(!v.gateway_require_licence);
+        assert!(!v.gateway_activity_lines);
+        assert!(!v.gateway_apns_sandbox);
+        assert!(v.gateway_sandbox_licences_count);
+        assert!(
+            !cfg(&[("GATEWAY_SANDBOX_LICENCES_COUNT", "false")])
+                .unwrap()
+                .v2
+                .gateway_sandbox_licences_count
+        );
+        assert_eq!(
+            (v.gateway_global.per_sec.get(), v.gateway_global.burst.get()),
+            (20, 100)
+        );
+        assert_eq!(
+            (
+                v.gateway_group_hourly.per_hour.get(),
+                v.gateway_group_hourly.burst.get()
+            ),
+            (600, 100)
+        );
+        assert_eq!(
+            (v.rate_gateway.per_sec.get(), v.rate_gateway.burst.get()),
+            (1, 30)
+        );
+        assert_eq!(v.gateway_max_tokens_per_group, 30);
+        assert_eq!(v.gateway_max_groups, 2000);
+        assert!(v.licence_revoked.0.is_empty());
+        let v = cfg(&[
+            ("GATEWAY_REQUIRE_LICENCE", "true"),
+            ("GATEWAY_ACTIVITY_LINES", "true"),
+            ("GATEWAY_APNS_SANDBOX", "true"),
+            ("GATEWAY_MAX_GROUPS", "5"),
+            ("LICENCE_REVOKED_TX", " secret-tx-1 , secret-tx-2 ,"),
+        ])
+        .unwrap()
+        .v2;
+        assert!(v.gateway_require_licence && v.gateway_activity_lines && v.gateway_apns_sandbox);
+        assert_eq!(v.gateway_max_groups, 5);
+        assert_eq!(v.licence_revoked.0.len(), 2);
+        assert!(v.licence_revoked.0.contains("secret-tx-2"));
+        assert!(
+            !format!("{v:?}").contains("secret-tx"),
+            "revoked ids are never printed"
+        );
+        assert!(cfg(&[("GATEWAY_MAX_TOKENS_PER_GROUP", "0")]).is_err());
+        assert!(cfg(&[("GATEWAY_REQUIRE_LICENCE", "maybe")]).is_err());
     }
 
     #[test]

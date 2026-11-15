@@ -46,10 +46,10 @@ use self::apns::{
 use self::licence::{LicenceError, LicencePolicy, LicenceReq, VerifiedLicence};
 use self::presence::Presence;
 use self::store::{
-    Attach, CreateGroup, Device, GroupLicence, Insert, NewMessage, Store, StoreError, Upsert,
+    Attach, Bind, CreateGroup, Device, GroupLicence, Insert, NewMessage, Store, StoreError, Upsert,
 };
 use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME, MAX_STREAMS};
-use crate::api::{error, invalid, json_error, precheck, too_many, AppState, Outcome};
+use crate::api::{error, invalid, json_error, precheck, too_many, AppState, GlobalClass, Outcome};
 use crate::config::Mode;
 use crate::limits::{ip_key, V2Limits};
 use crate::metrics::{ApiTag, Event};
@@ -77,7 +77,13 @@ pub struct V2State {
     pub activities: Activities,
     /// Max base64 length of a snapshot's `sealed` (`V2_SNAPSHOT_MAX_BYTES`).
     pub snapshot_max: usize,
+    /// Gateway pushes in flight to APNs ([`GATEWAY_MAX_IN_FLIGHT`]).
+    pub gateway_sends: tokio::sync::Semaphore,
 }
+
+/// At most this many gateway pushes wait on APNs at once; more get `503`
+/// with `Retry-After: 1` instead of queueing.
+pub const GATEWAY_MAX_IN_FLIGHT: usize = 32;
 
 /// Body limit of `POST /v2/snapshot`: the sealed blob plus the JSON around it.
 pub fn snapshot_body_limit(snapshot_max: usize) -> usize {
@@ -224,7 +230,13 @@ async fn authenticate(
     rule: DeviceRule,
 ) -> Result<Authed, Outcome> {
     let now = state.now();
-    precheck(state, ip, now)?;
+    // Only the gateway push has no device; it skips the hosted global bucket.
+    let class = if rule == DeviceRule::None {
+        GlobalClass::Gateway
+    } else {
+        GlobalClass::Hosted
+    };
+    precheck(state, ip, now, class)?;
 
     let group = header(headers, GROUP_HEADER).filter(|g| is_id128(g));
     let device_id = header(headers, DEVICE_HEADER).filter(|d| is_id128(d));
@@ -432,7 +444,7 @@ async fn create_group(
 
 async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outcome {
     let now = state.now();
-    if let Err(o) = precheck(state, ip, now) {
+    if let Err(o) = precheck(state, ip, now, GlobalClass::Hosted) {
         return o;
     }
     let v2 = state.v2();
@@ -467,55 +479,91 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
     // about it from GET /v2/status and PUT /v2/licence). Self-hosted servers
     // never check, they only forward it to the gateway.
     let policy = &v2.licence;
+    // A gateway registration on the hosted server (from a self-hosted
+    // server). Closed gateway first, even with a licence.
+    let gateway_reg = req.gateway && state.mode() == Mode::Hosted;
+    if gateway_reg && !policy.gateway_open {
+        return gateway_closed();
+    }
+    // Strict gateway mode: the licence must verify and attach, like hosted.
+    let strict = gateway_reg && policy.gateway_require_licence;
     let required = policy.required_for_new_groups();
+    let attach_required = required || strict;
     let verified: Option<VerifiedLicence> = match (&req.licence, state.mode()) {
         (_, Mode::SelfHosted) => None,
         (Some(l), Mode::Hosted) => match policy.verify(l) {
             Ok(v) => Some(v),
             Err(e) => {
                 record_licence(state, None, "groups", "invalid", e.code());
-                if required {
+                if attach_required {
                     return licence_invalid(e);
                 }
                 tracing::info!(reason = e.code(), "open registration: licence ignored");
                 None
             }
         },
-        (_, Mode::Hosted) if req.gateway && !policy.gateway_open => return gateway_closed(),
         (None, Mode::Hosted) if required && !req.gateway => return licence_required(),
         (None, Mode::Hosted) => None,
     };
+    let gateway_licensed = verified
+        .as_ref()
+        .is_some_and(|v| policy.gateway_licensed(v));
+    if strict && !gateway_licensed {
+        return licence_required();
+    }
 
     let g = req.group_id.clone();
     let max = policy.max_groups;
+    let max_gateway = policy.gateway_max_groups;
     let lic = verified.clone();
     let stored = v2
         .store
-        .call(move |c| match lic {
-            Some(lic) if required => store::create_group_with_licence(c, &g, &key, &lic, max, now)
-                .map(|(created, a)| (created, Some(a))),
-            Some(lic) => {
-                let created = store::create_group(c, &g, &key, now)?;
-                if created == CreateGroup::Conflict {
-                    return Ok((created, None));
-                }
-                Ok((created, Some(store::attach_licence(c, &g, &lic, max, now)?)))
+        .call(move |c| {
+            if gateway_reg && !store::gateway_has_room(c, &g, max_gateway)? {
+                return Ok(None);
             }
-            None => Ok((store::create_group(c, &g, &key, now)?, None)),
+            let (created, attached) = match lic {
+                Some(lic) if attach_required => {
+                    store::create_group_with_licence(c, &g, &key, &lic, max, now)
+                        .map(|(created, a)| (created, Some(a)))?
+                }
+                Some(lic) => {
+                    let created = store::create_group(c, &g, &key, now)?;
+                    if created == CreateGroup::Conflict {
+                        return Ok(Some((created, None)));
+                    }
+                    (created, Some(store::attach_licence(c, &g, &lic, max, now)?))
+                }
+                None => (store::create_group(c, &g, &key, now)?, None),
+            };
+            let refused = created == CreateGroup::Conflict
+                || (attach_required && attached == Some(Attach::InUse));
+            if gateway_reg && !refused {
+                let licensed = gateway_licensed
+                    && matches!(attached, Some(Attach::Attached | Attach::Refreshed));
+                store::put_gateway_group(c, &g, licensed, now)?;
+            }
+            Ok(Some((created, attached)))
         })
         .await;
     let (created, attached) = match stored {
-        Ok((CreateGroup::Conflict, _)) => {
+        Ok(None) => {
+            return (
+                error(StatusCode::SERVICE_UNAVAILABLE, "gateway_full"),
+                "gateway_full",
+            )
+        }
+        Ok(Some((CreateGroup::Conflict, _))) => {
             return (
                 error(StatusCode::CONFLICT, "group_exists"),
                 "group_conflict",
             )
         }
-        Ok((_, Some(Attach::InUse))) if required => {
+        Ok(Some((_, Some(Attach::InUse)))) if attach_required => {
             record_licence(state, None, "groups", "in_use", "");
             return licence_in_use();
         }
-        Ok((c, a)) => (c, a),
+        Ok(Some((c, a))) => (c, a),
         Err(e) => return storage_error(e),
     };
     match (&verified, attached) {
@@ -2145,16 +2193,41 @@ async fn gateway_push(
     let r = async {
         let a = authenticate(&state, ip, "POST", &uri, &headers, &body, DeviceRule::None).await?;
         group = Some(a.group.clone());
-        if !state.v2().licence.gateway_open {
+        let v2 = state.v2();
+        let policy = &v2.licence;
+        if !policy.gateway_open {
             return Err((
                 error(StatusCode::FORBIDDEN, "gateway_closed"),
                 "gateway_closed",
             ));
         }
-        if let Err(ra) = state.v2().limits.check_gateway(&a.group) {
+        // Only groups registered with `gateway: true` may push to arbitrary
+        // tokens; a hosted group pushes to its own devices only.
+        let g = a.group.clone();
+        let licensed = match v2.store.call(move |c| store::gateway_member(c, &g)).await {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                return Err((
+                    error(StatusCode::FORBIDDEN, "not_gateway_group"),
+                    "not_gateway_group",
+                ))
+            }
+            Err(e) => return Err(storage_error(e)),
+        };
+        if let Err(ra) = v2.limits.check_gateway_global() {
+            return Err((too_many(ra), "rate_limited_gateway_global"));
+        }
+        if let Err(ra) = v2.limits.check_gateway(&a.group, licensed) {
             return Err((too_many(ra), "rate_limited_gateway"));
         }
         let req: GatewayPush = parse(&body)?;
+        // App Store and TestFlight builds use production APNs.
+        if req.env == ApnsEnv::Sandbox && !policy.gateway_apns_sandbox {
+            return Err((
+                invalid("env sandbox is not accepted by this gateway"),
+                "sandbox_refused",
+            ));
+        }
         let token = normalize_apns_token(&req.device_token)
             .ok_or_else(|| bad("device_token must be 64 to 200 hex characters"))?;
         let now = state.now();
@@ -2177,7 +2250,7 @@ async fn gateway_push(
                 }
                 PushContent::Background(b)
             }
-            (None, None, Some(n), None) => {
+            (None, None, Some(mut n), None) => {
                 n.state.validate().map_err(bad)?;
                 let near = |t: u64| t.abs_diff(now) <= MAX_TTL_SECS;
                 if !near(n.timestamp)
@@ -2185,6 +2258,11 @@ async fn gateway_push(
                     || !n.dismissal_date.map_or(true, near)
                 {
                     return Err(bad("activity times must be within 24 h of now"));
+                }
+                // Host / service lines are plaintext on the Lock Screen: a
+                // gateway caller could otherwise show any text there.
+                if !policy.gateway_activity_lines {
+                    n.state.lines.clear();
                 }
                 PushContent::Activity(n)
             }
@@ -2202,8 +2280,10 @@ async fn gateway_push(
         if req.expiration != 0 && req.expiration > now + MAX_TTL_SECS {
             return Err(bad("expiration must be 0 or at most 24 h ahead"));
         }
-        // The gateway builds the payload itself (presence text is fixed), so it
-        // cannot be used to send arbitrary notification text.
+        // The gateway builds the payload itself (fixed presence, heartbeat and
+        // push-to-start texts, Live Activity lines dropped unless
+        // GATEWAY_ACTIVITY_LINES), so it cannot be used to send arbitrary
+        // notification text.
         let payload_len = match &content {
             PushContent::Sealed(m) => build_payload(m, req.urgency).len(),
             PushContent::Presence(p) => build_presence_payload(*p).len(),
@@ -2216,19 +2296,67 @@ async fn gateway_push(
                 "payload_too_large",
             ));
         }
+        // The token must not belong to a hosted user or to another gateway
+        // group that used it in the last 24 h.
+        let (g, t, st) = (a.group.clone(), token.clone(), state.clone());
+        let max_tokens = policy.gateway_max_tokens_per_group;
+        let bound = v2
+            .store
+            .call(move |c| {
+                store::bind_gateway_token(c, &g, &t, now, max_tokens, || {
+                    st.v2().limits.check_gateway_rebind(&g).is_ok()
+                })
+            })
+            .await
+            .map_err(storage_error)?;
+        match bound {
+            Bind::Bound => {}
+            Bind::TakenElsewhere => {
+                return Err((error(StatusCode::FORBIDDEN, "token_bound"), "token_bound"))
+            }
+            Bind::TokenLimit => {
+                return Err((
+                    error(StatusCode::TOO_MANY_REQUESTS, "token_limit"),
+                    "token_limit",
+                ))
+            }
+            Bind::RebindLimit => {
+                return Err((
+                    error(StatusCode::TOO_MANY_REQUESTS, "rebind_limit"),
+                    "rebind_limit",
+                ))
+            }
+        }
+        // Fail fast instead of queueing behind a slow APNs.
+        let Ok(_permit) = v2.gateway_sends.try_acquire() else {
+            let mut r = error(StatusCode::SERVICE_UNAVAILABLE, "gateway_busy");
+            r.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            return Err((r, "gateway_busy"));
+        };
         let job = PushJob {
             group_id: a.group.clone(),
             auth_key: a.key,
-            device_token: token,
+            device_token: token.clone(),
             env: req.env,
             content,
             urgency: req.urgency,
             collapse_id: req.collapse_id,
             expiration: req.expiration,
         };
-        match state.v2().sender.send(&job).await {
+        match v2.sender.send(&job).await {
             Ok(()) => Ok(ok(StatusCode::OK, json!({"status": "sent"}), "sent")),
             Err(PushError::Unregistered) => {
+                let g = a.group.clone();
+                if let Err(e) = v2
+                    .store
+                    .call(move |c| store::unbind_gateway_token(c, &g, &token))
+                    .await
+                {
+                    tracing::error!(error = %e, "gateway: cannot forget token binding");
+                }
                 Ok((error(StatusCode::GONE, "unregistered"), "unregistered"))
             }
             Err(PushError::Rejected { status, reason }) => {

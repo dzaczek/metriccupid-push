@@ -827,7 +827,12 @@ With `APNS_MODE=gateway` it forwards each push job to the hosted service (`GATEW
 
 1. When the Mac creates the group on the self-hosted server, that server forwards the same
    `POST /v2/groups` body (`group_id`, `auth_key`, `licence` if any) to the gateway with
-   `"gateway": true`. The gateway then requires no licence: self-hosting stays free. A refusal by the
+   `"gateway": true`. The gateway then requires no licence by default (compatible mode): self-hosting
+   stays free; a valid licence, if present, marks the group licensed (twice the quotas below). In
+   strict mode (`GATEWAY_REQUIRE_LICENCE=true`) a registration without a valid licence gets `402`
+   (`403` for an invalid or revoked one). Only a `gateway: true` registration makes a group a
+   gateway group; at most `GATEWAY_MAX_GROUPS` exist (`503 gateway_full`). A closed gateway answers
+   `403 gateway_closed` even when a licence is sent. A refusal by the
    gateway is returned to the Mac (`402`, `403`, `409`, `502`); the request is idempotent and can be
    retried. A self-hosted server with licence support needs a gateway with licence support too (older
    gateways reject the `gateway` field with `400`).
@@ -852,15 +857,36 @@ to priority 10, anything else to 5. Exactly one of `message`, `presence`, `activ
 (`400` otherwise); a `message` with `t: "summary"` is refused (summaries are never pushed).
 `expiration` is 0 or at most 24 h ahead. The gateway builds the APNs payload itself from `message`
 and `urgency` (section 6.5) or from `presence` (fixed texts, section 7a), so it cannot be used to
-send arbitrary notification text, and sends it with its own key. A gateway older than this version
+send arbitrary notification text, and sends it with its own key. Live Activity `lines` (free text
+on the Lock Screen) are dropped unless the operator sets `GATEWAY_ACTIVITY_LINES=true`; counts,
+`start` and its fixed alert are unchanged. A gateway older than this version
 rejects `presence`, `activity` or `background` (`400`): the self-hosted server then logs the failure and the phones
 get no presence push (`GET /v2/status` still works) or no Live Activity update. Answers: `200 {"status":"sent"}`, `410 {"error":"unregistered"}` (the self-hosted
-server removes the token), `502 upstream_error`, `400`, `401`, `413`, `429` (per group, default
-5/s, burst 50).
+server removes the token), `502 upstream_error`, `400`, `401`, `413`, `429`.
+
+The gateway guards every push, in this order:
+
+1. The group must be a gateway group, else `403 not_gateway_group` (a hosted group cannot push to
+   arbitrary tokens).
+2. A bucket shared by all gateway pushes (`GATEWAY_GLOBAL_*`, default 20/s, burst 100), separate
+   from the hosted service's global bucket; then per group 1/s burst 30 and 600/h burst 100
+   (licensed groups: twice both). Refusals are `429` with `Retry-After`.
+3. `env: "sandbox"` is `400` unless `GATEWAY_APNS_SANDBOX=true` (App Store and TestFlight builds use
+   production APNs).
+4. Token binding: a token that is a hosted user's device or Live Activity token, or that another
+   gateway group used within the last 24 h, is `403 token_bound`. A binding idle for more than
+   24 h moves to the new group (a "Reset link"), at most 10 times per group per day
+   (`429 rebind_limit`). At most `GATEWAY_MAX_TOKENS_PER_GROUP` (30) distinct tokens per group
+   (`429 token_limit`). A `410` from APNs deletes the binding.
+5. At most 32 pushes in flight to APNs; beyond that `503 gateway_busy` with `Retry-After: 1`.
+
+The self-hosted server treats every answer other than `200` and `410` as a failed push and keeps
+the token.
 
 Privacy: the gateway learns the group id, `auth_key`, device tokens, ciphertext, sizes, urgency and
 timing of pushes. It never sees `enc_key`, plaintext, device names or the mailbox, and stores
-nothing but the group registration.
+nothing but the group registration (with its gateway membership and licence, if any) and which
+group last pushed to which token, and when.
 
 ## 10. What the server sees
 
@@ -1001,7 +1027,9 @@ device of the Apple ID.
 A purchase is identified by `appTransactionId`. If the payload has none (older OS versions), by
 `sha256:` + hex SHA-256 of `"{originalPurchaseDate}|{appAppleId}|{originalPlatform}"` (missing values
 as `0` / empty). One purchase may be attached to at most `LICENCE_MAX_GROUPS` (default 3) groups;
-another group gets `403 licence_in_use`. All Macs and iPhones of one Apple ID normally share one group
+another group gets `403 licence_in_use`, as does a fourth new attach of one purchase within 24 h
+(deleting a group frees a slot, not an attach). Purchase ids on the operator's revocation list
+(`LICENCE_REVOKED_TX`) are refused with `403 licence_invalid`, `reason: revoked`. All Macs and iPhones of one Apple ID normally share one group
 (the group secret syncs through iCloud Keychain), so the limit is about separate setups. A slot is
 freed by deleting a group (section 6.1a).
 

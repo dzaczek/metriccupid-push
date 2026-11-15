@@ -59,15 +59,20 @@ services:
     depends_on:
       relay:
         condition: service_healthy
-    networks: [relay]
+    networks:
+      relay:
+        # Fixed address: CF_IPS_EXTRA trusts exactly this container
+        # (172.30.53.20/32), never the whole network, whose gateway .1 is the
+        # source of every host-published connection.
+        ipv4_address: 172.30.53.20
 
 volumes:
   data:
 
 networks:
   relay:
-    # Fixed subnet so TRUST_PROXY can trust the cloudflared container
-    # (see README, "Cloudflare Tunnel").
+    # Fixed subnet so cloudflared gets a fixed address that TRUST_PROXY can
+    # trust (see README, "Cloudflare Tunnel").
     ipam:
       config:
         - subnet: 172.30.53.0/24

@@ -21,7 +21,10 @@ memory-exhaustion or crash bugs reachable by unauthenticated clients.
 For v2 also: access to another group's mailbox, queue, devices or stream;
 anything that lets the server or a network observer read or forge sealed
 content; leaking APNs tokens, sealed blobs or keys in responses or logs;
-abuse of the gateway to send notifications with arbitrary text.
+abuse of the gateway to send notifications with arbitrary text (including
+Live Activity text), to push to a token that belongs to a hosted user or to
+another gateway user's active phone, or to exhaust quotas shared with hosted
+users; client IP spoofing through an over-broad `CF_IPS_EXTRA`.
 
 Out of scope: volumetric DDoS against an origin exposed without a proxy
 (put Cloudflare or a Tunnel in front, see README), and issues that require

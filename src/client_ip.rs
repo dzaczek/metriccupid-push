@@ -247,6 +247,20 @@ mod tests {
     }
 
     #[test]
+    fn cf_extra_slash_32_trusts_only_cloudflared_not_the_bridge_gateway() {
+        let mut ranges = builtin_cloudflare_ranges();
+        ranges.push("172.31.250.20/32".parse().unwrap());
+        let r = ClientIpResolver::Cloudflare(ranges);
+        let h = hdr(&[("cf-connecting-ip", "198.51.100.7")]);
+        // cloudflared's fixed address: its header is used.
+        assert_eq!(r.resolve(ip("172.31.250.20"), &h), ip("198.51.100.7"));
+        // Host-published port: the peer is the bridge gateway, the forged
+        // header is ignored.
+        assert_eq!(r.resolve(ip("172.31.250.1"), &h), ip("172.31.250.1"));
+        assert_eq!(r.country(ip("172.31.250.1"), &h), None);
+    }
+
+    #[test]
     fn country_only_from_trusted_peer() {
         let r = ClientIpResolver::Cloudflare(builtin_cloudflare_ranges());
         let h = hdr(&[("cf-ipcountry", "ch")]);

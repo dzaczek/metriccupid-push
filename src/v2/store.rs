@@ -165,6 +165,43 @@ CREATE TABLE snapshots (
 "#,
 ];
 
+/// Objects added after schema version 6 without a numbered migration, so
+/// `user_version` stays 6 and a 0.2.0 binary (which refuses newer versions)
+/// can still open the database after an image rollback; it ignores these
+/// tables, and SQLite still applies their cascades. A later numbered
+/// migration takes them over with `IF NOT EXISTS`. Only add idempotent
+/// `IF NOT EXISTS` statements here.
+const AUX_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS gateway_groups (
+    group_id   TEXT PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    licensed   INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS gateway_tokens (
+    token     TEXT PRIMARY KEY,
+    group_id  TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+    last_used INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS gateway_tokens_group ON gateway_tokens(group_id);
+CREATE INDEX IF NOT EXISTS devices_apns_token ON devices(apns_token);
+CREATE INDEX IF NOT EXISTS activity_tokens_push_token ON activity_tokens(push_token);
+CREATE TABLE IF NOT EXISTS licence_attaches (
+    app_transaction_id TEXT NOT NULL,
+    attached_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS licence_attaches_purchase
+    ON licence_attaches(app_transaction_id, attached_at);
+"#;
+
+/// New attaches of one purchase to another group per 24 h.
+pub const MAX_ATTACHES_PER_DAY: i64 = 3;
+pub const ATTACH_WINDOW_SECS: u64 = 24 * 3600;
+/// A gateway token binding unused for longer than this may move to another
+/// gateway group (phones send a heartbeat every 15 min).
+pub const GATEWAY_BINDING_IDLE_SECS: u64 = 24 * 3600;
+/// `gateway_tokens.last_used` is written at most this often.
+pub const GATEWAY_TOUCH_SECS: u64 = 600;
+
 #[derive(Debug)]
 pub struct StoreError(pub String);
 
@@ -286,6 +323,7 @@ impl Store {
         // The root filesystem is read-only in the container: no temp files.
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         migrate(&mut conn)?;
+        ensure_aux_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
@@ -345,6 +383,12 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
     }
+    Ok(())
+}
+
+/// Create the [`AUX_SCHEMA`] objects; leaves `user_version` unchanged.
+pub fn ensure_aux_schema(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(AUX_SCHEMA)?;
     Ok(())
 }
 
@@ -478,6 +522,18 @@ fn attach_in(
         if others >= i64::from(max_groups) {
             return Ok(Attach::InUse);
         }
+        let recent: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM licence_attaches WHERE app_transaction_id = ?1 AND attached_at > ?2",
+            params![lic.app_transaction_id, cutoff(now, ATTACH_WINDOW_SECS)],
+            |r| r.get(0),
+        )?;
+        if recent >= MAX_ATTACHES_PER_DAY {
+            return Ok(Attach::InUse);
+        }
+        tx.execute(
+            "INSERT INTO licence_attaches (app_transaction_id, attached_at) VALUES (?1, ?2)",
+            params![lic.app_transaction_id, now as i64],
+        )?;
     }
     tx.execute(
         "INSERT INTO group_licences (group_id, kind, tier, environment, app_transaction_id,
@@ -983,6 +1039,156 @@ pub fn snapshot(
     .optional()?)
 }
 
+// --------------------------------------------------------------- gateway ---
+
+/// Whether `group_id` is a gateway group, and if so whether it is licensed.
+pub fn gateway_member(c: &mut Connection, group_id: &str) -> Result<Option<bool>, StoreError> {
+    Ok(c.query_row(
+        "SELECT licensed FROM gateway_groups WHERE group_id = ?1",
+        [group_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()?
+    .map(|l| l != 0))
+}
+
+/// `group_id` is already a gateway group, or there are fewer than `max`.
+pub fn gateway_has_room(c: &Connection, group_id: &str, max: u32) -> Result<bool, StoreError> {
+    let member = c
+        .query_row(
+            "SELECT 1 FROM gateway_groups WHERE group_id = ?1",
+            [group_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if member {
+        return Ok(true);
+    }
+    let n: i64 = c.query_row("SELECT COUNT(*) FROM gateway_groups", [], |r| r.get(0))?;
+    Ok(n < i64::from(max))
+}
+
+/// Make `group_id` (which must exist) a gateway group; `licensed` reflects
+/// the latest registration.
+pub fn put_gateway_group(
+    c: &Connection,
+    group_id: &str,
+    licensed: bool,
+    now: u64,
+) -> Result<(), StoreError> {
+    c.execute(
+        "INSERT INTO gateway_groups (group_id, created_at, licensed) VALUES (?1, ?2, ?3)
+         ON CONFLICT (group_id) DO UPDATE SET licensed = ?3",
+        params![group_id, now as i64, i64::from(licensed)],
+    )?;
+    Ok(())
+}
+
+/// `token` is a device or Live Activity token of a hosted group other
+/// than `group_id`.
+pub fn token_owned_by_hosted(
+    c: &Connection,
+    token: &str,
+    group_id: &str,
+) -> Result<bool, StoreError> {
+    Ok(c.query_row(
+        "SELECT 1 FROM devices WHERE apns_token = ?1 AND group_id != ?2
+         UNION ALL
+         SELECT 1 FROM activity_tokens WHERE push_token = ?1 AND group_id != ?2
+         LIMIT 1",
+        [token, group_id],
+        |_| Ok(()),
+    )
+    .optional()?
+    .is_some())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bind {
+    /// The token is (now) bound to the caller.
+    Bound,
+    /// A hosted user's token, or bound to another active gateway group.
+    TakenElsewhere,
+    /// The group already has its maximum of distinct tokens.
+    TokenLimit,
+    /// The group used up its re-bindings for today.
+    RebindLimit,
+}
+
+/// Bind `token` to gateway group `group_id` (one transaction): refused if a
+/// hosted group owns it or another gateway group used it within
+/// [`GATEWAY_BINDING_IDLE_SECS`]; an idle binding moves when `rebind()`
+/// allows it (rate limit); a new token needs room under `max_tokens`.
+pub fn bind_gateway_token(
+    c: &mut Connection,
+    group_id: &str,
+    token: &str,
+    now: u64,
+    max_tokens: u32,
+    rebind: impl FnOnce() -> bool,
+) -> Result<Bind, StoreError> {
+    let tx = c.transaction()?;
+    if token_owned_by_hosted(&tx, token, group_id)? {
+        return Ok(Bind::TakenElsewhere);
+    }
+    let current: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT group_id, last_used FROM gateway_tokens WHERE token = ?1",
+            [token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match current {
+        Some((g, last)) if g == group_id => {
+            if now.saturating_sub(ts(last)) >= GATEWAY_TOUCH_SECS {
+                tx.execute(
+                    "UPDATE gateway_tokens SET last_used = ?2 WHERE token = ?1",
+                    params![token, now as i64],
+                )?;
+            }
+        }
+        other => {
+            if let Some((_, last)) = &other {
+                if now.saturating_sub(ts(*last)) <= GATEWAY_BINDING_IDLE_SECS {
+                    return Ok(Bind::TakenElsewhere);
+                }
+            }
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM gateway_tokens WHERE group_id = ?1",
+                [group_id],
+                |r| r.get(0),
+            )?;
+            if n >= i64::from(max_tokens) {
+                return Ok(Bind::TokenLimit);
+            }
+            if other.is_some() && !rebind() {
+                return Ok(Bind::RebindLimit);
+            }
+            tx.execute(
+                "INSERT INTO gateway_tokens (token, group_id, last_used) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (token) DO UPDATE SET group_id = ?2, last_used = ?3",
+                params![token, group_id, now as i64],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(Bind::Bound)
+}
+
+/// Forget a binding (APNs said the token is gone).
+pub fn unbind_gateway_token(
+    c: &mut Connection,
+    group_id: &str,
+    token: &str,
+) -> Result<(), StoreError> {
+    c.execute(
+        "DELETE FROM gateway_tokens WHERE token = ?1 AND group_id = ?2",
+        [token, group_id],
+    )?;
+    Ok(())
+}
+
 /// Delete expired messages, commands and snapshots; returns (messages,
 /// commands) removed.
 pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreError> {
@@ -997,6 +1203,10 @@ pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreErro
     let k = c.execute(
         "DELETE FROM commands WHERE created_at <= ?1",
         [cutoff(now, COMMAND_RETENTION_SECS)],
+    )?;
+    c.execute(
+        "DELETE FROM licence_attaches WHERE attached_at <= ?1",
+        [cutoff(now, ATTACH_WINDOW_SECS)],
     )?;
     Ok((m, k))
 }
@@ -1025,6 +1235,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut c = Connection::open(dir.path().join(DB_FILE)).unwrap();
         migrate(&mut c).unwrap();
+        ensure_aux_schema(&c).unwrap();
         c.pragma_update(None, "foreign_keys", "ON").unwrap();
         (dir, c)
     }
@@ -1045,6 +1256,148 @@ mod tests {
         migrate(&mut c).unwrap();
         c.pragma_update(None, "user_version", 99).unwrap();
         assert!(migrate(&mut c).is_err());
+    }
+
+    #[test]
+    fn aux_schema_keeps_user_version_and_0_2_0_can_still_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let mut c = Connection::open(&path).unwrap();
+        let v: i64 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 6);
+        assert_eq!(v as usize, MIGRATIONS.len());
+        // Idempotent.
+        ensure_aux_schema(&c).unwrap();
+        // What 0.2.0 runs on open: migrate only, which accepts version 6.
+        migrate(&mut c).unwrap();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // 0.2.0's delete_group still works, and cascades into the new tables.
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        put_gateway_group(&c, "g", true, 0).unwrap();
+        assert_eq!(
+            bind_gateway_token(&mut c, "g", "t", 0, 30, || true).unwrap(),
+            Bind::Bound
+        );
+        assert!(delete_group(&mut c, "g").unwrap());
+        let n: i64 = c
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM gateway_groups) + (SELECT COUNT(*) FROM gateway_tokens)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+        // And Store::open again after that (0.2.1 after a roll-forward).
+        drop(c);
+        Store::open(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn gateway_membership_and_token_binding() {
+        let (_d, mut c) = store();
+        for g in ["a", "b", "h"] {
+            create_group(&mut c, g, &[1; 32], 0).unwrap();
+        }
+        assert_eq!(gateway_member(&mut c, "a").unwrap(), None);
+        assert!(gateway_has_room(&c, "a", 1).unwrap());
+        put_gateway_group(&c, "a", false, 0).unwrap();
+        assert_eq!(gateway_member(&mut c, "a").unwrap(), Some(false));
+        assert!(gateway_has_room(&c, "a", 1).unwrap(), "members always fit");
+        assert!(!gateway_has_room(&c, "b", 1).unwrap());
+        put_gateway_group(&c, "a", true, 5).unwrap();
+        assert_eq!(gateway_member(&mut c, "a").unwrap(), Some(true));
+        put_gateway_group(&c, "b", false, 0).unwrap();
+
+        // A hosted device's token is refused, even for an idle check later.
+        let d = Device {
+            device_id: "p".into(),
+            kind: "ios".into(),
+            name: "iPhone".into(),
+            apns_token: Some("hosted".into()),
+            apns_env: "production".into(),
+            created_at: 0,
+            updated_at: 0,
+            last_seen: None,
+        };
+        upsert_device(&mut c, "h", &d, 0).unwrap();
+        let bind = |c: &mut Connection, g: &str, t: &str, now: u64| {
+            bind_gateway_token(c, g, t, now, 2, || true).unwrap()
+        };
+        assert_eq!(bind(&mut c, "a", "hosted", 0), Bind::TakenElsewhere);
+        assert_eq!(bind(&mut c, "h", "hosted", 0), Bind::Bound, "own token");
+
+        assert_eq!(bind(&mut c, "a", "t1", 0), Bind::Bound);
+        assert_eq!(bind(&mut c, "b", "t1", 100), Bind::TakenElsewhere);
+        // Used by "a" at 500 (within the touch interval: not written).
+        assert_eq!(bind(&mut c, "a", "t1", 500), Bind::Bound);
+        let idle = GATEWAY_BINDING_IDLE_SECS;
+        assert_eq!(bind(&mut c, "b", "t1", idle), Bind::TakenElsewhere);
+        assert_eq!(bind(&mut c, "b", "t1", idle + 1), Bind::Bound, "idle moves");
+        assert_eq!(bind(&mut c, "a", "t1", idle + 2), Bind::TakenElsewhere);
+        // Rebind limit is consulted only for a move.
+        assert_eq!(
+            bind_gateway_token(&mut c, "a", "t2", 0, 2, || false).unwrap(),
+            Bind::Bound
+        );
+        assert_eq!(
+            bind_gateway_token(&mut c, "b", "t2", 3 * idle, 2, || false).unwrap(),
+            Bind::RebindLimit
+        );
+        // Token cap: "b" has t1, a second fits, the third does not.
+        assert_eq!(bind(&mut c, "b", "t3", idle + 3), Bind::Bound);
+        assert_eq!(bind(&mut c, "b", "t4", idle + 3), Bind::TokenLimit);
+        unbind_gateway_token(&mut c, "b", "t3").unwrap();
+        assert_eq!(bind(&mut c, "b", "t4", idle + 3), Bind::Bound);
+    }
+
+    #[test]
+    fn one_purchase_attaches_at_most_three_new_groups_per_day() {
+        let (_d, mut c) = store();
+        let lic = VerifiedLicence {
+            kind: "app_transaction",
+            tier: "founder",
+            environment: "production",
+            app_transaction_id: "p".into(),
+            original_purchase_date: None,
+            original_application_version: None,
+            original_platform: None,
+            signed_date: 0,
+        };
+        let t = ATTACH_WINDOW_SECS * 10;
+        for g in ["a", "b", "c", "d"] {
+            create_group(&mut c, g, &[1; 32], 0).unwrap();
+        }
+        for g in ["a", "b", "c"] {
+            assert_eq!(
+                attach_licence(&mut c, g, &lic, 10, t).unwrap(),
+                Attach::Attached
+            );
+        }
+        assert_eq!(
+            attach_licence(&mut c, "d", &lic, 10, t + 10).unwrap(),
+            Attach::InUse
+        );
+        // Refreshing an attached group is not a new attach.
+        assert_eq!(
+            attach_licence(&mut c, "a", &lic, 10, t + 10).unwrap(),
+            Attach::Refreshed
+        );
+        // Deleting a group does not give the attach back within 24 h.
+        delete_group(&mut c, "a").unwrap();
+        assert_eq!(
+            attach_licence(&mut c, "d", &lic, 10, t + 20).unwrap(),
+            Attach::InUse
+        );
+        let later = t + ATTACH_WINDOW_SECS + 1;
+        cleanup(&mut c, later).unwrap();
+        assert_eq!(
+            attach_licence(&mut c, "d", &lic, 10, later).unwrap(),
+            Attach::Attached
+        );
     }
 
     #[test]
