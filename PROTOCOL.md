@@ -975,7 +975,8 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 `gateway_error`, `upstream_error` (502), `too_many_streams` (503).
 
 `group_suspended`: the operator suspended the group (admin panel). Every signed request of the group,
-including `GET /v2/stream` and `POST /v2/gateway/push`, gets it after a valid signature; open streams
+including `GET /v2/stream` and `POST /v2/gateway/push`, gets it after a valid signature, and so does
+`POST /v2/groups` for the group's id (no re-registration, licence attach or gateway re-add); open streams
 are closed and nothing is pushed to the group's phones. Data is kept. A client SHOULD stop retrying
 and show that the service refused the group. An address banned by the operator gets
 `429 rate_limited` with `Retry-After` before any other check, like an automatic ban.

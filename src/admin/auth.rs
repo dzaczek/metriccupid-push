@@ -150,12 +150,41 @@ pub const PRE_SESSION_SECS: u64 = 600;
 /// Max sessions held in memory (logged-in and pre-login together).
 pub const MAX_SESSIONS: usize = 256;
 
+/// After a fresh TOTP code, management actions need only the session, its
+/// CSRF token and the rate limit for this long ...
+pub const STEPUP_SECS: u64 = 300;
+/// ... and at most this many times.
+pub const STEPUP_ACTIONS: u32 = 10;
+
+/// A step-up window of one session, bound to the admin's network and
+/// Cloudflare Access identity at the time of the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepUp {
+    pub until: u64,
+    pub actions_left: u32,
+    /// `/24` or `/48` of the client.
+    pub network: String,
+    pub email: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub csrf: String,
     pub authed: bool,
     pub created: u64,
     pub expires: u64,
+    /// Lost with the session (logout, expiry, restart).
+    pub stepup: Option<StepUp>,
+}
+
+impl Session {
+    /// Seconds and actions left in the step-up window at `now`.
+    pub fn stepup_left(&self, now: u64) -> Option<(u64, u32)> {
+        self.stepup
+            .as_ref()
+            .filter(|w| w.until > now && w.actions_left > 0)
+            .map(|w| (w.until - now, w.actions_left))
+    }
 }
 
 /// In-memory sessions keyed by the cookie token. Lost on restart (everyone
@@ -205,6 +234,7 @@ impl Sessions {
                 authed: false,
                 created: now,
                 expires: now + PRE_SESSION_SECS,
+                stepup: None,
             },
             now,
         );
@@ -219,6 +249,7 @@ impl Sessions {
                 authed: true,
                 created: now,
                 expires: now + self.ttl,
+                stepup: None,
             },
             now,
         )
@@ -239,6 +270,50 @@ impl Sessions {
 
     pub fn remove(&self, token: &str) {
         self.lock().remove(token);
+    }
+
+    /// Open (or renew) the step-up window of logged-in session `token`
+    /// after a fresh code; returns the updated session.
+    pub fn open_stepup(
+        &self,
+        token: &str,
+        now: u64,
+        network: &str,
+        email: Option<&str>,
+    ) -> Option<Session> {
+        let mut map = self.lock();
+        let s = map.get_mut(token).filter(|s| s.authed && s.expires > now)?;
+        s.stepup = Some(StepUp {
+            until: now + STEPUP_SECS,
+            actions_left: STEPUP_ACTIONS,
+            network: network.to_string(),
+            email: email.map(str::to_string),
+        });
+        Some(s.clone())
+    }
+
+    /// Use one action of the step-up window of `token`, if it is open at
+    /// `now`, has actions left and was opened from the same network and
+    /// Access identity. Returns the updated session.
+    pub fn use_stepup(
+        &self,
+        token: &str,
+        now: u64,
+        network: &str,
+        email: Option<&str>,
+    ) -> Option<Session> {
+        let mut map = self.lock();
+        let s = map.get_mut(token).filter(|s| s.authed && s.expires > now)?;
+        let w = s.stepup.as_mut()?;
+        if w.until <= now
+            || w.actions_left == 0
+            || w.network != network
+            || w.email.as_deref() != email
+        {
+            return None;
+        }
+        w.actions_left -= 1;
+        Some(s.clone())
     }
 
     pub fn len(&self) -> usize {
@@ -403,6 +478,44 @@ mod tests {
         s.remove(&t2);
         assert!(s.get(&t2, 1000).is_none(), "logout");
         assert!(s.get("nope", 1000).is_none());
+    }
+
+    #[test]
+    fn stepup_window_is_bound_capped_and_expires() {
+        let s = Sessions::new(3600);
+        let t = s.create_authed(100);
+        let net = "192.0.2.0/24";
+        assert!(s.use_stepup(&t, 100, net, None).is_none(), "no window yet");
+        let sess = s.open_stepup(&t, 100, net, Some("a@x")).unwrap();
+        assert_eq!(sess.stepup_left(100), Some((STEPUP_SECS, STEPUP_ACTIONS)));
+        assert!(
+            s.use_stepup(&t, 101, "198.51.100.0/24", Some("a@x"))
+                .is_none(),
+            "other network"
+        );
+        assert!(s.use_stepup(&t, 101, net, None).is_none(), "other identity");
+        assert!(
+            s.use_stepup(&t, 101, net, Some("b@x")).is_none(),
+            "other identity"
+        );
+        for i in 0..STEPUP_ACTIONS {
+            let left = s.use_stepup(&t, 101, net, Some("a@x")).unwrap();
+            assert_eq!(left.stepup.unwrap().actions_left, STEPUP_ACTIONS - 1 - i);
+        }
+        assert!(s.use_stepup(&t, 101, net, Some("a@x")).is_none(), "capped");
+        assert_eq!(s.get(&t, 101).unwrap().stepup_left(101), None);
+        s.open_stepup(&t, 200, net, Some("a@x")).unwrap();
+        assert!(
+            s.use_stepup(&t, 200 + STEPUP_SECS, net, Some("a@x"))
+                .is_none(),
+            "expired"
+        );
+        // Pre-login sessions never get a window; logout drops it.
+        let (pre, _) = s.create_pre(100);
+        assert!(s.open_stepup(&pre, 100, net, None).is_none());
+        s.open_stepup(&t, 300, net, None).unwrap();
+        s.remove(&t);
+        assert!(s.use_stepup(&t, 300, net, None).is_none());
     }
 
     #[test]

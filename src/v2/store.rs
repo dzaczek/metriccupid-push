@@ -1283,6 +1283,7 @@ pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreErro
         [cutoff(now, GATEWAY_BINDING_RETENTION_SECS)],
     )?;
     c.execute("DELETE FROM manual_bans WHERE until <= ?1", [now as i64])?;
+    crate::controls::prune_audit(c, now, crate::controls::AUDIT_MAX_ROWS)?;
     Ok((m, k))
 }
 

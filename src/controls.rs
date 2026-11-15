@@ -25,6 +25,14 @@ pub const BAN_MAX_SECS: u64 = 30 * 86_400;
 /// Shortest prefix a manual ban may cover.
 pub const MIN_V4_PREFIX: u8 = 16;
 pub const MIN_V6_PREFIX: u8 = 32;
+/// Longer IPv6 prefixes are widened to this.
+pub const MAX_V6_PREFIX: u8 = 64;
+/// Bans broader than these always need a fresh authenticator code.
+pub const NARROW_V4_PREFIX: u8 = 24;
+pub const NARROW_V6_PREFIX: u8 = 48;
+/// Audit rows are kept this long, and at most this many.
+pub const AUDIT_RETENTION_SECS: u64 = 90 * 86_400;
+pub const AUDIT_MAX_ROWS: i64 = 100_000;
 pub const MAX_REASON_CHARS: usize = 200;
 /// Longest purchase id accepted by the revoke form.
 pub const MAX_TX_LEN: usize = 128;
@@ -32,8 +40,9 @@ pub const MAX_TX_LEN: usize = 128;
 // ------------------------------------------------------------ validation ---
 
 /// An IP or CIDR prefix for a manual ban: IPv4 /16 or longer, IPv6 /32 or
-/// longer, host bits cleared. IPv4-mapped IPv6 is refused (requests are
-/// matched on the canonical address).
+/// longer, host bits cleared. IPv6 is normalised to at most a /64 (one host
+/// usually controls a whole /64, like `limits::ip_key`). IPv4-mapped IPv6 is
+/// refused (requests are matched on the canonical address).
 pub fn parse_ban_target(s: &str) -> Result<IpNet, &'static str> {
     let s = s.trim();
     if s.is_empty() || s.len() > 64 {
@@ -56,6 +65,11 @@ pub fn parse_ban_target(s: &str) -> Result<IpNet, &'static str> {
         IpNet::V6(n) if n.prefix_len() < MIN_V6_PREFIX => {
             Err("IPv6 prefixes must be /32 or longer.")
         }
+        IpNet::V6(n) if n.prefix_len() > MAX_V6_PREFIX => Ok(IpNet::V6(
+            ipnet::Ipv6Net::new(n.addr(), MAX_V6_PREFIX)
+                .expect("valid prefix length")
+                .trunc(),
+        )),
         n => Ok(n.trunc()),
     }
 }
@@ -64,12 +78,14 @@ pub fn parse_ban_target(s: &str) -> Result<IpNet, &'static str> {
 pub fn parse_duration(s: &str) -> Result<u64, &'static str> {
     const BAD: &str = "Duration must be 15m to 30d (e.g. 15m, 6h, 7d).";
     let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
-    let mult = match unit {
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        _ => return Err(BAD),
+    let (num, mult) = if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400)
+    } else {
+        return Err(BAD);
     };
     if num.is_empty() || num.len() > 5 || !num.bytes().all(|b| b.is_ascii_digit()) {
         return Err(BAD);
@@ -155,13 +171,13 @@ const fn switch(key: &'static str, help: &'static str) -> LimitKey {
 pub const LIMIT_KEYS: &[LimitKey] = &[
     num(
         "RATE_GLOBAL_PER_SEC",
-        1,
+        20,
         10_000,
         "Hosted global bucket, requests per second (every route except the gateway push)",
     ),
     num(
         "RATE_GLOBAL_BURST",
-        1,
+        20,
         100_000,
         "Hosted global bucket, burst",
     ),
@@ -229,6 +245,15 @@ pub const LIMIT_KEYS: &[LimitKey] = &[
         "Strict gateway: registrations and pushes need a gateway licence",
     ),
 ];
+
+/// Keys whose change always needs a fresh authenticator code (no step-up
+/// window): the gateway switches and the hosted global bucket.
+pub fn limit_needs_fresh(key: &str) -> bool {
+    matches!(
+        key,
+        "GATEWAY_OPEN" | "GATEWAY_REQUIRE_LICENCE" | "RATE_GLOBAL_PER_SEC" | "RATE_GLOBAL_BURST"
+    )
+}
 
 pub fn limit_key(key: &str) -> Option<&'static LimitKey> {
     LIMIT_KEYS.iter().find(|k| k.key == key)
@@ -586,7 +611,32 @@ pub struct Audit {
     pub outcome: &'static str,
 }
 
-/// Append to the audit log. There is no update or delete path.
+/// Whether a ban on `net` is broad enough to need a fresh code (shorter
+/// than IPv4 /24 or IPv6 /48).
+pub fn is_broad_ban(net: &IpNet) -> bool {
+    match net {
+        IpNet::V4(n) => n.prefix_len() < NARROW_V4_PREFIX,
+        IpNet::V6(n) => n.prefix_len() < NARROW_V6_PREFIX,
+    }
+}
+
+/// Retention: drop audit rows older than [`AUDIT_RETENTION_SECS`] and all
+/// but the newest `max_rows`. Returns the rows removed. Run by the storage
+/// cleanup only; the panel never deletes audit rows.
+pub fn prune_audit(c: &Connection, now: u64, max_rows: i64) -> R<usize> {
+    let old = c.execute(
+        "DELETE FROM admin_audit WHERE ts <= ?1",
+        [now.saturating_sub(AUDIT_RETENTION_SECS) as i64],
+    )?;
+    let over = c.execute(
+        "DELETE FROM admin_audit WHERE id <= (SELECT id FROM admin_audit ORDER BY id DESC LIMIT 1 OFFSET ?1)",
+        [max_rows],
+    )?;
+    Ok(old + over)
+}
+
+/// Append to the audit log. There is no update or delete path from the
+/// panel.
 pub fn audit(c: &Connection, a: &Audit) -> R<()> {
     c.execute(
         "INSERT INTO admin_audit (ts, actor, ip_prefix, action, target, detail, outcome)
@@ -627,6 +677,23 @@ mod tests {
             "2001:db8:1::/48"
         );
         assert!(parse_ban_target("2001:db8::/32").is_ok());
+        // IPv6 is banned per /64 at most, like the automatic bans.
+        for long in [
+            "2001:db8:1:2::5",
+            "2001:db8:1:2:aaaa::1/128",
+            "2001:db8:1:2::/80",
+        ] {
+            assert_eq!(
+                parse_ban_target(long).unwrap().to_string(),
+                "2001:db8:1:2::/64",
+                "{long}"
+            );
+        }
+        assert!(is_broad_ban(&parse_ban_target("192.0.2.0/23").unwrap()));
+        assert!(!is_broad_ban(&parse_ban_target("192.0.2.0/24").unwrap()));
+        assert!(is_broad_ban(&parse_ban_target("2001:db8::/47").unwrap()));
+        assert!(!is_broad_ban(&parse_ban_target("2001:db8::/48").unwrap()));
+        assert!(!is_broad_ban(&parse_ban_target("2001:db8::1").unwrap()));
         assert!(parse_ban_target("2001:db8::/31").is_err());
         assert!(parse_ban_target("::/0").is_err());
         assert!(parse_ban_target("::ffff:192.0.2.7").is_err());
@@ -749,6 +816,39 @@ mod tests {
     }
 
     #[test]
+    fn audit_retention_by_age_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::v2::store::Store::open(dir.path()).unwrap();
+        let row = |ts| Audit {
+            ts,
+            actor: "a".into(),
+            ip_prefix: "192.0.2.0/24".into(),
+            action: "x",
+            target: None,
+            detail: None,
+            outcome: "ok",
+        };
+        let now = 200 * 86_400;
+        store
+            .blocking(|c| {
+                audit(c, &row(now - AUDIT_RETENTION_SECS - 1))?;
+                for i in 0..5 {
+                    audit(c, &row(now - 10 + i))?;
+                }
+                assert_eq!(prune_audit(c, now, 3)?, 3, "1 too old, 2 over the cap");
+                let ts: Vec<i64> = c
+                    .prepare("SELECT ts FROM admin_audit ORDER BY id")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                let now = now as i64;
+                assert_eq!(ts, [now - 8, now - 7, now - 6], "the newest are kept");
+                assert_eq!(prune_audit(c, now as u64, 3)?, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn manual_bans_match_prefixes_and_expire() {
         let c = Config::from_lookup(|k| match k {
             "APNS_MODE" => Some("mock".into()),
@@ -774,10 +874,17 @@ mod tests {
         );
         assert_eq!(ctl.banned_for(ip("192.0.3.9"), 10), None);
         assert_eq!(ctl.banned_for(ip("2001:db8:5::1"), 10), Some(40));
+        // A /64 ban matches every address of that /64, i.e. its ip_key.
+        ctl.put_ban(ban("2001:db9:1:2::7", 30));
+        for a in ["2001:db9:1:2::7", "2001:db9:1:2:ffff::1"] {
+            assert_eq!(ctl.banned_for(ip(a), 10), Some(20), "{a}");
+            assert_eq!(ctl.banned_for(crate::limits::ip_key(ip(a)), 10), Some(20));
+        }
+        assert_eq!(ctl.banned_for(ip("2001:db9:1:3::7"), 10), None);
         assert_eq!(ctl.banned_for(ip("192.0.2.9"), 100), None, "expired");
         // Replacing keeps one entry per prefix.
         ctl.put_ban(ban("192.0.2.0/24", 200));
-        assert_eq!(ctl.bans(10).len(), 2);
+        assert_eq!(ctl.bans(10).len(), 3);
         assert!(ctl.remove_ban(&parse_ban_target("192.0.2.0/24").unwrap()));
         assert_eq!(ctl.banned_for(ip("192.0.2.9"), 10), None);
         ctl.cleanup(60);

@@ -510,20 +510,27 @@ guide:
 ### Management
 
 Besides the read-only pages, the panel can act. Every action is a `POST` form that needs the
-session, its CSRF token and a **fresh authenticator code typed into the form** (step-up): a code
-already used for a login or another action is refused, so actions are at most one per 30 s step.
-Refused codes count toward the login lockout (5 per IP in 15 min lock logins *and* actions), and all
-admins together get 30 actions per minute. Each action and each refused code is written to the
-**audit log** (`/admin/audit`: time, admin user plus Cloudflare Access e-mail, /24 or /48, action,
-target, outcome); the panel has no way to edit or delete it.
+session, its CSRF token and the action rate limit (30 per minute, all admins together); the input
+is validated next, so a refused input never uses up a code. Then **step-up**: an authenticator
+code typed into the form that was not used before (for a login or an action) opens a **step-up
+window** on the server-side session: for 5 minutes, and at most 10 actions, the code field may be
+left empty. The window is bound to the session, the admin's /24 or /48 and the Cloudflare Access
+identity, is shown in the page header, and ends with logout. These always need a fresh code:
+licence revoke / restore, changes of `GATEWAY_OPEN`, `GATEWAY_REQUIRE_LICENCE` and
+`RATE_GLOBAL_*`, and bans broader than IPv4 /24 or IPv6 /48. Wrong or reused codes count toward the
+login lockout (5 per IP in 15 min lock logins *and* actions). Each action, each refused code and
+each refused input is written to the **audit log** (`/admin/audit`: time, admin user plus
+Cloudflare Access e-mail, /24 or /48, action, target, detail with `stepup=fresh` or
+`stepup=window`, outcome), in the same transaction as the change; the panel has no way to edit or
+delete it. Rows are kept 90 days, at most 100 000.
 
 | Page | Actions |
 |---|---|
-| **Bans** | Lists manual bans and the current automatic (auth-failure) bans with their expiry. Ban an IP or CIDR prefix (IPv4 /16 or longer, IPv6 /32 or longer) for 15 min to 30 days with a reason; lift a manual ban; unban an automatic one. Manual bans are stored (table `manual_bans`), survive restarts and are checked before anything else on every public request (`429` with `Retry-After`). |
-| **Gateway** | Gateway groups with licence state, join date, token count, last use, pushes sent in the last hour, refusals (`token_bound`, `not_gateway_group`, `token_limit`, ...). Per group: unbind one token (tokens are shown as a SHA-256 fingerprint only), remove the group from the gateway (membership deleted, tokens unbound; it can register again while the gateway is open, so suspend it to keep it out). |
-| **Groups** (detail page) | Suspend / unsuspend with a reason. A suspended group gets `403 group_suspended` on every signed route, its streams are closed, nothing is pushed to its phones; its data is kept. |
+| **Bans** | Lists manual bans and the current automatic (auth-failure) bans with their expiry. Ban an IP or CIDR prefix (IPv4 /16 or longer, IPv6 /32 to /64; a longer IPv6 prefix or a single IPv6 address is widened to its /64, like the automatic bans) for 15 min to 30 days with a reason; lift a manual ban; unban an automatic one. Manual bans are stored (table `manual_bans`), survive restarts and are checked before anything else on every public request (`429` with `Retry-After`). |
+| **Gateway** | Gateway groups with licence state, join date, token count, last use, pushes sent in the last hour, refusals (`token_bound`, `not_gateway_group`, `token_limit`, ...). Per group: unbind one token (tokens are shown as a SHA-256 fingerprint only), remove the group from the gateway (membership deleted, tokens unbound). Removal is a **reset**, not a block: the group can register again while the gateway is open. Suspension is the block. |
+| **Groups** (detail page) | Suspend / unsuspend with a reason. A suspended group gets `403 group_suspended` on every signed route and on `POST /v2/groups` (no re-registration, licence attach or gateway re-add), its streams are closed, nothing is pushed to its phones; its data is kept. |
 | **Licences** | Revoke / restore an App Store purchase by its `appTransactionId`. Takes effect at once for groups already using it: hosted groups count as unlicensed (per `LICENCE_MODE`), gateway groups lose the licensed quotas and, with `GATEWAY_REQUIRE_LICENCE=true`, get `402` at push. Purchase ids are never shown, only a fingerprint (first 12 hex digits of the SHA-256). `LICENCE_REVOKED_TX` entries are listed but can only be removed in the environment. |
-| **Limits** | Effective values of `RATE_GLOBAL_*`, `RATE_IP_*`, `RATE_V2_GATEWAY_*`, `GATEWAY_GROUP_*`, `GATEWAY_GLOBAL_*`, `GATEWAY_MAX_TOKENS_PER_GROUP`, `GATEWAY_MAX_GROUPS`, `GATEWAY_OPEN` (kill switch) and `GATEWAY_REQUIRE_LICENCE`, with a per-key override applied without a restart (a changed rate replaces its limiter, whose buckets start full) and kept across restarts until **reset to config**. Overrides must stay within fixed ranges (shown on the page). |
+| **Limits** | Effective values of `RATE_GLOBAL_*`, `RATE_IP_*`, `RATE_V2_GATEWAY_*`, `GATEWAY_GROUP_*`, `GATEWAY_GLOBAL_*`, `GATEWAY_MAX_TOKENS_PER_GROUP`, `GATEWAY_MAX_GROUPS`, `GATEWAY_OPEN` (kill switch) and `GATEWAY_REQUIRE_LICENCE`, with a per-key override applied without a restart (a changed rate replaces its limiter, whose buckets start full) and kept across restarts until **reset to config**. Overrides must stay within fixed ranges (shown on the page; `RATE_GLOBAL_*` cannot go below 20, so the panel cannot throttle the whole public API). |
 
 The management state lives in SQLite tables added like the 0.2.1 gateway tables (`CREATE TABLE IF
 NOT EXISTS`, schema version stays 6): `admin_audit`, `manual_bans`, `group_suspensions`,
@@ -542,7 +549,8 @@ lasting revocations in `LICENCE_REVOKED_TX` and lasting limits in the environmen
 - **CSRF**: every POST (login, logout, management actions) needs the per-session token from a
   hidden form field; `SameSite=Strict` is defence in depth. Every other admin route is a read-only
   GET.
-- **Step-up**: each management action also needs a fresh TOTP code (see [Management](#management));
+- **Step-up**: management actions also need a fresh TOTP code or an open step-up window (see
+  [Management](#management));
   inputs are validated strictly (IP / CIDR, group id, duration, reason, numeric ranges) and every
   value shown is HTML-escaped. Purchase ids and APNs tokens are never shown in full.
 - **Brute force**: 5 failed logins per IP (IPv6 /64) within 15 min, or 20 in total, lock logins for

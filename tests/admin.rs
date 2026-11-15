@@ -194,6 +194,36 @@ impl Servers {
         (status, body)
     }
 
+    /// A panel action with the CSRF token and an empty code (step-up window).
+    async fn act_in_window(
+        &self,
+        session: &str,
+        path: &str,
+        fields: &[(&str, &str)],
+    ) -> (u16, String) {
+        let csrf = self.csrf_of(session).await;
+        let mut f = vec![("csrf", csrf.as_str()), ("totp", "")];
+        f.extend_from_slice(fields);
+        let (status, _, body) = self.post_form(path, Some(session), &f).await;
+        (status, body)
+    }
+
+    /// Audit details of successful actions, oldest first.
+    async fn audit_details(&self) -> Vec<String> {
+        self.db(|c| {
+            let mut st = c
+                .prepare(
+                    "SELECT detail FROM admin_audit WHERE outcome IN ('ok', 'noop') ORDER BY id",
+                )
+                .unwrap();
+            st.query_map([], |r| r.get::<_, Option<String>>(0))
+                .unwrap()
+                .map(|r| r.unwrap().unwrap_or_default())
+                .collect()
+        })
+        .await
+    }
+
     /// Audit rows, oldest first: (action, outcome, target).
     async fn audit(&self) -> Vec<(String, String, Option<String>)> {
         self.db(|c| {
@@ -1620,7 +1650,7 @@ async fn automatic_ban_is_listed_and_can_be_lifted() {
 #[tokio::test]
 async fn suspended_group_gets_403_its_stream_closed_and_no_pushes() {
     use futures_util::StreamExt;
-    let s = servers(&[]).await;
+    let s = servers(&[("RATE_V2_GROUPS_BURST", "20")]).await;
     let session = s.login().await;
     let (mac, phone) = hosted_group(&s, 40, json!({})).await;
     let other = hosted_group(&s, 50, json!({})).await.0;
@@ -1666,6 +1696,14 @@ async fn suspended_group_gets_403_its_stream_closed_and_no_pushes() {
         );
     }
     assert_eq!(open_ws(&mac).await.err(), Some(403));
+    // No re-registration, licence attach or gateway re-add either.
+    for extra in [json!({}), json!({"gateway": true})] {
+        let r = mac.create_group_with(extra).await;
+        assert_eq!(
+            (r.status, r.json["error"].as_str()),
+            (403, Some("group_suspended"))
+        );
+    }
     // The Mac-offline notice after the grace period is not pushed either.
     s.set_time(s.clock.now() + 600);
     metriccupid_push::v2::presence_tick(&s.state).await;
@@ -1705,8 +1743,16 @@ async fn suspended_group_gets_403_its_stream_closed_and_no_pushes() {
         )
         .await;
     assert_eq!(st, 404);
+    // A malformed path id is only judged after the session and CSRF
+    // token (no oracle for unauthenticated callers).
     let (st, _, _) = s
         .post_form("/admin/groups/nope/suspend", Some(&session), &[])
+        .await;
+    assert_eq!(st, 403, "CSRF first");
+    let (st, _, _) = s.post_form("/admin/groups/nope/suspend", None, &[]).await;
+    assert_eq!(st, 303, "login first");
+    let (st, _) = s
+        .act(&session, "/admin/groups/nope/suspend", &[("reason", "x")])
         .await;
     assert_eq!(st, 404);
 
@@ -2015,6 +2061,8 @@ async fn live_limit_override_applies_without_restart_is_bounded_and_resets() {
         ("RATE_IP_BURST", "-1", "negative"),
         ("NOPE", "1", "unknown key"),
         ("GATEWAY_OPEN", "2", "switch"),
+        ("RATE_GLOBAL_PER_SEC", "19", "global floor"),
+        ("RATE_GLOBAL_BURST", "1", "global floor"),
     ] {
         let (st, body) = s
             .act(
@@ -2088,7 +2136,7 @@ async fn live_limit_override_applies_without_restart_is_bounded_and_resets() {
             .count(),
         2
     );
-    assert_eq!(rows.iter().filter(|(_, o, _)| o == "invalid").count(), 6);
+    assert_eq!(rows.iter().filter(|(_, o, _)| o == "invalid").count(), 8);
 }
 
 #[tokio::test]
@@ -2144,4 +2192,234 @@ async fn new_pages_render_escaped_without_scripts() {
         );
         assert_eq!(s.get(path, None).await.0, 303, "{path} needs a session");
     }
+}
+
+// --------------------------------------------------------------- step-up ---
+
+const RESET_IP: &[(&str, &str)] = &[("key", "RATE_IP_BURST")];
+
+#[tokio::test]
+async fn stepup_window_allows_actions_without_a_code_until_expiry_or_cap() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    // No window yet: an empty code is refused (and does not count as a
+    // wrong code).
+    let (st, body) = s
+        .act_in_window(&session, "/admin/limits/reset", RESET_IP)
+        .await;
+    assert_eq!(st, 401, "{body}");
+    assert!(body.contains("no step-up window"), "{body}");
+    let (_, _, html) = s.get("/admin/bans", Some(&session)).await;
+    assert!(!html.contains("Step-up:"), "no window shown");
+
+    let (st, body) = s.act(&session, "/admin/limits/reset", RESET_IP).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("Step-up: 5m · 10 actions left"), "{body}");
+    s.set_time(s.clock.now() + 60);
+    let (_, _, html) = s.get("/admin/bans", Some(&session)).await;
+    assert!(html.contains("Step-up: 4m · 10 actions left"), "header");
+    // Ten actions inside the window, the eleventh needs a code again.
+    for i in 0..10 {
+        let (st, body) = s
+            .act_in_window(&session, "/admin/limits/reset", RESET_IP)
+            .await;
+        assert_eq!(st, 200, "window action {i}: {body}");
+    }
+    let (st, _) = s
+        .act_in_window(&session, "/admin/limits/reset", RESET_IP)
+        .await;
+    assert_eq!(st, 401, "capped at 10");
+    let details = s.audit_details().await;
+    assert_eq!(details.len(), 11);
+    assert!(details[0].ends_with("stepup=fresh"), "{details:?}");
+    assert!(
+        details[1..].iter().all(|d| d.ends_with("stepup=window")),
+        "{details:?}"
+    );
+
+    // A new code renews it; it ends after 5 minutes.
+    s.act(&session, "/admin/limits/reset", RESET_IP).await;
+    s.set_time(s.clock.now() + 299);
+    assert_eq!(
+        s.act_in_window(&session, "/admin/limits/reset", RESET_IP)
+            .await
+            .0,
+        200
+    );
+    s.set_time(s.clock.now() + 1);
+    assert_eq!(
+        s.act_in_window(&session, "/admin/limits/reset", RESET_IP)
+            .await
+            .0,
+        401,
+        "expired"
+    );
+    let rows = s.audit().await;
+    assert_eq!(
+        rows.iter()
+            .filter(|(_, o, _)| o == "stepup_required")
+            .count(),
+        3
+    );
+    // Empty codes never lock anyone out.
+    assert_eq!(rows.iter().filter(|(_, o, _)| o == "locked").count(), 0);
+}
+
+#[tokio::test]
+async fn some_actions_always_need_a_fresh_code() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    assert_eq!(
+        s.act(&session, "/admin/limits/reset", RESET_IP).await.0,
+        200
+    );
+    let ban = |t: &'static str| [("target", t), ("duration", "1h"), ("reason", "x")];
+    for (path, fields, why) in [
+        (
+            "/admin/licences/revoke",
+            vec![("tx", "tx-1"), ("reason", "x")],
+            "revoke",
+        ),
+        (
+            "/admin/licences/restore",
+            vec![("fp", "0123456789ab")],
+            "restore",
+        ),
+        (
+            "/admin/limits/set",
+            vec![("key", "GATEWAY_OPEN"), ("value", "1")],
+            "kill switch",
+        ),
+        (
+            "/admin/limits/reset",
+            vec![("key", "GATEWAY_OPEN")],
+            "kill switch reset",
+        ),
+        (
+            "/admin/limits/set",
+            vec![("key", "GATEWAY_REQUIRE_LICENCE"), ("value", "1")],
+            "strict mode",
+        ),
+        (
+            "/admin/limits/set",
+            vec![("key", "RATE_GLOBAL_BURST"), ("value", "500")],
+            "global rate",
+        ),
+        (
+            "/admin/limits/reset",
+            vec![("key", "RATE_GLOBAL_PER_SEC")],
+            "global reset",
+        ),
+        (
+            "/admin/bans/add",
+            ban("192.0.0.0/23").to_vec(),
+            "broad IPv4 ban",
+        ),
+        (
+            "/admin/bans/add",
+            ban("2001:db8::/40").to_vec(),
+            "broad IPv6 ban",
+        ),
+    ] {
+        let (st, body) = s.act_in_window(&session, path, &fields).await;
+        assert_eq!(st, 401, "{why}: {body}");
+        assert!(body.contains("always needs a fresh"), "{why}: {body}");
+    }
+    // Narrow bans are fine inside the window; IPv6 is banned per /64.
+    let (st, body) = s
+        .act_in_window(&session, "/admin/bans/add", &ban("192.0.2.0/24"))
+        .await;
+    assert_eq!(st, 200, "{body}");
+    let (st, body) = s
+        .act_in_window(&session, "/admin/bans/add", &ban("2001:db8:1:2::5"))
+        .await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("Banned 2001:db8:1:2::/64"), "{body}");
+    let (st, _) = s
+        .act_in_window(
+            &session,
+            "/admin/bans/remove",
+            &[("target", "2001:db8:1:2::9/128")],
+        )
+        .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        s.state.controls().ban_count(s.clock.now()),
+        1,
+        "same /64 lifted"
+    );
+    // With a fresh code the broad ones work.
+    let (st, body) = s
+        .act(&session, "/admin/bans/add", &ban("192.0.0.0/23"))
+        .await;
+    assert_eq!(st, 200, "{body}");
+    let (st, _) = s
+        .act(
+            &session,
+            "/admin/limits/set",
+            &[("key", "RATE_GLOBAL_BURST"), ("value", "500")],
+        )
+        .await;
+    assert_eq!(st, 200);
+    // The limits page marks those forms.
+    let (_, _, html) = s.get("/admin/limits", Some(&session)).await;
+    assert!(html.contains("Code (always needed)") && html.contains("Code (empty during step-up)"));
+}
+
+#[tokio::test]
+async fn logout_closes_the_window() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    assert_eq!(
+        s.act(&session, "/admin/limits/reset", RESET_IP).await.0,
+        200
+    );
+    let csrf_s = s.csrf_of(&session).await;
+    assert_eq!(
+        s.post_form("/admin/logout", Some(&session), &[("csrf", &csrf_s)])
+            .await
+            .0,
+        303
+    );
+    s.set_time(s.clock.now() + 30);
+    let session = s.login().await;
+    let (st, _) = s
+        .act_in_window(&session, "/admin/limits/reset", RESET_IP)
+        .await;
+    assert_eq!(st, 401, "a new session has no window");
+}
+
+#[tokio::test]
+async fn invalid_input_does_not_use_up_a_code() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    let csrf_s = s.csrf_of(&session).await;
+    let code = s.next_code();
+    for bad in [
+        vec![
+            ("target", "10.0.0.0/8"),
+            ("duration", "1h"),
+            ("reason", "x"),
+        ],
+        vec![("target", "192.0.2.1"), ("duration", "1é"), ("reason", "x")],
+    ] {
+        let mut f = vec![("csrf", csrf_s.as_str()), ("totp", code.as_str())];
+        f.extend(bad);
+        let (st, _, body) = s.post_form("/admin/bans/add", Some(&session), &f).await;
+        assert_eq!(st, 400, "{body}");
+    }
+    let (st, _, body) = s
+        .post_form(
+            "/admin/bans/add",
+            Some(&session),
+            &[
+                ("csrf", &csrf_s),
+                ("totp", &code),
+                ("target", "192.0.2.1"),
+                ("duration", "1h"),
+                ("reason", "x"),
+            ],
+        )
+        .await;
+    assert_eq!(st, 200, "the code is still unused: {body}");
 }

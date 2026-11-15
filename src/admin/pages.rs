@@ -261,6 +261,8 @@ pub struct Page<'a> {
     pub json: Option<&'a str>,
     pub refresh: bool,
     pub version: &'a str,
+    /// Seconds and actions left in the session's step-up window.
+    pub stepup: Option<(u64, u32)>,
 }
 
 pub fn layout(p: &Page<'_>, body: &str) -> String {
@@ -290,6 +292,13 @@ pub fn layout(p: &Page<'_>, body: &str) -> String {
         ] {
             let cls = if key == p.nav { r#" class="on""# } else { "" };
             let _ = write!(o, r#"<a href="{href}"{cls}>{label}</a>"#);
+        }
+        if let Some((secs, n)) = p.stepup {
+            let _ = write!(
+                o,
+                r#"<span class="stepup" title="Most management actions need no code until then">Step-up: {} · {n} actions left</span>"#,
+                fmt_dur(secs)
+            );
         }
         let _ = write!(
             o,
@@ -776,10 +785,25 @@ pub fn security(now: u64, s: &Security, sessions: usize) -> String {
 // ------------------------------------------------------------ management ---
 
 /// A POST form for one panel action: CSRF token, the action's own fields,
-/// and a fresh authenticator code (step-up).
+/// and an authenticator code, which may stay empty while the session's
+/// step-up window is open.
 pub fn action_form(action: &str, csrf: &str, fields: &str, button: &str) -> String {
+    form(action, csrf, fields, button, false)
+}
+
+/// Like [`action_form`] for actions that always need a fresh code.
+pub fn action_form_fresh(action: &str, csrf: &str, fields: &str, button: &str) -> String {
+    form(action, csrf, fields, button, true)
+}
+
+fn form(action: &str, csrf: &str, fields: &str, button: &str, fresh: bool) -> String {
+    let (label, required) = if fresh {
+        ("Code (always needed)", " required")
+    } else {
+        ("Code (empty during step-up)", "")
+    };
     format!(
-        r#"<form method="post" action="{}" class="action" autocomplete="off"><input type="hidden" name="csrf" value="{}">{fields}<label>Code <input name="totp" inputmode="numeric" pattern="[0-9]{{6}}" autocomplete="one-time-code" required maxlength="6" size="7"></label><button type="submit">{}</button></form>"#,
+        r#"<form method="post" action="{}" class="action" autocomplete="off"><input type="hidden" name="csrf" value="{}">{fields}<label>{label} <input name="totp" inputmode="numeric" pattern="[0-9]{{6}}" autocomplete="one-time-code"{required} maxlength="6" size="7"></label><button type="submit">{}</button></form>"#,
         esc(action),
         esc(csrf),
         esc(button)
@@ -825,7 +849,7 @@ pub fn bans(now: u64, manual: &[ManualBan], auto: &[(IpAddr, u64)], csrf: &str) 
         ),
         "Ban",
     );
-    b += r#"<p class="muted">IPv4 /16 or longer, IPv6 /32 or longer; 15 minutes to 30 days.</p>"#;
+    b += r#"<p class="muted">IPv4 /16 or longer, IPv6 /32 to /64 (longer IPv6 prefixes are widened to their /64); 15 minutes to 30 days. Bans broader than IPv4 /24 or IPv6 /48 always need a fresh code.</p>"#;
     let _ = write!(b, "<h2>Manual bans ({})</h2>", manual.len());
     if manual.is_empty() {
         b += r#"<p class="muted">None.</p>"#;
@@ -992,7 +1016,7 @@ pub fn licences(rows: &[RevokedRow], config: &[(String, u64)], csrf: &str) -> St
     let mut b = String::from(
         r#"<p>A revoked purchase is refused at registration and <code>PUT /v2/licence</code>, and groups it is already attached to are treated as unlicensed at once: hosted groups follow <code>LICENCE_MODE</code>, gateway groups lose the licensed quotas (and are refused with <code>GATEWAY_REQUIRE_LICENCE</code>). Purchase ids are never shown: rows carry a fingerprint (first 12 hex digits of the id's SHA-256).</p><h2>Revoke a purchase</h2>"#,
     );
-    b += &action_form(
+    b += &action_form_fresh(
         "/admin/licences/revoke",
         csrf,
         &format!(
@@ -1015,7 +1039,7 @@ pub fn licences(rows: &[RevokedRow], config: &[(String, u64)], csrf: &str) -> St
                 esc(&r.reason),
                 esc(&r.actor),
                 r.groups,
-                action_form(
+                action_form_fresh(
                     "/admin/licences/restore",
                     csrf,
                     &hidden("fp", &r.fp),
@@ -1063,7 +1087,7 @@ fn limit_value(kind: LimitKind, v: u32) -> String {
 
 pub fn limits(rows: &[LimitRow], csrf: &str) -> String {
     let mut b = String::from(
-        r#"<p>Overrides apply at once, without a restart, and are kept across restarts until reset. A changed rate replaces its limiter, so its buckets start full again. Each override must stay within the range shown.</p><div class="scroll"><table><tr><th>Key</th><th>Meaning</th><th>Config</th><th>Override</th><th>Effective</th><th>Range</th><th>Set</th><th>Reset</th></tr>"#,
+        r#"<p>Changes to <code>GATEWAY_OPEN</code>, <code>GATEWAY_REQUIRE_LICENCE</code> and <code>RATE_GLOBAL_*</code> always need a fresh code. Overrides apply at once, without a restart, and are kept across restarts until reset. A changed rate replaces its limiter, so its buckets start full again. Each override must stay within the range shown.</p><div class="scroll"><table><tr><th>Key</th><th>Meaning</th><th>Config</th><th>Override</th><th>Effective</th><th>Range</th><th>Set</th><th>Reset</th></tr>"#,
     );
     for r in rows {
         let Some(k) = LIMIT_KEYS.iter().find(|k| k.key == r.key) else {
@@ -1085,8 +1109,14 @@ pub fn limits(rows: &[LimitRow], csrf: &str) -> String {
             LimitKind::Switch => "true / false".to_string(),
             LimitKind::Number => format!("{} to {}", k.min, k.max),
         };
+        let fresh = crate::controls::limit_needs_fresh(k.key);
+        let f = if fresh {
+            action_form_fresh
+        } else {
+            action_form
+        };
         let reset = if r.overridden.is_some() {
-            action_form("/admin/limits/reset", csrf, &hidden("key", k.key), "Reset")
+            f("/admin/limits/reset", csrf, &hidden("key", k.key), "Reset")
         } else {
             "-".into()
         };
@@ -1100,7 +1130,7 @@ pub fn limits(rows: &[LimitRow], csrf: &str) -> String {
                 .map_or("-".into(), |v| esc(&limit_value(k.kind, v))),
             esc(&limit_value(k.kind, effective)),
             esc(&range),
-            action_form(
+            f(
                 "/admin/limits/set",
                 csrf,
                 &format!("{}{input}", hidden("key", k.key)),

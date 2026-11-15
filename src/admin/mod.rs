@@ -5,7 +5,8 @@
 //! Access control, in order: IP allowlist on the real client IP and, when
 //! configured, a valid Cloudflare Access JWT (else a plain 404), login with password (argon2id) and TOTP, server-side session
 //! cookie, per-session CSRF token on every POST. Every response carries
-//! strict security headers. Pages show metadata only.
+//! strict security headers. Pages show metadata only. Management actions
+//! (`actions`) add a step-up TOTP code or window on top.
 
 // Handlers return `Result<_, Response>` where the error is the finished
 // response, built on the cold path only.
@@ -489,6 +490,7 @@ fn login_page(
         json: None,
         refresh: false,
         version: VERSION,
+        stepup: None,
     };
     let html = Html(pages::layout(&page, &pages::login(error, csrf)));
     match cookie {
@@ -634,7 +636,9 @@ async fn logout(
 
 // ----------------------------------------------------------------- pages ---
 
+#[allow(clippy::too_many_arguments)]
 fn page(
+    s: &AdminState,
     title: &str,
     nav: &str,
     sess: &Session,
@@ -651,6 +655,7 @@ fn page(
         json,
         refresh,
         version: VERSION,
+        stepup: sess.stepup_left(s.now()),
     };
     Html(pages::layout(&p, body)).into_response()
 }
@@ -674,6 +679,7 @@ async fn overview_page(
     let o = tri!(s.query(move |c| queries::overview(c, now)).await);
     let body = pages::overview(now, &o, &s.runtime());
     page(
+        &s,
         "Overview",
         "overview",
         &sess,
@@ -694,6 +700,7 @@ async fn groups_page(
     let f2 = f.clone();
     let rows = tri!(s.query(move |c| queries::groups(c, now, &f2)).await);
     page(
+        &s,
         "Groups",
         "groups",
         &sess,
@@ -736,6 +743,7 @@ async fn group_page(
     let path = format!("/admin/groups/{}", g.group_id);
     let json = format!("/admin/api/groups/{}", g.group_id);
     page(
+        &s,
         "Group",
         "groups",
         &sess,
@@ -756,6 +764,7 @@ async fn pushes_page(
     let p = tri!(s.query(move |c| queries::pushes(c, now)).await);
     let body = pages::pushes(now, &p, s.info.apns_mode);
     page(
+        &s,
         "Pushes and APNs",
         "pushes",
         &sess,
@@ -776,6 +785,7 @@ async fn security_page(
     let sec = tri!(s.query(move |c| queries::security(c, now)).await);
     let body = pages::security(now, &sec, s.sessions.len());
     page(
+        &s,
         "Security",
         "security",
         &sess,

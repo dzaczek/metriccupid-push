@@ -470,6 +470,11 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
     if !is_id128(&req.group_id) {
         return bad("group_id must be 16 bytes, base64url without padding");
     }
+    // Suspended from the admin panel: no re-registration, licence attach or
+    // gateway re-add either.
+    if state.controls().is_suspended(&req.group_id) {
+        return group_suspended();
+    }
     let key: [u8; 32] = match STANDARD
         .decode(&req.auth_key)
         .ok()
@@ -2170,6 +2175,22 @@ async fn open_stream(State(state): State<Arc<AppState>>, req: Request) -> Respon
             .on_upgrade(move |socket| async move {
                 let v2 = st.v2();
                 match v2.hub.register(&a.group, &device) {
+                    // Suspended between `authenticate` and here: the admin
+                    // sets the flag before dropping the group's streams, so
+                    // either that drop sees this registration or this check
+                    // sees the flag.
+                    Ok((id, _rx)) if st.controls().is_suspended(&a.group) => {
+                        v2.hub.unregister(&a.group, &device, id);
+                        let mut socket = socket;
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Close(Some(
+                                axum::extract::ws::CloseFrame {
+                                    code: 1008,
+                                    reason: "group suspended".into(),
+                                },
+                            )))
+                            .await;
+                    }
                     Ok((id, rx)) => stream::run(socket, st.clone(), a.group, device, id, rx).await,
                     Err(_) => {
                         let mut socket = socket;
