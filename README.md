@@ -263,7 +263,7 @@ exposes them at `GET /v2/debug/pushes`.
 | `GATEWAY_GROUP_PER_HOUR` / `_BURST` | `600` / `100` | Per gateway group and hour, on top of `RATE_V2_GATEWAY_*`. Licensed groups get twice both. |
 | `GATEWAY_MAX_TOKENS_PER_GROUP` | `30` | Device / activity tokens one gateway group may have used within 24 h; more get `429 token_limit`. Older bindings free their slot; bindings unused for 7 days are deleted. |
 | `GATEWAY_MAX_GROUPS` | `2000` | Gateway groups in total; new ones beyond get `503 gateway_full`. |
-| `LICENCE_REVOKED_TX` | empty | Comma-separated purchase ids (`appTransactionId`) refused with `403 licence_invalid` (`reason: revoked`). Never logged. |
+| `LICENCE_REVOKED_TX` | empty | Comma-separated purchase ids (`appTransactionId`) refused with `403 licence_invalid` (`reason: revoked`); groups they are already attached to count as unlicensed. Merged with revocations made in the [admin panel](#management). Never logged. |
 | `DATA_DIR` | `/data` | Directory for the SQLite database (`metriccupid-push.sqlite3`, WAL). Must be writable. |
 | `LICENCE_MODE` | `app_transaction` in hosted, `open` self-hosted | `MODE=hosted` only. `app_transaction`: a group needs a verified App Store purchase of the app (StoreKit `AppTransaction` JWS) to register and to send; unlicensed groups can still read. `open`: anyone (open beta). Self-hosted servers never require a licence. See PROTOCOL.md section 13. |
 | `HOSTED_OPEN_REGISTRATION` | `false` | Alias: `true` means `LICENCE_MODE=open` (an error together with `LICENCE_MODE=app_transaction`). |
@@ -426,6 +426,9 @@ no JavaScript; JSON mirrors under `/admin/api/` and a CSV export of the daily ag
 | `/admin/pushes` | `/admin/api/pushes` |
 | `/admin/security` | `/admin/api/security` |
 | | `/admin/export/daily.csv` |
+| `/admin/bans`, `/admin/gateway`, `/admin/gateway/{group_id}`, `/admin/licences`, `/admin/limits`, `/admin/audit` (management, below) | |
+
+The groups list also filters on `suspended=yes|no`.
 
 ### Setup
 
@@ -504,6 +507,31 @@ guide:
   reason (`cf_access_missing`, `cf_access_expired`, ...). Tokens are never logged. The verified
   `email` claim is stored with admin login events (Security page); no other claim is kept.
 
+### Management
+
+Besides the read-only pages, the panel can act. Every action is a `POST` form that needs the
+session, its CSRF token and a **fresh authenticator code typed into the form** (step-up): a code
+already used for a login or another action is refused, so actions are at most one per 30 s step.
+Refused codes count toward the login lockout (5 per IP in 15 min lock logins *and* actions), and all
+admins together get 30 actions per minute. Each action and each refused code is written to the
+**audit log** (`/admin/audit`: time, admin user plus Cloudflare Access e-mail, /24 or /48, action,
+target, outcome); the panel has no way to edit or delete it.
+
+| Page | Actions |
+|---|---|
+| **Bans** | Lists manual bans and the current automatic (auth-failure) bans with their expiry. Ban an IP or CIDR prefix (IPv4 /16 or longer, IPv6 /32 or longer) for 15 min to 30 days with a reason; lift a manual ban; unban an automatic one. Manual bans are stored (table `manual_bans`), survive restarts and are checked before anything else on every public request (`429` with `Retry-After`). |
+| **Gateway** | Gateway groups with licence state, join date, token count, last use, pushes sent in the last hour, refusals (`token_bound`, `not_gateway_group`, `token_limit`, ...). Per group: unbind one token (tokens are shown as a SHA-256 fingerprint only), remove the group from the gateway (membership deleted, tokens unbound; it can register again while the gateway is open, so suspend it to keep it out). |
+| **Groups** (detail page) | Suspend / unsuspend with a reason. A suspended group gets `403 group_suspended` on every signed route, its streams are closed, nothing is pushed to its phones; its data is kept. |
+| **Licences** | Revoke / restore an App Store purchase by its `appTransactionId`. Takes effect at once for groups already using it: hosted groups count as unlicensed (per `LICENCE_MODE`), gateway groups lose the licensed quotas and, with `GATEWAY_REQUIRE_LICENCE=true`, get `402` at push. Purchase ids are never shown, only a fingerprint (first 12 hex digits of the SHA-256). `LICENCE_REVOKED_TX` entries are listed but can only be removed in the environment. |
+| **Limits** | Effective values of `RATE_GLOBAL_*`, `RATE_IP_*`, `RATE_V2_GATEWAY_*`, `GATEWAY_GROUP_*`, `GATEWAY_GLOBAL_*`, `GATEWAY_MAX_TOKENS_PER_GROUP`, `GATEWAY_MAX_GROUPS`, `GATEWAY_OPEN` (kill switch) and `GATEWAY_REQUIRE_LICENCE`, with a per-key override applied without a restart (a changed rate replaces its limiter, whose buckets start full) and kept across restarts until **reset to config**. Overrides must stay within fixed ranges (shown on the page). |
+
+The management state lives in SQLite tables added like the 0.2.1 gateway tables (`CREATE TABLE IF
+NOT EXISTS`, schema version stays 6): `admin_audit`, `manual_bans`, `group_suspensions`,
+`revoked_licences`, `limit_overrides`. It is loaded at startup and applies even while the panel is
+off. A rollback to 0.2.0 / 0.2.1 opens the same database but ignores these tables, so manual bans,
+suspensions, panel revocations and limit overrides are **not enforced** by those versions (put
+lasting revocations in `LICENCE_REVOKED_TX` and lasting limits in the environment before a rollback).
+
 ### Security model
 
 - **Access, in order**: IP allowlist (real client IP via `TRUST_PROXY`, else `404`), Cloudflare
@@ -511,8 +539,12 @@ guide:
   user + argon2id password + **mandatory TOTP** (±1 step, a code is accepted once), then a 256-bit
   random session token in memory, cookie `mc_admin` (`HttpOnly; Secure; SameSite=Strict; Path=/`).
   The session id is replaced at login (no fixation).
-- **CSRF**: every POST (login, logout) needs the per-session token from a hidden form field;
-  `SameSite=Strict` is defence in depth. All other admin routes are read-only GETs.
+- **CSRF**: every POST (login, logout, management actions) needs the per-session token from a
+  hidden form field; `SameSite=Strict` is defence in depth. Every other admin route is a read-only
+  GET.
+- **Step-up**: each management action also needs a fresh TOTP code (see [Management](#management));
+  inputs are validated strictly (IP / CIDR, group id, duration, reason, numeric ranges) and every
+  value shown is HTML-escaped. Purchase ids and APNs tokens are never shown in full.
 - **Brute force**: 5 failed logins per IP (IPv6 /64) within 15 min, or 20 in total, lock logins for
   15 min. One message for every failure; constant-time comparisons; one argon2 check at a time.
 - **Headers on every response**: `Content-Security-Policy: default-src 'none'; style-src 'self';

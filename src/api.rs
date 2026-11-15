@@ -21,7 +21,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::Authenticator;
 use crate::client_ip::ClientIpResolver;
-use crate::config::{ApnsMode, Config, Mode};
+use crate::config::{ApnsMode, Config, HourlyRate, Mode, Rate};
+use crate::controls::Controls;
 use crate::limits::{ip_key, AuthBans, Clock, ExpiringSet, RateLimits, RetryAfter, V2Limits};
 use crate::metrics::{self, ApiTag, Event, MeteredSender, Metrics};
 use crate::pushover::{Message, PushoverClient, SendError};
@@ -54,6 +55,8 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     v2: V2State,
     metrics: Arc<Metrics>,
+    /// Manual bans, suspensions and live limit overrides (admin panel).
+    controls: Controls,
 }
 
 impl AppState {
@@ -79,7 +82,18 @@ impl AppState {
             clock.clone(),
         ));
         let v2 = build_v2(config, clock.clone(), metrics.clone())?;
-        Ok(Self {
+        // Persisted panel controls apply from the first request, whether or
+        // not the panel is enabled now.
+        let controls = Controls::new(config);
+        let now = clock.now();
+        let loaded = v2
+            .store
+            .blocking(|c| controls.load(c, now))
+            .map_err(|e| format!("cannot load admin controls: {e}"))?;
+        for tx in &loaded.revoked {
+            v2.licence.set_revoked(tx, true);
+        }
+        let s = Self {
             mode: config.mode,
             v1_enabled: config.v1_enabled,
             allow_emergency: config.allow_emergency,
@@ -93,7 +107,17 @@ impl AppState {
             clock,
             v2,
             metrics,
-        })
+            controls,
+        };
+        for key in loaded.overrides {
+            tracing::info!(
+                key,
+                value = s.controls.effective(key),
+                "limit override from the admin panel"
+            );
+            s.apply_limit(key);
+        }
+        Ok(s)
     }
 
     /// Like `new`, but App Store licences are checked against `licence_root`
@@ -125,6 +149,62 @@ impl AppState {
 
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    pub fn controls(&self) -> &Controls {
+        &self.controls
+    }
+
+    /// Auth-failure bans (listed and lifted by the admin panel).
+    pub fn auth_bans(&self) -> &AuthBans {
+        &self.bans
+    }
+
+    /// Rebuild whatever uses live key `key` from its effective value (the
+    /// panel override, else the configuration). Rates replace their limiter
+    /// as a whole; the rest are atomics.
+    pub fn apply_limit(&self, key: &str) {
+        let c = &self.controls;
+        let nz = |k: &str| {
+            std::num::NonZeroU32::new(c.effective(k)).unwrap_or(std::num::NonZeroU32::MIN)
+        };
+        let rate = |p: &str, b: &str| Rate {
+            per_sec: nz(p),
+            burst: nz(b),
+        };
+        let policy = &self.v2.licence;
+        use std::sync::atomic::Ordering::Relaxed;
+        match key {
+            "RATE_GLOBAL_PER_SEC" | "RATE_GLOBAL_BURST" => self
+                .limits
+                .set_global(rate("RATE_GLOBAL_PER_SEC", "RATE_GLOBAL_BURST")),
+            "RATE_IP_PER_SEC" | "RATE_IP_BURST" => self
+                .limits
+                .set_per_ip(rate("RATE_IP_PER_SEC", "RATE_IP_BURST")),
+            "RATE_V2_GATEWAY_PER_SEC" | "RATE_V2_GATEWAY_BURST" => self
+                .v2
+                .limits
+                .set_gateway(rate("RATE_V2_GATEWAY_PER_SEC", "RATE_V2_GATEWAY_BURST")),
+            "GATEWAY_GROUP_PER_HOUR" | "GATEWAY_GROUP_BURST" => {
+                self.v2.limits.set_gateway_hourly(HourlyRate {
+                    per_hour: nz("GATEWAY_GROUP_PER_HOUR"),
+                    burst: nz("GATEWAY_GROUP_BURST"),
+                })
+            }
+            "GATEWAY_GLOBAL_PER_SEC" | "GATEWAY_GLOBAL_BURST" => self
+                .v2
+                .limits
+                .set_gateway_global(rate("GATEWAY_GLOBAL_PER_SEC", "GATEWAY_GLOBAL_BURST")),
+            "GATEWAY_MAX_TOKENS_PER_GROUP" => policy
+                .gateway_max_tokens_per_group
+                .store(c.effective(key), Relaxed),
+            "GATEWAY_MAX_GROUPS" => policy.gateway_max_groups.store(c.effective(key), Relaxed),
+            "GATEWAY_OPEN" => policy.gateway_open.store(c.effective(key) != 0, Relaxed),
+            "GATEWAY_REQUIRE_LICENCE" => policy
+                .gateway_require_licence
+                .store(c.effective(key) != 0, Relaxed),
+            _ => {}
+        }
     }
 
     /// Cloudflare's `CF-IPCountry`, only from a trusted proxy.
@@ -177,6 +257,7 @@ impl AppState {
         self.limits.cleanup();
         self.v2.limits.cleanup();
         self.bans.cleanup(now);
+        self.controls.cleanup(now);
         self.auth.cleanup(now);
         self.dedup
             .lock()
@@ -240,14 +321,15 @@ fn build_v2(
             verifier: AppTransactionVerifier::apple(c.licence_allow_sandbox),
             max_groups: c.licence_max_groups,
             grace_until: c.licence_grace_until,
-            gateway_open: c.gateway_open,
-            gateway_require_licence: c.gateway_require_licence,
+            gateway_open: c.gateway_open.into(),
+            gateway_require_licence: c.gateway_require_licence.into(),
             gateway_activity_lines: c.gateway_activity_lines,
             gateway_apns_sandbox: c.gateway_apns_sandbox,
             gateway_sandbox_licences_count: c.gateway_sandbox_licences_count,
-            gateway_max_tokens_per_group: c.gateway_max_tokens_per_group,
-            gateway_max_groups: c.gateway_max_groups,
+            gateway_max_tokens_per_group: c.gateway_max_tokens_per_group.into(),
+            gateway_max_groups: c.gateway_max_groups.into(),
             revoked: c.licence_revoked.clone(),
+            revoked_live: Default::default(),
         },
         gateway_sends: tokio::sync::Semaphore::new(v2::GATEWAY_MAX_IN_FLIGHT),
         ws_ping: c.ws_ping,
@@ -534,7 +616,8 @@ pub(crate) enum GlobalClass {
     Gateway,
 }
 
-/// Ban, per-IP and global checks, done before any authentication work.
+/// Manual ban, ban, per-IP and global checks, done before any
+/// authentication work.
 // The error is the finished HTTP response; it is only built on the cold path.
 #[allow(clippy::result_large_err)]
 pub(crate) fn precheck(
@@ -543,6 +626,10 @@ pub(crate) fn precheck(
     now: u64,
     class: GlobalClass,
 ) -> Result<(), Outcome> {
+    // Manual bans from the admin panel come first, on the exact address.
+    if let Some(secs) = state.controls.banned_for(ip, now) {
+        return Err((too_many(RetryAfter(secs)), "banned_manual"));
+    }
     let key = ip_key(ip);
     if let Some(secs) = state.bans.banned_for(key, now) {
         return Err((too_many(RetryAfter(secs)), "banned"));

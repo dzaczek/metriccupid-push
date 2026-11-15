@@ -270,6 +270,10 @@ async fn authenticate(
     ) {
         return Err(state.auth_failed(ip, now, e.as_str()));
     }
+    // Suspended from the admin panel: data kept, every signed route refused.
+    if state.controls().is_suspended(group) {
+        return Err(group_suspended());
+    }
 
     let mut authed = Authed {
         group: group.to_string(),
@@ -301,6 +305,13 @@ async fn authenticate(
         authed.device = Some(dev);
     }
     Ok(authed)
+}
+
+fn group_suspended() -> Outcome {
+    (
+        error(StatusCode::FORBIDDEN, "group_suspended"),
+        "group_suspended",
+    )
 }
 
 fn finish(
@@ -415,8 +426,8 @@ fn stored_licence_json(l: Option<&GroupLicence>) -> serde_json::Value {
     })
 }
 
-/// 402 unless the group may send: it has a licence, or the server does not
-/// enforce one (open mode, self-hosted, grace period).
+/// 402 unless the group may send: it has a licence that is not revoked, or
+/// the server does not enforce one (open mode, self-hosted, grace period).
 async fn require_licence(state: &AppState, group: &str) -> Result<(), Outcome> {
     let v2 = state.v2();
     if !v2.licence.enforced(state.now()) {
@@ -424,8 +435,9 @@ async fn require_licence(state: &AppState, group: &str) -> Result<(), Outcome> {
     }
     let g = group.to_string();
     match v2.store.call(move |c| store::group_licence(c, &g)).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(licence_required()),
+        // A purchase revoked after it was attached no longer counts.
+        Ok(Some(l)) if !v2.licence.is_tx_revoked(&l.app_transaction_id) => Ok(()),
+        Ok(_) => Err(licence_required()),
         Err(e) => Err(storage_error(e)),
     }
 }
@@ -482,11 +494,11 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
     // A gateway registration on the hosted server (from a self-hosted
     // server). Closed gateway first, even with a licence.
     let gateway_reg = req.gateway && state.mode() == Mode::Hosted;
-    if gateway_reg && !policy.gateway_open {
+    if gateway_reg && !policy.gateway_open() {
         return gateway_closed();
     }
     // Strict gateway mode: the licence must verify and attach, like hosted.
-    let strict = gateway_reg && policy.gateway_require_licence;
+    let strict = gateway_reg && policy.gateway_require_licence();
     let required = policy.required_for_new_groups();
     let attach_required = required || strict;
     let verified: Option<VerifiedLicence> = match (&req.licence, state.mode()) {
@@ -514,7 +526,7 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
 
     let g = req.group_id.clone();
     let max = policy.max_groups;
-    let max_gateway = policy.gateway_max_groups;
+    let max_gateway = policy.gateway_max_groups();
     let lic = verified.clone();
     let stored = v2
         .store
@@ -966,6 +978,9 @@ async fn get_status(
             .call(move |c| Ok((store::list_devices(c, &g)?, store::group_licence(c, &g)?)))
             .await
             .map_err(storage_error)?;
+        let policy = &state.v2().licence;
+        // A revoked purchase is reported as no licence.
+        let licence = licence.filter(|l| !policy.is_tx_revoked(&l.app_transaction_id));
         let hub = &state.v2().hub;
         let macs: Vec<_> = devices
             .iter()
@@ -980,7 +995,6 @@ async fn get_status(
                 json!({ "device_id": d.device_id, "online": online, "last_seen": d.last_seen })
             })
             .collect();
-        let policy = &state.v2().licence;
         let in_force = policy.required_for_new_groups();
         Ok(ok(
             StatusCode::OK,
@@ -1214,6 +1228,10 @@ async fn fan_out(
     collapse_id: Option<String>,
     expiration: u64,
 ) -> Result<(usize, usize, usize), StoreError> {
+    // Suspended: nothing is pushed (presence and heartbeats included).
+    if state.controls().is_suspended(group) {
+        return Ok((0, 0, 0));
+    }
     let v2 = state.v2();
     let g = group.to_string();
     let targets = v2.store.call(move |c| store::push_targets(c, &g)).await?;
@@ -1360,6 +1378,9 @@ async fn fan_out_activity(
     key: [u8; 32],
     batch: Batch,
 ) -> Result<ActivityFanOut, StoreError> {
+    if state.controls().is_suspended(group) {
+        return Ok(ActivityFanOut::default());
+    }
     let v2 = state.v2();
     let now = state.now();
     let g = group.to_string();
@@ -2195,7 +2216,7 @@ async fn gateway_push(
         group = Some(a.group.clone());
         let v2 = state.v2();
         let policy = &v2.licence;
-        if !policy.gateway_open {
+        if !policy.gateway_open() {
             return Err((
                 error(StatusCode::FORBIDDEN, "gateway_closed"),
                 "gateway_closed",
@@ -2204,8 +2225,13 @@ async fn gateway_push(
         // Only groups registered with `gateway: true` may push to arbitrary
         // tokens; a hosted group pushes to its own devices only.
         let g = a.group.clone();
-        let licensed = match v2.store.call(move |c| store::gateway_member(c, &g)).await {
-            Ok(Some(l)) => l,
+        let member = v2
+            .store
+            .call(move |c| store::gateway_member_licence(c, &g))
+            .await;
+        // A purchase revoked after registration no longer counts.
+        let licensed = match member {
+            Ok(Some((flag, tx))) => flag && !tx.is_some_and(|t| policy.is_tx_revoked(&t)),
             Ok(None) => {
                 return Err((
                     error(StatusCode::FORBIDDEN, "not_gateway_group"),
@@ -2214,6 +2240,13 @@ async fn gateway_push(
             }
             Err(e) => return Err(storage_error(e)),
         };
+        // Strict mode: membership needs a licence that counts, at every push.
+        if policy.gateway_require_licence() && !licensed {
+            return Err((
+                error(StatusCode::PAYMENT_REQUIRED, "licence_required"),
+                "gateway_licence_required",
+            ));
+        }
         // Per-group buckets first: a group's rejected requests use up only
         // its own quota, never the bucket shared by all gateway groups.
         if let Err(ra) = v2.limits.check_gateway(&a.group, licensed) {
@@ -2298,7 +2331,7 @@ async fn gateway_push(
         // The token must not belong to a hosted user or to another gateway
         // group that used it in the last 24 h.
         let (g, t, st) = (a.group.clone(), token.clone(), state.clone());
-        let max_tokens = policy.gateway_max_tokens_per_group;
+        let max_tokens = policy.gateway_max_tokens_per_group();
         let bound = v2
             .store
             .call(move |c| {

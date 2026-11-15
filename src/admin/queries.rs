@@ -3,6 +3,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+use crate::controls::fingerprint;
 use crate::metrics::{day_of, day_str};
 use crate::v2::store::StoreError;
 
@@ -292,6 +293,8 @@ pub struct GroupRow {
     pub country: Option<String>,
     pub requests_30d: u64,
     pub pushes_30d: u64,
+    /// Suspended from the admin panel.
+    pub suspended: bool,
 }
 
 /// Groups-list filter and sort, from the query string.
@@ -304,6 +307,8 @@ pub struct GroupFilter {
     pub licence: String,
     /// Two-letter country.
     pub country: String,
+    /// `yes` (suspended only) or `no` (not suspended).
+    pub suspended: String,
     /// Group id prefix.
     pub q: String,
     /// `created` (default), `last_active`, `requests`, `pushes`, `devices`.
@@ -327,7 +332,8 @@ pub fn groups(c: &Connection, now: u64, f: &GroupFilter) -> R<Vec<GroupRow>> {
             (SELECT COALESCE(SUM(x.count), 0) FROM daily_agg x
                 WHERE x.group_id = g.group_id AND x.day >= ?1 AND x.kind = 'api'),
             (SELECT COALESCE(SUM(x.count), 0) FROM daily_agg x
-                WHERE x.group_id = g.group_id AND x.day >= ?1 AND x.kind = 'push')
+                WHERE x.group_id = g.group_id AND x.day >= ?1 AND x.kind = 'push'),
+            EXISTS (SELECT 1 FROM group_suspensions s WHERE s.group_id = g.group_id)
          FROM groups g LEFT JOIN group_licences l ON l.group_id = g.group_id",
     )?;
     let rows = st.query_map([&d30], |r| {
@@ -342,6 +348,7 @@ pub fn groups(c: &Connection, now: u64, f: &GroupFilter) -> R<Vec<GroupRow>> {
             country: r.get(7)?,
             requests_30d: u(r.get(8)?),
             pushes_30d: u(r.get(9)?),
+            suspended: r.get(10)?,
         })
     })?;
     let mut out: Vec<GroupRow> = rows.collect::<Result<_, _>>()?;
@@ -366,7 +373,12 @@ pub fn groups(c: &Connection, now: u64, f: &GroupFilter) -> R<Vec<GroupRow>> {
         };
         let country_ok =
             f.country.is_empty() || g.country.as_deref() == Some(&f.country.to_ascii_uppercase());
-        active_ok && licence_ok && country_ok && g.group_id.starts_with(f.q.trim())
+        let suspended_ok = match f.suspended.as_str() {
+            "yes" => g.suspended,
+            "no" => !g.suspended,
+            _ => true,
+        };
+        active_ok && licence_ok && country_ok && suspended_ok && g.group_id.starts_with(f.q.trim())
     });
     match f.sort.as_str() {
         "last_active" => out.sort_by_key(|g| g.last_active),
@@ -410,6 +422,18 @@ pub struct LicenceRow {
     pub original_platform: Option<String>,
     pub attached_at: u64,
     pub verified_at: u64,
+    /// Only to check revocations; never rendered or serialized.
+    #[serde(skip)]
+    pub app_transaction_id: String,
+    /// Revoked (config or panel); filled in by the handler.
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SuspensionRow {
+    pub suspended_at: u64,
+    pub reason: String,
+    pub actor: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -444,6 +468,9 @@ pub struct GroupDetail {
     pub created_at: u64,
     pub devices: Vec<DeviceRow>,
     pub licence: Option<LicenceRow>,
+    pub suspension: Option<SuspensionRow>,
+    /// A gateway group: its stored `licensed` flag.
+    pub gateway_licensed: Option<bool>,
     pub mailbox_messages: u64,
     pub queued_commands: u64,
     pub activity_daily: Series,
@@ -520,7 +547,7 @@ pub fn group_detail(c: &Connection, now: u64, gid: &str) -> R<Option<GroupDetail
     let licence = c
         .query_row(
             "SELECT tier, environment, original_purchase_date, original_application_version,
-                    original_platform, attached_at, verified_at
+                    original_platform, attached_at, verified_at, app_transaction_id
              FROM group_licences WHERE group_id = ?1",
             [gid],
             |r| {
@@ -532,10 +559,33 @@ pub fn group_detail(c: &Connection, now: u64, gid: &str) -> R<Option<GroupDetail
                     original_platform: r.get(4)?,
                     attached_at: u(r.get(5)?),
                     verified_at: u(r.get(6)?),
+                    app_transaction_id: r.get(7)?,
+                    revoked: false,
                 })
             },
         )
         .optional()?;
+    let suspension = c
+        .query_row(
+            "SELECT suspended_at, reason, actor FROM group_suspensions WHERE group_id = ?1",
+            [gid],
+            |r| {
+                Ok(SuspensionRow {
+                    suspended_at: u(r.get(0)?),
+                    reason: r.get(1)?,
+                    actor: r.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    let gateway_licensed = c
+        .query_row(
+            "SELECT licensed FROM gateway_groups WHERE group_id = ?1",
+            [gid],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|l| l != 0);
     let count = |sql: &str| -> R<u64> { Ok(u(c.query_row(sql, [gid], |r| r.get(0))?)) };
     let mut activity_daily = Series::new(
         &["messages", "commands", "activity", "pushes", "other"],
@@ -577,6 +627,8 @@ pub fn group_detail(c: &Connection, now: u64, gid: &str) -> R<Option<GroupDetail
         created_at: u(created_at),
         devices,
         licence,
+        suspension,
+        gateway_licensed,
         mailbox_messages: count("SELECT COUNT(*) FROM messages WHERE group_id = ?1")?,
         queued_commands: count("SELECT COUNT(*) FROM commands WHERE group_id = ?1")?,
         activity_daily,
@@ -753,6 +805,242 @@ pub fn security(c: &Connection, now: u64) -> R<Security> {
         )?,
         licence_events: events(c, "kind = 'licence' AND ts >= ?1", [t30])?,
     })
+}
+
+// --------------------------------------------------------------- gateway ---
+
+/// `gateway.push` outcomes shown as refusals.
+pub const GATEWAY_REFUSALS: [&str; 6] = [
+    "token_bound",
+    "not_gateway_group",
+    "token_limit",
+    "rebind_limit",
+    "gateway_licence_required",
+    "gateway_closed",
+];
+
+/// SQL condition on `events` columns (with table prefix `t`, e.g. `e.`).
+fn refusal_filter(t: &str) -> String {
+    let list: Vec<String> = GATEWAY_REFUSALS.iter().map(|o| format!("'{o}'")).collect();
+    format!(
+        "{t}kind = 'api' AND {t}route = 'gateway.push' AND {t}outcome IN ({})",
+        list.join(", ")
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayRow {
+    pub group_id: String,
+    pub created_at: u64,
+    /// The stored flag.
+    pub licensed_flag: bool,
+    /// The flag and the licence not revoked; filled in by the handler.
+    pub licensed: bool,
+    /// Only to check revocations; never rendered.
+    pub app_transaction_id: Option<String>,
+    pub tokens: u64,
+    pub last_used: Option<u64>,
+    /// `gateway.push` answered `sent` in the last hour (raw events).
+    pub sent_1h: u64,
+    pub refused_24h: u64,
+    pub suspended: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Gateway {
+    pub rows: Vec<GatewayRow>,
+    pub total: u64,
+    pub refusals_24h: Vec<Count>,
+    pub recent_refusals: Vec<EventRow>,
+}
+
+const GATEWAY_ROW: &str = "SELECT g.group_id, g.created_at, g.licensed, l.app_transaction_id,
+        (SELECT COUNT(*) FROM gateway_tokens t WHERE t.group_id = g.group_id),
+        (SELECT MAX(t.last_used) FROM gateway_tokens t WHERE t.group_id = g.group_id),
+        (SELECT COUNT(*) FROM events e WHERE e.kind = 'api' AND e.route = 'gateway.push'
+            AND e.group_id = g.group_id AND e.outcome = 'sent' AND e.ts >= ?1),
+        (SELECT COUNT(*) FROM events e WHERE e.group_id = g.group_id AND e.ts >= ?2 AND REFUSALS),
+        EXISTS (SELECT 1 FROM group_suspensions s WHERE s.group_id = g.group_id)
+     FROM gateway_groups g LEFT JOIN group_licences l ON l.group_id = g.group_id";
+
+fn gateway_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GatewayRow> {
+    Ok(GatewayRow {
+        group_id: r.get(0)?,
+        created_at: u(r.get(1)?),
+        licensed_flag: r.get::<_, i64>(2)? != 0,
+        licensed: false,
+        app_transaction_id: r.get(3)?,
+        tokens: u(r.get(4)?),
+        last_used: r.get::<_, Option<i64>>(5)?.map(u),
+        sent_1h: u(r.get(6)?),
+        refused_24h: u(r.get(7)?),
+        suspended: r.get(8)?,
+    })
+}
+
+fn gateway_sql(tail: &str) -> String {
+    format!(
+        "{} {tail}",
+        GATEWAY_ROW.replace("REFUSALS", &refusal_filter("e."))
+    )
+}
+
+pub fn gateway(c: &Connection, now: u64) -> R<Gateway> {
+    let mut st = c.prepare(&gateway_sql("ORDER BY g.created_at DESC LIMIT ?3"))?;
+    let rows = st
+        .query_map(
+            params![
+                now.saturating_sub(3600) as i64,
+                now.saturating_sub(86_400) as i64,
+                MAX_GROUP_ROWS as i64
+            ],
+            gateway_row,
+        )?
+        .collect::<Result<_, _>>()?;
+    let since = now.saturating_sub(86_400) as i64;
+    Ok(Gateway {
+        rows,
+        total: u(c.query_row("SELECT COUNT(*) FROM gateway_groups", [], |r| r.get(0))?),
+        refusals_24h: counts(
+            c,
+            &format!(
+                "SELECT outcome, COUNT(*) FROM events WHERE ts >= ?1 AND {} GROUP BY 1 ORDER BY 2 DESC",
+                refusal_filter("")
+            ),
+            [since],
+        )?,
+        recent_refusals: events(c, &refusal_filter(""), [])?,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenRow {
+    /// [`fingerprint`] of the APNs token: the token itself is never shown.
+    pub fp: String,
+    pub last_used: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayDetail {
+    pub row: GatewayRow,
+    pub tokens: Vec<TokenRow>,
+    pub recent_refusals: Vec<EventRow>,
+}
+
+pub fn gateway_detail(c: &Connection, now: u64, gid: &str) -> R<Option<GatewayDetail>> {
+    let row = c
+        .query_row(
+            &gateway_sql("WHERE g.group_id = ?3"),
+            params![
+                now.saturating_sub(3600) as i64,
+                now.saturating_sub(86_400) as i64,
+                gid
+            ],
+            gateway_row,
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut st = c.prepare(
+        "SELECT token, last_used FROM gateway_tokens WHERE group_id = ?1 ORDER BY last_used DESC",
+    )?;
+    let tokens = st
+        .query_map([gid], |r| {
+            Ok(TokenRow {
+                fp: fingerprint(&r.get::<_, String>(0)?),
+                last_used: u(r.get(1)?),
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(Some(GatewayDetail {
+        row,
+        tokens,
+        recent_refusals: events(
+            c,
+            &format!("group_id = ?1 AND {}", refusal_filter("")),
+            [gid],
+        )?,
+    }))
+}
+
+// -------------------------------------------------------------- licences ---
+
+#[derive(Debug, Clone)]
+pub struct RevokedRow {
+    /// [`fingerprint`] of the purchase id: the id itself is never shown.
+    pub fp: String,
+    pub revoked_at: u64,
+    pub reason: String,
+    pub actor: String,
+    /// Groups this purchase is attached to now.
+    pub groups: u64,
+}
+
+pub fn revoked_licences(c: &Connection) -> R<Vec<RevokedRow>> {
+    let mut st = c.prepare(
+        "SELECT r.app_transaction_id, r.revoked_at, r.reason, r.actor,
+            (SELECT COUNT(*) FROM group_licences l WHERE l.app_transaction_id = r.app_transaction_id)
+         FROM revoked_licences r ORDER BY r.revoked_at DESC",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(RevokedRow {
+            fp: fingerprint(&r.get::<_, String>(0)?),
+            revoked_at: u(r.get(1)?),
+            reason: r.get(2)?,
+            actor: r.get(3)?,
+            groups: u(r.get(4)?),
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Groups attached to each of `ids` (config revocations), by fingerprint.
+pub fn attached_counts(c: &Connection, ids: &[String]) -> R<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    for id in ids {
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM group_licences WHERE app_transaction_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        out.push((fingerprint(id), u(n)));
+    }
+    Ok(out)
+}
+
+// ----------------------------------------------------------------- audit ---
+
+pub const MAX_AUDIT_ROWS: i64 = 500;
+
+#[derive(Debug, Clone)]
+pub struct AuditRow {
+    pub ts: u64,
+    pub actor: String,
+    pub ip_prefix: Option<String>,
+    pub action: String,
+    pub target: Option<String>,
+    pub detail: Option<String>,
+    pub outcome: String,
+}
+
+pub fn audit_log(c: &Connection) -> R<Vec<AuditRow>> {
+    let mut st = c.prepare(
+        "SELECT ts, actor, ip_prefix, action, target, detail, outcome FROM admin_audit
+         ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = st.query_map([MAX_AUDIT_ROWS], |r| {
+        Ok(AuditRow {
+            ts: u(r.get(0)?),
+            actor: r.get(1)?,
+            ip_prefix: r.get(2)?,
+            action: r.get(3)?,
+            target: r.get(4)?,
+            detail: r.get(5)?,
+            outcome: r.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 // ------------------------------------------------------------------- CSV ---

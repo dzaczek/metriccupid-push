@@ -12,6 +12,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod access;
+mod actions;
 pub mod auth;
 pub mod pages;
 pub mod queries;
@@ -28,6 +29,7 @@ use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -74,6 +76,8 @@ pub struct AdminState {
     verify_gate: Semaphore,
     /// Cloudflare Access JWT check (`ADMIN_CF_ACCESS_*`).
     access: Option<AccessVerifier>,
+    /// Management actions, all admins together ([`actions::ACTIONS_PER_MINUTE`]).
+    actions: DefaultDirectRateLimiter,
 }
 
 /// The resolved client IP, set by the allowlist middleware.
@@ -146,6 +150,9 @@ impl AdminState {
             cfg,
             last_totp_step: Mutex::new(0),
             verify_gate: Semaphore::new(1),
+            actions: RateLimiter::direct(Quota::per_minute(
+                std::num::NonZeroU32::new(actions::ACTIONS_PER_MINUTE).expect("non-zero"),
+            )),
         })
     }
 
@@ -250,6 +257,26 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/groups/{id}", get(group_page))
         .route("/admin/pushes", get(pushes_page))
         .route("/admin/security", get(security_page))
+        .route("/admin/groups/{id}/suspend", post(actions::group_suspend))
+        .route(
+            "/admin/groups/{id}/unsuspend",
+            post(actions::group_unsuspend),
+        )
+        .route("/admin/bans", get(actions::bans_page))
+        .route("/admin/bans/add", post(actions::ban_add))
+        .route("/admin/bans/remove", post(actions::ban_remove))
+        .route("/admin/bans/unban", post(actions::unban))
+        .route("/admin/gateway", get(actions::gateway_page))
+        .route("/admin/gateway/{id}", get(actions::gateway_group_page))
+        .route("/admin/gateway/{id}/unbind", post(actions::gateway_unbind))
+        .route("/admin/gateway/{id}/remove", post(actions::gateway_remove))
+        .route("/admin/licences", get(actions::licences_page))
+        .route("/admin/licences/revoke", post(actions::licence_revoke))
+        .route("/admin/licences/restore", post(actions::licence_restore))
+        .route("/admin/limits", get(actions::limits_page))
+        .route("/admin/limits/set", post(actions::limit_set))
+        .route("/admin/limits/reset", post(actions::limit_reset))
+        .route("/admin/audit", get(actions::audit_page))
         .route("/admin/api/overview", get(api_overview))
         .route("/admin/api/groups", get(api_groups))
         .route("/admin/api/groups/{id}", get(api_group))
@@ -686,6 +713,9 @@ async fn load_group(s: &AdminState, id: String) -> Result<queries::GroupDetail, 
         .query(move |c| queries::group_detail(c, now, &id))
         .await?
         .ok_or_else(not_found_response)?;
+    if let Some(l) = &mut g.licence {
+        l.revoked = s.app.v2().licence.is_tx_revoked(&l.app_transaction_id);
+    }
     let hub = &s.app.v2().hub;
     for d in &mut g.devices {
         if d.kind == "mac" {
@@ -712,7 +742,7 @@ async fn group_page(
         &path,
         Some(&json),
         wants_refresh(&q),
-        &pages::group_detail(s.now(), &g),
+        &pages::group_detail(s.now(), &g, &sess.csrf),
     )
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "metriccupid-push"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Self-hostable server for MetricCupid: signed Pushover relay (v1) and end-to-end encrypted Mac <-> iPhone mailbox with APNs (v2)"

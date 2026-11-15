@@ -108,6 +108,12 @@ impl Hub {
         }
     }
 
+    /// Drop every stream of the group (suspended); returns how many. Each
+    /// one sees its channel close and ends with a close frame.
+    pub fn remove_group(&self, group: &str) -> usize {
+        self.lock().remove(group).map_or(0, |g| g.len())
+    }
+
     /// Hand `frame` to every live stream of the group; `true` if at least one took it.
     pub fn deliver(&self, group: &str, frame: &CommandFrame) -> bool {
         let map = self.lock();

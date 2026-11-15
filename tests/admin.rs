@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use argon2::password_hash::{PasswordHasher, SaltString};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use common::{derive, id128, Client};
 use metriccupid_push::admin::{self, auth::totp, AdminState};
 use metriccupid_push::client_ip::ClientIpResolver;
@@ -42,6 +44,7 @@ fn test_hash() -> String {
 
 struct Servers {
     _dir: tempfile::TempDir,
+    env: HashMap<String, String>,
     public: String,
     admin: String,
     clock: Arc<TestClock>,
@@ -152,6 +155,58 @@ impl Servers {
         assert_ne!(token, pre, "session id rotated at login");
         token
     }
+
+    /// Stop using these servers and start new ones on the same data
+    /// directory and configuration (a restart), at the current time.
+    async fn restart(self) -> Servers {
+        let t = self.clock.now();
+        start(
+            self._dir,
+            self.env,
+            t,
+            None,
+            reqwest::header::HeaderMap::new(),
+        )
+        .await
+    }
+
+    /// Move to the next TOTP step and return its code.
+    fn next_code(&self) -> String {
+        let t = self.clock.now() + 30;
+        self.set_time(t);
+        totp(SECRET, t)
+    }
+
+    /// The session's CSRF token (from the logout form of any page).
+    async fn csrf_of(&self, session: &str) -> String {
+        let (status, _, html) = self.get("/admin/bans", Some(session)).await;
+        assert_eq!(status, 200, "{html}");
+        csrf(&html)
+    }
+
+    /// A panel action with the session's CSRF token and a fresh code.
+    async fn act(&self, session: &str, path: &str, fields: &[(&str, &str)]) -> (u16, String) {
+        let csrf = self.csrf_of(session).await;
+        let code = self.next_code();
+        let mut f = vec![("csrf", csrf.as_str()), ("totp", code.as_str())];
+        f.extend_from_slice(fields);
+        let (status, _, body) = self.post_form(path, Some(session), &f).await;
+        (status, body)
+    }
+
+    /// Audit rows, oldest first: (action, outcome, target).
+    async fn audit(&self) -> Vec<(String, String, Option<String>)> {
+        self.db(|c| {
+            let mut st = c
+                .prepare("SELECT action, outcome, target FROM admin_audit ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        })
+        .await
+    }
 }
 
 fn form_enc(s: &str) -> String {
@@ -204,10 +259,29 @@ async fn servers_opts(
     for (k, v) in overrides {
         env.insert(k.to_string(), v.to_string());
     }
+    start(dir, env, T0, certs_url, headers).await
+}
+
+/// Servers on `dir` (fresh or reused: a restart) with the clock at `t`.
+async fn start(
+    dir: tempfile::TempDir,
+    env: HashMap<String, String>,
+    t: u64,
+    certs_url: Option<String>,
+    headers: reqwest::header::HeaderMap,
+) -> Servers {
     let config = Config::from_lookup(|k| env.get(k).cloned()).expect("valid test config");
-    let clock = Arc::new(TestClock(AtomicU64::new(T0)));
+    let clock = Arc::new(TestClock(AtomicU64::new(t)));
     let resolver = ClientIpResolver::from_config(&config.trust_proxy).await;
-    let state = Arc::new(AppState::new(&config, resolver, clock.clone()).unwrap());
+    let state = Arc::new(
+        AppState::new_with_licence_root(
+            &config,
+            resolver,
+            clock.clone(),
+            common::licence::CHAIN.root.clone(),
+        )
+        .unwrap(),
+    );
     let admin_state = Arc::new(
         match certs_url {
             None => AdminState::new(state.clone(), &config),
@@ -225,6 +299,7 @@ async fn servers_opts(
     tokio::spawn(admin::serve(al, admin_state, std::future::pending()));
     Servers {
         _dir: dir,
+        env,
         public,
         admin,
         clock,
@@ -1145,4 +1220,928 @@ async fn cf_access_disabled_keeps_existing_behaviour() {
         200
     );
     s.login().await;
+}
+
+// ------------------------------------------------------------ management ---
+
+fn alert(mac: &Client, id: &str) -> Value {
+    json!({
+        "id": id, "type": "alert", "urgency": "normal", "ttl_secs": 3600,
+        "sealed": mac.seal_json("alert", id, &json!({"v": 1, "id": id}), [1; 12]),
+    })
+}
+
+fn gw_msg(token: &str, id: &str) -> Value {
+    json!({
+        "device_token": token, "env": "production",
+        "message": {"id": id, "t": "alert", "s": STANDARD.encode([0u8; 40])},
+        "urgency": "normal", "expiration": 0,
+    })
+}
+
+fn tok(n: u32) -> String {
+    format!("{n:064x}")
+}
+
+/// A gateway group registered on the hosted server (as a self-hosted server
+/// would); it signs push jobs with an empty device line.
+async fn gw_group(s: &Servers, seed: u8, extra: Value) -> Client {
+    let c = s.mac(seed);
+    let mut body = json!({"gateway": true});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let r = c.create_group_with(body).await;
+    assert!(matches!(r.status, 200 | 201), "{:?}", r.json);
+    Client {
+        device_id: String::new(),
+        ..c
+    }
+}
+
+async fn gw_push(c: &Client, token: &str, id: &str) -> common::Resp {
+    c.post("/v2/gateway/push", &gw_msg(token, id)).await
+}
+
+/// Group `seed` with a Mac and an iPhone; returns (mac, phone).
+async fn hosted_group(s: &Servers, seed: u8, extra: Value) -> (Client, Client) {
+    let mac = s.mac(seed);
+    let r = mac.create_group_with(extra).await;
+    assert_eq!(r.status, 201, "{:?}", r.json);
+    assert_eq!(mac.register("mac", "MacBook", None).await.status, 201);
+    let phone = mac.as_device(&id128(seed + 2));
+    assert_eq!(
+        phone.register("ios", "iPhone", Some(TOKEN)).await.status,
+        201
+    );
+    (mac, phone)
+}
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_ws(c: &Client) -> Result<Ws, u16> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let mut req = c.ws_url().into_client_request().unwrap();
+    for (k, v) in c.signed_headers("GET", "/v2/stream", b"") {
+        req.headers_mut().insert(
+            HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            HeaderValue::from_str(&v).unwrap(),
+        );
+    }
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+        Err(e) => panic!("ws connect: {e}"),
+    }
+}
+
+/// Every action route with fields that would be valid.
+fn action_routes(gid: &str) -> Vec<(String, Vec<(&'static str, String)>)> {
+    let f = |v: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+        v.iter().map(|(k, v)| (*k, v.to_string())).collect()
+    };
+    vec![
+        (
+            "/admin/bans/add".into(),
+            f(&[("target", "192.0.2.1"), ("duration", "1h"), ("reason", "x")]),
+        ),
+        ("/admin/bans/remove".into(), f(&[("target", "192.0.2.1")])),
+        ("/admin/bans/unban".into(), f(&[("target", "192.0.2.1")])),
+        (
+            format!("/admin/gateway/{gid}/unbind"),
+            f(&[("token", "0123456789ab")]),
+        ),
+        (format!("/admin/gateway/{gid}/remove"), vec![]),
+        (
+            format!("/admin/groups/{gid}/suspend"),
+            f(&[("reason", "x")]),
+        ),
+        (format!("/admin/groups/{gid}/unsuspend"), vec![]),
+        (
+            "/admin/licences/revoke".into(),
+            f(&[("tx", "tx-1"), ("reason", "x")]),
+        ),
+        (
+            "/admin/licences/restore".into(),
+            f(&[("fp", "0123456789ab")]),
+        ),
+        (
+            "/admin/limits/set".into(),
+            f(&[("key", "RATE_IP_BURST"), ("value", "5")]),
+        ),
+        ("/admin/limits/reset".into(), f(&[("key", "RATE_IP_BURST")])),
+    ]
+}
+
+#[tokio::test]
+async fn every_action_needs_a_session_csrf_and_a_fresh_code() {
+    let s = servers(&[]).await;
+    let gid = id128(10);
+    for (path, fields) in action_routes(&gid) {
+        let fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        // A new 15-minute lockout window for each route (2 failures each).
+        s.set_time(s.clock.now() + 901);
+        let session = s.login().await;
+        let csrf_s = s.csrf_of(&session).await;
+        let used = totp(SECRET, s.clock.now());
+        let with = |csrf: &str, code: &str| {
+            let mut v = vec![("csrf", csrf.to_string()), ("totp", code.to_string())];
+            v.extend(fields.iter().map(|(k, v)| (*k, v.to_string())));
+            v
+        };
+        let post = |cookie: Option<String>, v: Vec<(&'static str, String)>| {
+            let path = path.clone();
+            let s = &s;
+            async move {
+                let v: Vec<(&str, &str)> = v.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                s.post_form(&path, cookie.as_deref(), &v).await
+            }
+        };
+        let fresh = totp(SECRET, s.clock.now() + 30);
+
+        // Unauthenticated: back to the login form, nothing done.
+        let (st, h, _) = post(None, with(&csrf_s, &fresh)).await;
+        assert_eq!(
+            (st, h["location"].to_str().unwrap()),
+            (303, "/admin/login"),
+            "{path}"
+        );
+        // Missing or foreign CSRF token: 403.
+        let (st, _, _) = post(Some(session.clone()), with("", &fresh)).await;
+        assert_eq!(st, 403, "{path} without csrf");
+        let (st, _, _) = post(Some(session.clone()), with(&"0".repeat(64), &fresh)).await;
+        assert_eq!(st, 403, "{path} wrong csrf");
+        // Wrong code.
+        let wrong = if fresh == "000000" {
+            "000001"
+        } else {
+            "000000"
+        };
+        let wrong = if wrong == used { "000002" } else { wrong };
+        let (st, _, body) = post(Some(session.clone()), with(&csrf_s, wrong)).await;
+        assert_eq!(st, 401, "{path} wrong code: {body}");
+        assert!(body.contains("authenticator code"), "{body}");
+        // The code that logged us in cannot be used again.
+        let (st, _, _) = post(Some(session.clone()), with(&csrf_s, &used)).await;
+        assert_eq!(st, 401, "{path} reused code");
+    }
+    let rows = s.audit().await;
+    assert!(
+        rows.iter().all(|(_, o, _)| o != "ok"),
+        "nothing done: {rows:?}"
+    );
+    let n = action_routes(&gid).len();
+    assert_eq!(
+        rows.iter().filter(|(_, o, _)| o == "totp_failed").count(),
+        n
+    );
+    assert_eq!(
+        rows.iter().filter(|(_, o, _)| o == "totp_reused").count(),
+        n
+    );
+    assert!(s.state.controls().bans(s.clock.now()).is_empty());
+    assert_eq!(s.state.controls().override_of("RATE_IP_BURST"), None);
+}
+
+#[tokio::test]
+async fn failed_codes_lock_actions_and_a_code_works_once() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    let csrf_s = s.csrf_of(&session).await;
+    for i in 0..5 {
+        let r = s
+            .post_form(
+                "/admin/limits/reset",
+                Some(&session),
+                &[
+                    ("csrf", &csrf_s),
+                    ("totp", "abcdef"),
+                    ("key", "RATE_IP_BURST"),
+                ],
+            )
+            .await;
+        assert_eq!(r.0, 401, "failure {i}");
+    }
+    // Locked: even a correct code is refused, and so is a login.
+    let code = s.next_code();
+    let r = s
+        .post_form(
+            "/admin/limits/reset",
+            Some(&session),
+            &[("csrf", &csrf_s), ("totp", &code), ("key", "RATE_IP_BURST")],
+        )
+        .await;
+    assert_eq!(r.0, 429, "{}", r.2);
+    assert!(s.audit().await.iter().any(|(_, o, _)| o == "locked"));
+    s.set_time(s.clock.now() + 901);
+    let (st, _) = s
+        .act(&session, "/admin/limits/reset", &[("key", "RATE_IP_BURST")])
+        .await;
+    assert_eq!(st, 200);
+    // The same code again (same 30 s step): refused.
+    let code = totp(SECRET, s.clock.now());
+    let r = s
+        .post_form(
+            "/admin/limits/reset",
+            Some(&session),
+            &[("csrf", &csrf_s), ("totp", &code), ("key", "RATE_IP_BURST")],
+        )
+        .await;
+    assert_eq!(r.0, 401);
+}
+
+#[tokio::test]
+async fn actions_are_rate_limited() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    let mut codes = Vec::new();
+    for _ in 0..31 {
+        let (st, _) = s
+            .act(&session, "/admin/limits/reset", &[("key", "RATE_IP_BURST")])
+            .await;
+        codes.push(st);
+    }
+    assert!(codes[..30].iter().all(|c| *c == 200), "{codes:?}");
+    assert_eq!(codes[30], 429);
+}
+
+#[tokio::test]
+async fn manual_ban_is_enforced_first_persists_across_restart_and_lifts() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    let mac = s.mac(20);
+
+    for (fields, why) in [
+        (
+            [
+                ("target", "10.0.0.0/8"),
+                ("duration", "1h"),
+                ("reason", "x"),
+            ],
+            "short prefix",
+        ),
+        (
+            [("target", "::/0"), ("duration", "1h"), ("reason", "x")],
+            "v6 short prefix",
+        ),
+        (
+            [("target", "nonsense"), ("duration", "1h"), ("reason", "x")],
+            "not an IP",
+        ),
+        (
+            [
+                ("target", "127.0.0.1"),
+                ("duration", "31d"),
+                ("reason", "x"),
+            ],
+            "too long",
+        ),
+        (
+            [("target", "127.0.0.1"), ("duration", "5m"), ("reason", "x")],
+            "too short",
+        ),
+        (
+            [("target", "127.0.0.1"), ("duration", "1h"), ("reason", "")],
+            "no reason",
+        ),
+    ] {
+        let (st, body) = s.act(&session, "/admin/bans/add", &fields).await;
+        assert_eq!(st, 400, "{why}: {body}");
+    }
+    assert_eq!(mac.create_group().await.status, 201, "nothing banned yet");
+    assert_eq!(mac.register("mac", "MacBook", None).await.status, 201);
+
+    let (st, body) = s
+        .act(
+            &session,
+            "/admin/bans/add",
+            &[
+                ("target", "127.0.0.1"),
+                ("duration", "1h"),
+                ("reason", "<script>abuse</script>"),
+            ],
+        )
+        .await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("Banned 127.0.0.1/32"), "{body}");
+    // Checked before anything else: even before the signature.
+    let r = mac.get("/v2/status").await;
+    assert_eq!(r.status, 429);
+    assert!(r.headers.get("retry-after").is_some());
+    let (_, _, html) = s.get("/admin/bans", Some(&session)).await;
+    assert!(html.contains("127.0.0.1/32"), "listed");
+    assert!(
+        html.contains("&lt;script&gt;abuse&lt;/script&gt;") && !html.contains("<script>"),
+        "escaped"
+    );
+    // The admin listener is not affected.
+    assert_eq!(s.get("/admin/", Some(&session)).await.0, 200);
+
+    // Restart: the ban is still there.
+    let s = s.restart().await;
+    let mac = s.mac(20);
+    assert_eq!(mac.get("/v2/status").await.status, 429, "persisted");
+    let session = s.login().await;
+    let (st, body) = s
+        .act(
+            &session,
+            "/admin/bans/remove",
+            &[("target", "127.0.0.1/32")],
+        )
+        .await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("Lifted"));
+    assert_eq!(mac.get("/v2/status").await.status, 200, "lifted");
+
+    // A ban runs out on its own.
+    s.act(
+        &session,
+        "/admin/bans/add",
+        &[
+            ("target", "127.0.0.0/16"),
+            ("duration", "15m"),
+            ("reason", "x"),
+        ],
+    )
+    .await;
+    assert_eq!(mac.get("/v2/status").await.status, 429);
+    s.set_time(s.clock.now() + 15 * 60);
+    assert_eq!(mac.get("/v2/status").await.status, 200, "expired");
+
+    let rows = s.audit().await;
+    let ok: Vec<_> = rows
+        .iter()
+        .filter(|(_, o, _)| o == "ok")
+        .map(|(a, _, t)| (a.as_str(), t.as_deref()))
+        .collect();
+    assert_eq!(
+        ok,
+        [
+            ("ban.add", Some("127.0.0.1/32")),
+            ("ban.remove", Some("127.0.0.1/32")),
+            ("ban.add", Some("127.0.0.0/16")),
+        ]
+    );
+    assert_eq!(rows.iter().filter(|(_, o, _)| o == "invalid").count(), 6);
+    let (_, _, html) = s.get("/admin/audit", Some(&session)).await;
+    assert!(html.contains("ban.remove") && html.contains("127.0.0.0/16"));
+}
+
+#[tokio::test]
+async fn automatic_ban_is_listed_and_can_be_lifted() {
+    let s = servers(&[("AUTH_BAN_THRESHOLD", "2")]).await;
+    let session = s.login().await;
+    let stranger = s.mac(30); // never registered: every request fails auth
+    assert_eq!(stranger.get("/v2/status").await.status, 401);
+    assert_eq!(stranger.get("/v2/status").await.status, 401);
+    assert_eq!(stranger.get("/v2/status").await.status, 429, "banned");
+    let (_, _, html) = s.get("/admin/bans", Some(&session)).await;
+    assert!(html.contains("Automatic bans (1)"), "{html}");
+    assert!(html.contains("<code>127.0.0.1</code>"));
+    let (st, body) = s
+        .act(&session, "/admin/bans/unban", &[("target", "127.0.0.1")])
+        .await;
+    assert_eq!(st, 200);
+    assert!(body.contains("Lifted"), "{body}");
+    assert_eq!(stranger.get("/v2/status").await.status, 401, "unbanned");
+    let (st, body) = s
+        .act(&session, "/admin/bans/unban", &[("target", "not-an-ip")])
+        .await;
+    assert_eq!(st, 400, "{body}");
+    let rows = s.audit().await;
+    assert!(
+        rows.contains(&("ban.unban".into(), "ok".into(), Some("127.0.0.0/24".into()))),
+        "only the network is stored: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn suspended_group_gets_403_its_stream_closed_and_no_pushes() {
+    use futures_util::StreamExt;
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    let (mac, phone) = hosted_group(&s, 40, json!({})).await;
+    let other = hosted_group(&s, 50, json!({})).await.0;
+    let mut ws = open_ws(&mac).await.expect("stream opens");
+    let mock = s.state.mock_apns().unwrap();
+    assert_eq!(
+        mac.post("/v2/messages", &alert(&mac, "m1")).await.status,
+        200
+    );
+    let pushes = mock.pushes().len();
+    assert_eq!(pushes, 1);
+
+    let path = format!("/admin/groups/{}/suspend", mac.group_id);
+    let (st, body) = s.act(&session, &path, &[("reason", "")]).await;
+    assert_eq!(st, 400, "a reason is required: {body}");
+    let (st, body) = s.act(&session, &path, &[("reason", "abuse")]).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("closed 1 streams"), "{body}");
+    // The stream is closed by the server.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                | None
+                | Some(Err(_)) => return true,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(closed);
+    // Every signed route: 403 group_suspended.
+    for r in [
+        mac.get("/v2/status").await,
+        mac.post("/v2/messages", &alert(&mac, "m2")).await,
+        phone.get("/v2/messages?since=0").await,
+        mac.post("/v2/heartbeat", &json!({"id": "hb1"})).await,
+    ] {
+        assert_eq!(
+            (r.status, r.json["error"].as_str()),
+            (403, Some("group_suspended"))
+        );
+    }
+    assert_eq!(open_ws(&mac).await.err(), Some(403));
+    // The Mac-offline notice after the grace period is not pushed either.
+    s.set_time(s.clock.now() + 600);
+    metriccupid_push::v2::presence_tick(&s.state).await;
+    assert_eq!(
+        mock.pushes().len(),
+        pushes,
+        "no pushes to a suspended group"
+    );
+    // Other groups are unaffected; the data is kept.
+    assert_eq!(other.get("/v2/status").await.status, 200);
+    let g = mac.group_id.clone();
+    let (m, _) = s
+        .db(move |c| metriccupid_push::v2::store::counts(c, &g).unwrap())
+        .await;
+    assert_eq!(m, 1, "mailbox kept");
+
+    // The panel shows it, with a filter.
+    let (_, _, html) = s.get("/admin/groups?suspended=yes", Some(&session)).await;
+    assert!(html.contains(&mac.group_id) && !html.contains(&other.group_id));
+    let (_, _, html) = s.get("/admin/groups?suspended=no", Some(&session)).await;
+    assert!(!html.contains(&mac.group_id) && html.contains(&other.group_id));
+    let (_, _, html) = s
+        .get(&format!("/admin/groups/{}", mac.group_id), Some(&session))
+        .await;
+    assert!(html.contains("Suspended") && html.contains("abuse"));
+    let (_, _, json) = s
+        .get("/admin/api/groups?suspended=yes", Some(&session))
+        .await;
+    assert!(json.contains(r#""suspended":true"#), "{json}");
+
+    // Unknown group ids: uniform 404 / not found.
+    let (st, _) = s
+        .act(
+            &session,
+            &format!("/admin/groups/{}/suspend", id128(99)),
+            &[("reason", "x")],
+        )
+        .await;
+    assert_eq!(st, 404);
+    let (st, _, _) = s
+        .post_form("/admin/groups/nope/suspend", Some(&session), &[])
+        .await;
+    assert_eq!(st, 404);
+
+    // Survives a restart, then unsuspend.
+    let s = s.restart().await;
+    let session = s.login().await;
+    let mac = Client {
+        base: s.public.clone(),
+        ..mac
+    };
+    assert_eq!(mac.get("/v2/status").await.status, 403);
+    let (st, _) = s
+        .act(
+            &session,
+            &format!("/admin/groups/{}/unsuspend", mac.group_id),
+            &[],
+        )
+        .await;
+    assert_eq!(st, 200);
+    assert_eq!(mac.get("/v2/status").await.status, 200);
+    let actions: Vec<_> = s
+        .audit()
+        .await
+        .into_iter()
+        .filter(|(_, o, _)| o == "ok")
+        .map(|(a, _, _)| a)
+        .collect();
+    assert_eq!(actions, ["group.suspend", "group.unsuspend"]);
+}
+
+const GW: &[(&str, &str)] = &[
+    ("MODE", "hosted"),
+    ("HOSTED_OPEN_REGISTRATION", "true"),
+    ("GATEWAY_OPEN", "true"),
+];
+
+fn with<'a>(base: &[(&'a str, &'a str)], more: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut v = base.to_vec();
+    v.extend_from_slice(more);
+    v
+}
+
+#[tokio::test]
+async fn gateway_page_unbinds_a_token_and_removes_a_group() {
+    let s = servers(GW).await;
+    let session = s.login().await;
+    let a = gw_group(&s, 60, json!({})).await;
+    let b = gw_group(&s, 62, json!({})).await;
+    assert_eq!(gw_push(&a, &tok(1), "a1").await.status, 200);
+    assert_eq!(gw_push(&a, &tok(2), "a2").await.status, 200);
+    let r = gw_push(&b, &tok(1), "b1").await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("token_bound"))
+    );
+    s.flush().await;
+
+    let (st, _, html) = s.get("/admin/gateway", Some(&session)).await;
+    assert_eq!(st, 200);
+    assert!(html.contains(&a.group_id) && html.contains(&b.group_id));
+    assert!(html.contains("token_bound"), "refusal listed");
+    assert!(!html.contains(&tok(1)), "tokens never shown");
+    let (st, _, html) = s
+        .get(&format!("/admin/gateway/{}", a.group_id), Some(&session))
+        .await;
+    assert_eq!(st, 200);
+    let fp1 = metriccupid_push::controls::fingerprint(&tok(1));
+    assert!(html.contains(&fp1) && !html.contains(&tok(1)));
+    assert!(html.contains("2 of 30 tokens"), "{html}");
+    assert_eq!(
+        s.get(&format!("/admin/gateway/{}", id128(99)), Some(&session))
+            .await
+            .0,
+        404
+    );
+
+    let unbind = format!("/admin/gateway/{}/unbind", a.group_id);
+    let (st, _) = s.act(&session, &unbind, &[("token", "xyz")]).await;
+    assert_eq!(st, 400);
+    let (st, body) = s.act(&session, &unbind, &[("token", &fp1)]).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(
+        gw_push(&b, &tok(1), "b2").await.status,
+        200,
+        "token is free"
+    );
+
+    let (st, body) = s
+        .act(
+            &session,
+            &format!("/admin/gateway/{}/remove", a.group_id),
+            &[],
+        )
+        .await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("1 tokens unbound"), "{body}");
+    let r = gw_push(&a, &tok(2), "a3").await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("not_gateway_group"))
+    );
+    let g = a.group_id.clone();
+    let (members, tokens) = s
+        .db(move |c| {
+            let m: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM gateway_groups WHERE group_id = ?1",
+                    [&g],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let t: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM gateway_tokens WHERE group_id = ?1",
+                    [&g],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (m, t)
+        })
+        .await;
+    assert_eq!((members, tokens), (0, 0));
+    let rows = s.audit().await;
+    assert!(rows.contains(&(
+        "gateway.unbind".into(),
+        "ok".into(),
+        Some(a.group_id.clone())
+    )));
+    assert!(rows.contains(&(
+        "gateway.remove".into(),
+        "ok".into(),
+        Some(a.group_id.clone())
+    )));
+}
+
+#[tokio::test]
+async fn revoked_purchase_takes_effect_on_an_attached_hosted_group() {
+    let s = servers(&[("MODE", "hosted"), ("LICENCE_MODE", "app_transaction")]).await;
+    let session = s.login().await;
+    let lic = common::licence::licence("tx-hosted-1", T0);
+    let (mac, _phone) = hosted_group(&s, 70, json!({ "licence": lic })).await;
+    assert_eq!(
+        mac.post("/v2/messages", &alert(&mac, "m1")).await.status,
+        200
+    );
+
+    let (st, _) = s
+        .act(
+            &session,
+            "/admin/licences/revoke",
+            &[("tx", "bad id"), ("reason", "x")],
+        )
+        .await;
+    assert_eq!(st, 400);
+    let (st, body) = s
+        .act(
+            &session,
+            "/admin/licences/revoke",
+            &[("tx", "tx-hosted-1"), ("reason", "refunded")],
+        )
+        .await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("1 attached groups"), "{body}");
+    assert!(!body.contains("tx-hosted-1"), "id never shown");
+    // At once, without re-registration.
+    let r = mac.post("/v2/messages", &alert(&mac, "m2")).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
+    let st = mac.get("/v2/status").await;
+    assert_eq!(st.json["licence"], Value::Null, "{:?}", st.json);
+    assert_eq!(st.json["licence_required"], true);
+    // Attaching it again is refused too.
+    let r = mac.send("PUT", "/v2/licence", &lic.to_string()).await;
+    assert_eq!(r.json["reason"], "revoked", "{:?}", r.json);
+
+    let fp = metriccupid_push::controls::fingerprint("tx-hosted-1");
+    let (_, _, html) = s.get("/admin/licences", Some(&session)).await;
+    assert!(html.contains(&fp) && !html.contains("tx-hosted-1"));
+    let (_, _, html) = s
+        .get(&format!("/admin/groups/{}", mac.group_id), Some(&session))
+        .await;
+    assert!(html.contains("purchase is revoked"));
+    let (_, _, json) = s
+        .get(
+            &format!("/admin/api/groups/{}", mac.group_id),
+            Some(&session),
+        )
+        .await;
+    assert!(!json.contains("tx-hosted-1") && json.contains(r#""revoked":true"#));
+    let rows = s.audit().await;
+    assert!(rows.contains(&("licence.revoke".into(), "ok".into(), Some(fp.clone()))));
+    assert!(rows
+        .iter()
+        .all(|(_, _, t)| t.as_deref() != Some("tx-hosted-1")));
+
+    // Survives a restart; restore brings the licence back.
+    let s = s.restart().await;
+    let session = s.login().await;
+    let mac = Client {
+        base: s.public.clone(),
+        ..mac
+    };
+    assert_eq!(
+        mac.post("/v2/messages", &alert(&mac, "m3")).await.status,
+        402
+    );
+    let (st, _) = s
+        .act(
+            &session,
+            "/admin/licences/restore",
+            &[("fp", "ffffffffffff")],
+        )
+        .await;
+    assert_eq!(st, 404);
+    let (st, body) = s
+        .act(&session, "/admin/licences/restore", &[("fp", &fp)])
+        .await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(
+        mac.post("/v2/messages", &alert(&mac, "m4")).await.status,
+        200
+    );
+}
+
+#[tokio::test]
+async fn revoked_purchase_drops_gateway_quotas_and_strict_mode_refuses() {
+    let s = servers(&with(
+        GW,
+        &[
+            ("RATE_V2_GATEWAY_BURST", "2"),
+            ("RATE_V2_GATEWAY_PER_SEC", "1"),
+        ],
+    ))
+    .await;
+    let session = s.login().await;
+    let gw = gw_group(
+        &s,
+        80,
+        json!({ "licence": common::licence::licence("tx-gw-1", T0) }),
+    )
+    .await;
+    // Licensed: twice the burst (4).
+    for i in 0..3 {
+        assert_eq!(gw_push(&gw, &tok(1), &format!("l{i}")).await.status, 200);
+    }
+    let (_, _, html) = s.get("/admin/gateway", Some(&session)).await;
+    assert!(html.contains(">licensed<"), "{html}");
+
+    let (st, _) = s
+        .act(
+            &session,
+            "/admin/licences/revoke",
+            &[("tx", "tx-gw-1"), ("reason", "fraud")],
+        )
+        .await;
+    assert_eq!(st, 200);
+    let (_, _, html) = s.get("/admin/gateway", Some(&session)).await;
+    assert!(html.contains("licence revoked"), "{html}");
+    // Normal quotas now: burst 2.
+    let codes: Vec<u16> = {
+        let mut v = Vec::new();
+        for i in 0..3 {
+            v.push(gw_push(&gw, &tok(1), &format!("u{i}")).await.status);
+        }
+        v
+    };
+    assert_eq!(codes, [200, 200, 429]);
+
+    // Strict mode turned on in the panel: the membership is refused at push.
+    let (st, _) = s
+        .act(
+            &session,
+            "/admin/limits/set",
+            &[("key", "GATEWAY_REQUIRE_LICENCE"), ("value", "1")],
+        )
+        .await;
+    assert_eq!(st, 200);
+    let r = gw_push(&gw, &tok(1), "s1").await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (402, Some("licence_required"))
+    );
+    let fp = metriccupid_push::controls::fingerprint("tx-gw-1");
+    let (st, _) = s
+        .act(&session, "/admin/licences/restore", &[("fp", &fp)])
+        .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        gw_push(&gw, &tok(1), "s2").await.status,
+        200,
+        "licensed again"
+    );
+}
+
+#[tokio::test]
+async fn live_limit_override_applies_without_restart_is_bounded_and_resets() {
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    let stranger = s.mac(90);
+    for (key, value, why) in [
+        ("RATE_IP_BURST", "0", "below the range"),
+        ("RATE_IP_BURST", "10001", "above the range"),
+        ("RATE_IP_BURST", "abc", "not a number"),
+        ("RATE_IP_BURST", "-1", "negative"),
+        ("NOPE", "1", "unknown key"),
+        ("GATEWAY_OPEN", "2", "switch"),
+    ] {
+        let (st, body) = s
+            .act(
+                &session,
+                "/admin/limits/set",
+                &[("key", key), ("value", value)],
+            )
+            .await;
+        assert_eq!(st, 400, "{why}: {body}");
+    }
+    assert_eq!(s.state.controls().effective("RATE_IP_BURST"), 10_000);
+
+    for (k, v) in [("RATE_IP_PER_SEC", "1"), ("RATE_IP_BURST", "2")] {
+        let (st, body) = s
+            .act(&session, "/admin/limits/set", &[("key", k), ("value", v)])
+            .await;
+        assert_eq!(st, 200, "{body}");
+    }
+    let burst: Vec<u16> = {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.push(stranger.get("/v2/status").await.status);
+        }
+        v
+    };
+    assert_eq!(burst, [401, 401, 429], "applied at once");
+    let (_, _, html) = s.get("/admin/limits", Some(&session)).await;
+    assert!(
+        html.contains("RATE_IP_BURST") && html.contains("<b>2</b>"),
+        "{html}"
+    );
+
+    // Kept across a restart.
+    let s = s.restart().await;
+    let session = s.login().await;
+    let stranger = Client {
+        base: s.public.clone(),
+        ..stranger
+    };
+    assert_eq!(s.state.controls().effective("RATE_IP_BURST"), 2);
+    let burst: Vec<u16> = {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.push(stranger.get("/v2/status").await.status);
+        }
+        v
+    };
+    assert_eq!(burst, [401, 401, 429], "override reloaded");
+
+    for k in ["RATE_IP_PER_SEC", "RATE_IP_BURST"] {
+        let (st, _) = s.act(&session, "/admin/limits/reset", &[("key", k)]).await;
+        assert_eq!(st, 200);
+    }
+    for _ in 0..5 {
+        assert_eq!(
+            stranger.get("/v2/status").await.status,
+            401,
+            "back to config"
+        );
+    }
+    let rows = s.audit().await;
+    assert_eq!(
+        rows.iter()
+            .filter(|(a, o, _)| a == "limit.set" && o == "ok")
+            .count(),
+        2
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|(a, o, _)| a == "limit.reset" && o == "ok")
+            .count(),
+        2
+    );
+    assert_eq!(rows.iter().filter(|(_, o, _)| o == "invalid").count(), 6);
+}
+
+#[tokio::test]
+async fn gateway_open_kill_switch_via_the_panel() {
+    let s = servers(GW).await;
+    let session = s.login().await;
+    let gw = gw_group(&s, 100, json!({})).await;
+    assert_eq!(gw_push(&gw, &tok(1), "k1").await.status, 200);
+    let (st, _) = s
+        .act(
+            &session,
+            "/admin/limits/set",
+            &[("key", "GATEWAY_OPEN"), ("value", "0")],
+        )
+        .await;
+    assert_eq!(st, 200);
+    let r = gw_push(&gw, &tok(1), "k2").await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("gateway_closed"))
+    );
+    let r = s.mac(102).create_group_with(json!({"gateway": true})).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (403, Some("gateway_closed"))
+    );
+    let (_, _, html) = s.get("/admin/gateway", Some(&session)).await;
+    assert!(html.contains("Gateway <b>closed</b>"), "{html}");
+    let (st, _) = s
+        .act(&session, "/admin/limits/reset", &[("key", "GATEWAY_OPEN")])
+        .await;
+    assert_eq!(st, 200);
+    assert_eq!(gw_push(&gw, &tok(1), "k3").await.status, 200, "open again");
+}
+
+#[tokio::test]
+async fn new_pages_render_escaped_without_scripts() {
+    let s = servers(GW).await;
+    let session = s.login().await;
+    for path in [
+        "/admin/bans",
+        "/admin/gateway",
+        "/admin/licences",
+        "/admin/limits",
+        "/admin/audit",
+    ] {
+        let (st, h, html) = s.get(path, Some(&session)).await;
+        assert_eq!(st, 200, "{path}");
+        assert_security_headers(&h);
+        assert!(
+            !html.contains("<script") && !html.contains("style=\""),
+            "{path}"
+        );
+        assert_eq!(s.get(path, None).await.0, 303, "{path} needs a session");
+    }
 }

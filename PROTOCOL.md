@@ -830,7 +830,9 @@ With `APNS_MODE=gateway` it forwards each push job to the hosted service (`GATEW
    `"gateway": true`. The gateway then requires no licence by default (compatible mode): self-hosting
    stays free; a valid licence, if present, marks the group licensed (twice the quotas below). In
    strict mode (`GATEWAY_REQUIRE_LICENCE=true`) a registration without a valid licence gets `402`
-   (`403` for an invalid or revoked one). Only a `gateway: true` registration makes a group a
+   (`403` for an invalid or revoked one), and a gateway group whose licence no longer counts (for
+   example revoked later) gets `402 licence_required` on `POST /v2/gateway/push`. Only a
+   `gateway: true` registration makes a group a
    gateway group; at most `GATEWAY_MAX_GROUPS` exist (`503 gateway_full`). A closed gateway answers
    `403 gateway_closed` even when a licence is sent. A group that exists without membership (for
    example one created while the gateway was closed, or by a 0.2.0 server) becomes a gateway group
@@ -967,10 +969,16 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 ## 12. Error codes
 
 `unauthorized` (401), `unknown_device`, `wrong_device_kind`, `licence_invalid` (with `reason`),
-`licence_in_use` (403), `not_found` (404), `group_exists`, `device_limit` (409),
+`licence_in_use`, `group_suspended` (403), `not_found` (404), `group_exists`, `device_limit` (409),
 `licence_required` (402), `payload_too_large` (413),
 `rate_limited`, `queue_full` (429), `invalid_request` (400, with `detail`), `storage_error` (500),
 `gateway_error`, `upstream_error` (502), `too_many_streams` (503).
+
+`group_suspended`: the operator suspended the group (admin panel). Every signed request of the group,
+including `GET /v2/stream` and `POST /v2/gateway/push`, gets it after a valid signature; open streams
+are closed and nothing is pushed to the group's phones. Data is kept. A client SHOULD stop retrying
+and show that the service refused the group. An address banned by the operator gets
+`429 rate_limited` with `Retry-After` before any other check, like an automatic ban.
 
 ## 13. Licences (hosted service)
 
@@ -1039,7 +1047,10 @@ A purchase is identified by `appTransactionId`. If the payload has none (older O
 as `0` / empty). One purchase may be attached to at most `LICENCE_MAX_GROUPS` (default 3) groups;
 another group gets `403 licence_in_use`, as does a fourth new attach of one purchase within 24 h
 (deleting a group frees a slot, not an attach). Purchase ids on the operator's revocation list
-(`LICENCE_REVOKED_TX`) are refused with `403 licence_invalid`, `reason: revoked`. All Macs and iPhones of one Apple ID normally share one group
+(`LICENCE_REVOKED_TX`, or revoked in the admin panel) are refused with `403 licence_invalid`,
+`reason: revoked`. A revocation also applies at once to groups the purchase is already attached to:
+they count as unlicensed (`402 licence_required` on sending routes in `app_transaction` mode,
+`licence: null` in `GET /v2/status`; gateway groups lose the licensed quotas). All Macs and iPhones of one Apple ID normally share one group
 (the group secret syncs through iCloud Keychain), so the limit is about separate setups. A slot is
 freed by deleting a group (section 6.1a).
 

@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use governor::clock::{Clock as _, DefaultClock};
@@ -178,6 +178,24 @@ impl AuthBans {
         Self::cleanup_locked(&mut map, now, self.window);
     }
 
+    /// Keys banned at `now` with the seconds left, longest first.
+    pub fn active(&self, now: u64) -> Vec<(IpAddr, u64)> {
+        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<_> = map
+            .iter()
+            .filter(|(_, e)| e.banned_until > now)
+            .map(|(k, e)| (*k, e.banned_until - now))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Lift the ban on `key` and forget its failures; `true` if it was banned.
+    pub fn unban(&self, key: IpAddr, now: u64) -> bool {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&key).is_some_and(|e| e.banned_until > now)
+    }
+
     pub fn len(&self) -> usize {
         self.map.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -196,10 +214,29 @@ fn quota(r: Rate) -> Quota {
     Quota::per_second(r.per_sec).allow_burst(r.burst)
 }
 
+/// A value replaced as a whole at runtime (admin live limits): readers get
+/// the current `Arc`, a writer swaps in a freshly built one. A replaced
+/// limiter starts with full buckets.
+pub struct Live<T>(RwLock<Arc<T>>);
+
+impl<T> Live<T> {
+    pub fn new(v: T) -> Self {
+        Self(RwLock::new(Arc::new(v)))
+    }
+
+    pub fn get(&self) -> Arc<T> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, v: T) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(v);
+    }
+}
+
 /// Global, per-IP and per-secret token buckets.
 pub struct RateLimits {
-    global: DefaultDirectRateLimiter,
-    per_ip: DefaultKeyedRateLimiter<IpAddr>,
+    global: Live<DefaultDirectRateLimiter>,
+    per_ip: Live<DefaultKeyedRateLimiter<IpAddr>>,
     per_secret: Vec<DefaultDirectRateLimiter>,
 }
 
@@ -215,8 +252,8 @@ fn retry_after(nu: governor::NotUntil<governor::clock::QuantaInstant>) -> RetryA
 impl RateLimits {
     pub fn new(limits: &Limits, secret_count: usize) -> Self {
         Self {
-            global: RateLimiter::direct(quota(limits.global)),
-            per_ip: RateLimiter::keyed(quota(limits.per_ip)),
+            global: Live::new(RateLimiter::direct(quota(limits.global))),
+            per_ip: Live::new(RateLimiter::keyed(quota(limits.per_ip))),
             per_secret: (0..secret_count)
                 .map(|_| RateLimiter::direct(quota(limits.per_secret)))
                 .collect(),
@@ -224,11 +261,21 @@ impl RateLimits {
     }
 
     pub fn check_ip(&self, key: IpAddr) -> Result<(), RetryAfter> {
-        self.per_ip.check_key(&key).map_err(retry_after)
+        self.per_ip.get().check_key(&key).map_err(retry_after)
     }
 
     pub fn check_global(&self) -> Result<(), RetryAfter> {
-        self.global.check().map_err(retry_after)
+        self.global.get().check().map_err(retry_after)
+    }
+
+    /// Replace the per-IP buckets (`RATE_IP_*` live override).
+    pub fn set_per_ip(&self, r: Rate) {
+        self.per_ip.set(RateLimiter::keyed(quota(r)));
+    }
+
+    /// Replace the global bucket (`RATE_GLOBAL_*` live override).
+    pub fn set_global(&self, r: Rate) {
+        self.global.set(RateLimiter::direct(quota(r)));
     }
 
     pub fn check_secret(&self, index: usize) -> Result<(), RetryAfter> {
@@ -240,12 +287,13 @@ impl RateLimits {
 
     /// Drop per-IP buckets that are back to full (equivalent to unseen).
     pub fn cleanup(&self) {
-        self.per_ip.retain_recent();
-        self.per_ip.shrink_to_fit();
+        let l = self.per_ip.get();
+        l.retain_recent();
+        l.shrink_to_fit();
     }
 
     pub fn tracked_ips(&self) -> usize {
-        self.per_ip.len()
+        self.per_ip.get().len()
     }
 }
 
@@ -254,13 +302,13 @@ impl RateLimits {
 pub struct V2Limits {
     messages: DefaultKeyedRateLimiter<String>,
     commands: DefaultKeyedRateLimiter<String>,
-    gateway: DefaultKeyedRateLimiter<String>,
-    /// Licensed gateway groups: twice `gateway` / `gateway_hourly`.
-    gateway_licensed: DefaultKeyedRateLimiter<String>,
-    gateway_hourly: DefaultKeyedRateLimiter<String>,
-    gateway_hourly_licensed: DefaultKeyedRateLimiter<String>,
+    /// Per-group gateway buckets per second: `[unlicensed, licensed]`;
+    /// licensed groups get twice the rate and burst.
+    gateway: Live<[DefaultKeyedRateLimiter<String>; 2]>,
+    /// The same per hour (`GATEWAY_GROUP_*`).
+    gateway_hourly: Live<[DefaultKeyedRateLimiter<String>; 2]>,
     /// All gateway pushes together (`GATEWAY_GLOBAL_*`).
-    gateway_global: DefaultDirectRateLimiter,
+    gateway_global: Live<DefaultDirectRateLimiter>,
     /// Token re-bindings per gateway group (10 per day).
     gateway_rebind: DefaultKeyedRateLimiter<String>,
     activity: DefaultKeyedRateLimiter<String>,
@@ -312,22 +360,34 @@ fn double(n: std::num::NonZeroU32) -> std::num::NonZeroU32 {
     n.saturating_mul(std::num::NonZeroU32::new(2).expect("non-zero"))
 }
 
+fn gateway_pair(r: Rate) -> [DefaultKeyedRateLimiter<String>; 2] {
+    [
+        RateLimiter::keyed(quota(r)),
+        RateLimiter::keyed(quota(Rate {
+            per_sec: double(r.per_sec),
+            burst: double(r.burst),
+        })),
+    ]
+}
+
+fn gateway_hourly_pair(r: HourlyRate) -> [DefaultKeyedRateLimiter<String>; 2] {
+    [
+        RateLimiter::keyed(hourly(r)),
+        RateLimiter::keyed(hourly(HourlyRate {
+            per_hour: double(r.per_hour),
+            burst: double(r.burst),
+        })),
+    ]
+}
+
 impl V2Limits {
     pub fn new(c: &V2Config) -> Self {
         Self {
             messages: RateLimiter::keyed(quota(c.rate_messages)),
             commands: RateLimiter::keyed(quota(c.rate_commands)),
-            gateway: RateLimiter::keyed(quota(c.rate_gateway)),
-            gateway_licensed: RateLimiter::keyed(quota(Rate {
-                per_sec: double(c.rate_gateway.per_sec),
-                burst: double(c.rate_gateway.burst),
-            })),
-            gateway_hourly: RateLimiter::keyed(hourly(c.gateway_group_hourly)),
-            gateway_hourly_licensed: RateLimiter::keyed(hourly(HourlyRate {
-                per_hour: double(c.gateway_group_hourly.per_hour),
-                burst: double(c.gateway_group_hourly.burst),
-            })),
-            gateway_global: RateLimiter::direct(quota(c.gateway_global)),
+            gateway: Live::new(gateway_pair(c.rate_gateway)),
+            gateway_hourly: Live::new(gateway_hourly_pair(c.gateway_group_hourly)),
+            gateway_global: Live::new(RateLimiter::direct(quota(c.gateway_global))),
             gateway_rebind: RateLimiter::keyed(gateway_rebind_quota()),
             activity: RateLimiter::keyed(activity_quota()),
             snapshot: RateLimiter::keyed(snapshot_quota()),
@@ -352,18 +412,31 @@ impl V2Limits {
     /// groups get twice both.
     pub fn check_gateway(&self, group: &str, licensed: bool) -> Result<(), RetryAfter> {
         let key = group.to_string();
-        let (sec, hour) = if licensed {
-            (&self.gateway_licensed, &self.gateway_hourly_licensed)
-        } else {
-            (&self.gateway, &self.gateway_hourly)
-        };
-        sec.check_key(&key).map_err(retry_after)?;
-        hour.check_key(&key).map_err(retry_after)
+        let i = usize::from(licensed);
+        self.gateway.get()[i].check_key(&key).map_err(retry_after)?;
+        self.gateway_hourly.get()[i]
+            .check_key(&key)
+            .map_err(retry_after)
     }
 
     /// The gateway's own global bucket.
     pub fn check_gateway_global(&self) -> Result<(), RetryAfter> {
-        self.gateway_global.check().map_err(retry_after)
+        self.gateway_global.get().check().map_err(retry_after)
+    }
+
+    /// Replace the per-group gateway buckets (`RATE_V2_GATEWAY_*`).
+    pub fn set_gateway(&self, r: Rate) {
+        self.gateway.set(gateway_pair(r));
+    }
+
+    /// Replace the hourly per-group gateway buckets (`GATEWAY_GROUP_*`).
+    pub fn set_gateway_hourly(&self, r: HourlyRate) {
+        self.gateway_hourly.set(gateway_hourly_pair(r));
+    }
+
+    /// Replace the shared gateway bucket (`GATEWAY_GLOBAL_*`).
+    pub fn set_gateway_global(&self, r: Rate) {
+        self.gateway_global.set(RateLimiter::direct(quota(r)));
     }
 
     /// One more re-binding of an idle token to `group`.
@@ -396,13 +469,14 @@ impl V2Limits {
     }
 
     pub fn cleanup(&self) {
+        let (gw, gwh) = (self.gateway.get(), self.gateway_hourly.get());
         for l in [
             &self.messages,
             &self.commands,
-            &self.gateway,
-            &self.gateway_licensed,
-            &self.gateway_hourly,
-            &self.gateway_hourly_licensed,
+            &gw[0],
+            &gw[1],
+            &gwh[0],
+            &gwh[1],
             &self.gateway_rebind,
             &self.activity,
             &self.snapshot,
@@ -465,6 +539,74 @@ mod tests {
         assert_eq!(bans.banned_for(ip, 102), None);
         bans.cleanup(1000);
         assert!(bans.is_empty());
+    }
+
+    #[test]
+    fn active_bans_and_unban() {
+        let bans = AuthBans::new(1, Duration::from_secs(60), Duration::from_secs(100));
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        bans.record_failure(a, 0);
+        bans.record_failure(b, 50);
+        assert_eq!(bans.active(60), vec![(b, 90), (a, 40)], "longest first");
+        assert!(bans.unban(a, 60));
+        assert!(!bans.unban(a, 60), "already lifted");
+        assert_eq!(bans.banned_for(a, 60), None);
+        assert_eq!(bans.active(200), vec![], "expired");
+        assert!(!bans.unban(b, 200), "expired ban is not lifted");
+    }
+
+    #[test]
+    fn live_limiters_are_replaced_without_restart() {
+        let r = |p, b| Rate {
+            per_sec: nz(p),
+            burst: nz(b),
+        };
+        let limits = Limits {
+            global: r(100, 100),
+            per_ip: r(1, 1),
+            per_secret: r(1, 1),
+            ban_threshold: 10,
+            ban_window: Duration::from_secs(900),
+            ban_duration: Duration::from_secs(900),
+        };
+        let rl = RateLimits::new(&limits, 0);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        assert!(rl.check_ip(ip).is_ok());
+        assert!(rl.check_ip(ip).is_err());
+        rl.set_per_ip(r(1, 3));
+        for _ in 0..3 {
+            assert!(rl.check_ip(ip).is_ok(), "new bucket, burst 3");
+        }
+        assert!(rl.check_ip(ip).is_err());
+        rl.set_global(r(1, 1));
+        assert!(rl.check_global().is_ok());
+        assert!(rl.check_global().is_err());
+
+        let c = crate::config::Config::from_lookup(|k| match k {
+            "APNS_MODE" => Some("mock".into()),
+            "RATE_V2_GATEWAY_BURST" => Some("1".into()),
+            _ => None,
+        })
+        .unwrap();
+        let v2 = V2Limits::new(&c.v2);
+        assert!(v2.check_gateway("g", false).is_ok());
+        assert!(v2.check_gateway("g", false).is_err());
+        assert!(v2.check_gateway("g", true).is_ok(), "licensed: burst 2");
+        v2.set_gateway(r(1, 5));
+        for _ in 0..5 {
+            assert!(v2.check_gateway("g", false).is_ok());
+        }
+        assert!(v2.check_gateway("g", false).is_err());
+        v2.set_gateway_hourly(HourlyRate {
+            per_hour: nz(1),
+            burst: nz(1),
+        });
+        assert!(v2.check_gateway("h", false).is_ok());
+        assert!(v2.check_gateway("h", false).is_err(), "hourly bucket");
+        v2.set_gateway_global(r(1, 1));
+        assert!(v2.check_gateway_global().is_ok());
+        assert!(v2.check_gateway_global().is_err());
     }
 
     #[test]

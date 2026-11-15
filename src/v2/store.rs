@@ -191,6 +191,43 @@ CREATE TABLE IF NOT EXISTS licence_attaches (
 );
 CREATE INDEX IF NOT EXISTS licence_attaches_purchase
     ON licence_attaches(app_transaction_id, attached_at);
+-- Admin management (0.2.2, src/controls.rs). Written only by panel actions.
+CREATE TABLE IF NOT EXISTS admin_audit (
+    id        INTEGER PRIMARY KEY,
+    ts        INTEGER NOT NULL,
+    actor     TEXT NOT NULL,
+    ip_prefix TEXT,
+    action    TEXT NOT NULL,
+    target    TEXT,
+    detail    TEXT,
+    outcome   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admin_audit_ts ON admin_audit(ts);
+CREATE TABLE IF NOT EXISTS manual_bans (
+    net        TEXT PRIMARY KEY,
+    until      INTEGER NOT NULL,
+    reason     TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    actor      TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS group_suspensions (
+    group_id     TEXT PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
+    suspended_at INTEGER NOT NULL,
+    reason       TEXT NOT NULL,
+    actor        TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS revoked_licences (
+    app_transaction_id TEXT PRIMARY KEY,
+    revoked_at         INTEGER NOT NULL,
+    reason             TEXT NOT NULL,
+    actor              TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS limit_overrides (
+    key        TEXT PRIMARY KEY,
+    value      INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    actor      TEXT NOT NULL
+) WITHOUT ROWID;
 "#;
 
 /// New attaches of one purchase to another group per 24 h.
@@ -352,6 +389,16 @@ impl Store {
             conn: Arc::new(Mutex::new(conn)),
             path: self.path.clone(),
         })
+    }
+
+    /// Run `f` with the connection on the calling thread. For startup only
+    /// (loading the admin controls before the server accepts requests).
+    pub fn blocking<R>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let mut c = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut c)
     }
 
     /// Run `f` with the connection on the blocking thread pool.
@@ -1054,6 +1101,21 @@ pub fn gateway_member(c: &mut Connection, group_id: &str) -> Result<Option<bool>
     .map(|l| l != 0))
 }
 
+/// Like [`gateway_member`], plus the purchase id of the group's licence
+/// (to honour revocations made after the group registered).
+pub fn gateway_member_licence(
+    c: &mut Connection,
+    group_id: &str,
+) -> Result<Option<(bool, Option<String>)>, StoreError> {
+    Ok(c.query_row(
+        "SELECT g.licensed, l.app_transaction_id FROM gateway_groups g
+         LEFT JOIN group_licences l ON l.group_id = g.group_id WHERE g.group_id = ?1",
+        [group_id],
+        |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?)),
+    )
+    .optional()?)
+}
+
 /// `group_id` is already a gateway group, or there are fewer than `max`.
 pub fn gateway_has_room(c: &Connection, group_id: &str, max: u32) -> Result<bool, StoreError> {
     let member = c
@@ -1220,6 +1282,7 @@ pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreErro
         "DELETE FROM gateway_tokens WHERE last_used <= ?1",
         [cutoff(now, GATEWAY_BINDING_RETENTION_SECS)],
     )?;
+    c.execute("DELETE FROM manual_bans WHERE until <= ?1", [now as i64])?;
     Ok((m, k))
 }
 

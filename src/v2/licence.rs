@@ -10,6 +10,10 @@
 //! so that a later subscription model can add `free` / `pro` without touching
 //! the founders.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::RwLock;
+
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ring::signature::{self, UnparsedPublicKey, VerificationAlgorithm};
@@ -116,6 +120,10 @@ pub struct LicenceReq {
 }
 
 /// What the hosted service requires (built from `LICENCE_*`).
+///
+/// `GATEWAY_OPEN`, `GATEWAY_REQUIRE_LICENCE`, `GATEWAY_MAX_TOKENS_PER_GROUP`
+/// and `GATEWAY_MAX_GROUPS` can be changed at runtime from the admin panel
+/// (live limits), so they are atomics read through accessors.
 pub struct LicencePolicy {
     pub mode: LicenceMode,
     pub verifier: AppTransactionVerifier,
@@ -124,12 +132,13 @@ pub struct LicencePolicy {
     /// `GATEWAY_OPEN`: whether this (hosted) server relays APNs for
     /// self-hosted servers. Closed by default so nobody uses the operator's
     /// APNs key and quota without being let in explicitly.
-    pub gateway_open: bool,
+    pub gateway_open: AtomicBool,
     /// `GATEWAY_REQUIRE_LICENCE`: gateway registrations need a licence that
     /// counts for the gateway (production, or sandbox while
-    /// `GATEWAY_SANDBOX_LICENCES_COUNT=true`). Off (compatible): a licence
-    /// only raises the quotas.
-    pub gateway_require_licence: bool,
+    /// `GATEWAY_SANDBOX_LICENCES_COUNT=true`), and pushes from gateway
+    /// groups without one are refused. Off (compatible): a licence only
+    /// raises the quotas.
+    pub gateway_require_licence: AtomicBool,
     /// `GATEWAY_ACTIVITY_LINES`: keep Live Activity text lines on gateway pushes.
     pub gateway_activity_lines: bool,
     /// `GATEWAY_APNS_SANDBOX`: accept gateway pushes with `env=sandbox`.
@@ -137,16 +146,55 @@ pub struct LicencePolicy {
     /// `GATEWAY_SANDBOX_LICENCES_COUNT`: a TestFlight licence counts as
     /// licensed for the gateway.
     pub gateway_sandbox_licences_count: bool,
-    pub gateway_max_tokens_per_group: u32,
-    pub gateway_max_groups: u32,
+    pub gateway_max_tokens_per_group: AtomicU32,
+    pub gateway_max_groups: AtomicU32,
     /// `LICENCE_REVOKED_TX`. Never logged.
     pub revoked: RevokedTx,
+    /// Purchases revoked from the admin panel (table `revoked_licences`),
+    /// merged with `revoked`. Never logged.
+    pub revoked_live: RwLock<HashSet<String>>,
 }
 
 impl LicencePolicy {
     /// The purchase is on the revocation list.
     pub fn is_revoked(&self, lic: &VerifiedLicence) -> bool {
-        self.revoked.0.contains(&lic.app_transaction_id)
+        self.is_tx_revoked(&lic.app_transaction_id)
+    }
+
+    /// Purchase id `tx` is revoked (`LICENCE_REVOKED_TX` or the admin panel).
+    pub fn is_tx_revoked(&self, tx: &str) -> bool {
+        self.revoked.0.contains(tx)
+            || self
+                .revoked_live
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(tx)
+    }
+
+    /// Add (`true`) or remove a panel revocation of purchase `tx`.
+    pub fn set_revoked(&self, tx: &str, revoked: bool) {
+        let mut set = self.revoked_live.write().unwrap_or_else(|e| e.into_inner());
+        if revoked {
+            set.insert(tx.to_string());
+        } else {
+            set.remove(tx);
+        }
+    }
+
+    pub fn gateway_open(&self) -> bool {
+        self.gateway_open.load(Ordering::Relaxed)
+    }
+
+    pub fn gateway_require_licence(&self) -> bool {
+        self.gateway_require_licence.load(Ordering::Relaxed)
+    }
+
+    pub fn gateway_max_tokens_per_group(&self) -> u32 {
+        self.gateway_max_tokens_per_group.load(Ordering::Relaxed)
+    }
+
+    pub fn gateway_max_groups(&self) -> u32 {
+        self.gateway_max_groups.load(Ordering::Relaxed)
     }
 
     /// The licence counts for the gateway's higher quotas and strict mode:

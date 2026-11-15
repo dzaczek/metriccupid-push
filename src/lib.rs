@@ -8,6 +8,7 @@ pub mod api;
 pub mod auth;
 pub mod client_ip;
 pub mod config;
+pub mod controls;
 pub mod limits;
 pub mod metrics;
 pub mod pushover;

@@ -25,6 +25,15 @@ abuse of the gateway to send notifications with arbitrary text (including
 Live Activity text), to push to a token that belongs to a hosted user or to
 another gateway user's active phone, or to exhaust quotas shared with hosted
 users; client IP spoofing through an over-broad `CF_IPS_EXTRA`.
+For the admin panel: reaching it past the allowlist or Cloudflare Access check,
+performing a management action (ban, unban, gateway unbind or removal, group
+suspension, licence revocation or restore, limit override) without a session,
+its CSRF token and a fresh TOTP code, reusing a TOTP code, bypassing the
+action rate limit or lockout, setting a limit outside its fixed range,
+altering or deleting audit log rows from the panel, a suspended group or a
+manually banned address still reaching the API, a revoked purchase still
+counting as licensed, and HTML injection or leaking purchase ids, APNs tokens
+or secrets in panel pages.
 
 Out of scope: volumetric DDoS against an origin exposed without a proxy
 (put Cloudflare or a Tunnel in front, see README), and issues that require

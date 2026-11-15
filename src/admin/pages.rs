@@ -3,9 +3,13 @@
 
 use std::fmt::Write as _;
 
+use std::net::IpAddr;
+
 use super::queries::{
-    Count, EventRow, GroupDetail, GroupFilter, GroupRow, Overview, Pushes, Security, Series,
+    AuditRow, Count, EventRow, Gateway, GatewayDetail, GatewayRow, GroupDetail, GroupFilter,
+    GroupRow, Overview, Pushes, RevokedRow, Security, Series,
 };
+use crate::controls::{LimitKind, ManualBan, LIMIT_KEYS};
 
 /// HTML-escape text and attribute values.
 pub fn esc(s: &str) -> String {
@@ -278,6 +282,11 @@ pub fn layout(p: &Page<'_>, body: &str) -> String {
             ("groups", "/admin/groups", "Groups"),
             ("pushes", "/admin/pushes", "Pushes"),
             ("security", "/admin/security", "Security"),
+            ("bans", "/admin/bans", "Bans"),
+            ("gateway", "/admin/gateway", "Gateway"),
+            ("licences", "/admin/licences", "Licences"),
+            ("limits", "/admin/limits", "Limits"),
+            ("audit", "/admin/audit", "Audit log"),
         ] {
             let cls = if key == p.nav { r#" class="on""# } else { "" };
             let _ = write!(o, r#"<a href="{href}"{cls}>{label}</a>"#);
@@ -520,6 +529,11 @@ pub fn groups(now: u64, rows: &[GroupRow], f: &GroupFilter) -> String {
             ("none", "none"),
         ],
     );
+    b += &sel(
+        "Suspended",
+        &f.suspended,
+        &[("", "any"), ("yes", "suspended"), ("no", "not suspended")],
+    );
     let _ = write!(
         b,
         r#"<label>Country <input name="country" value="{}" maxlength="2" size="3"></label><label>Group id <input name="q" value="{}" maxlength="22" size="12"></label>"#,
@@ -545,7 +559,7 @@ pub fn groups(now: u64, rows: &[GroupRow], f: &GroupFilter) -> String {
         rows.len(),
         super::queries::MAX_GROUP_ROWS
     );
-    b += r#"<div class="scroll"><table><tr><th>Group</th><th>Created</th><th>Last active</th><th>Macs</th><th>Phones</th><th>Licence</th><th>Country</th><th>Requests 30 d</th><th>Pushes 30 d</th></tr>"#;
+    b += r#"<div class="scroll"><table><tr><th>Group</th><th>Created</th><th>Last active</th><th>Macs</th><th>Phones</th><th>Licence</th><th>Country</th><th>Requests 30 d</th><th>Pushes 30 d</th><th>State</th></tr>"#;
     for g in rows {
         let lic = match (&g.tier, &g.environment) {
             (Some(t), Some(e)) => format!("{t} / {e}"),
@@ -553,7 +567,7 @@ pub fn groups(now: u64, rows: &[GroupRow], f: &GroupFilter) -> String {
         };
         let _ = write!(
             b,
-            r#"<tr><td><a href="/admin/groups/{}"><code>{}</code></a></td><td>{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td>{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td></tr>"#,
+            r#"<tr><td><a href="/admin/groups/{}"><code>{}</code></a></td><td>{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td>{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td>{}</td></tr>"#,
             qv(&g.group_id),
             esc(&g.group_id),
             fmt_date(g.created_at),
@@ -563,14 +577,19 @@ pub fn groups(now: u64, rows: &[GroupRow], f: &GroupFilter) -> String {
             esc(&lic),
             opt(&g.country),
             g.requests_30d,
-            g.pushes_30d
+            g.pushes_30d,
+            if g.suspended {
+                r#"<span class="error">suspended</span>"#
+            } else {
+                "active"
+            }
         );
     }
     b.push_str("</table></div>");
     b
 }
 
-pub fn group_detail(now: u64, g: &GroupDetail) -> String {
+pub fn group_detail(now: u64, g: &GroupDetail, csrf: &str) -> String {
     let mut b = format!(
         r#"<p><code>{}</code> · created {} · mailbox {} messages · {} queued commands</p>"#,
         esc(&g.group_id),
@@ -578,9 +597,47 @@ pub fn group_detail(now: u64, g: &GroupDetail) -> String {
         g.mailbox_messages,
         g.queued_commands
     );
+    b += "<h2>State</h2>";
+    let gid = qv(&g.group_id);
+    match &g.suspension {
+        Some(sp) => {
+            let _ = write!(
+                b,
+                r#"<p><span class="error">Suspended</span> {} by {}: {}</p>"#,
+                fmt_ts(sp.suspended_at),
+                esc(&sp.actor),
+                esc(&sp.reason)
+            );
+            b += &action_form(
+                &format!("/admin/groups/{gid}/unsuspend"),
+                csrf,
+                "",
+                "Unsuspend",
+            );
+        }
+        None => {
+            b += r#"<p>Active. Suspending refuses every signed request with <code>403 group_suspended</code>, closes its streams and stops all pushes; data is kept.</p>"#;
+            b += &action_form(
+                &format!("/admin/groups/{gid}/suspend"),
+                csrf,
+                &reason_field(),
+                "Suspend",
+            );
+        }
+    }
+    if let Some(l) = g.gateway_licensed {
+        let _ = write!(
+            b,
+            r#"<p>Gateway group (stored licensed flag: {}). <a href="/admin/gateway/{gid}">Gateway details</a></p>"#,
+            if l { "yes" } else { "no" }
+        );
+    }
     b += "<h2>Licence</h2>";
     match &g.licence {
         Some(l) => {
+            if l.revoked {
+                b += r#"<p class="error">This purchase is revoked: the group is treated as unlicensed.</p>"#;
+            }
             let _ = write!(
                 b,
                 "<table><tr><th>Tier</th><th>Environment</th><th>Original purchase</th><th>Original version</th><th>Platform</th><th>Attached</th><th>Verified</th></tr><tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr></table>",
@@ -713,6 +770,374 @@ pub fn security(now: u64, s: &Security, sessions: usize) -> String {
     b += &events_table(now, &s.bans, true);
     b += "<h2>Admin logins</h2>";
     b += &events_table(now, &s.admin_logins, true);
+    b
+}
+
+// ------------------------------------------------------------ management ---
+
+/// A POST form for one panel action: CSRF token, the action's own fields,
+/// and a fresh authenticator code (step-up).
+pub fn action_form(action: &str, csrf: &str, fields: &str, button: &str) -> String {
+    format!(
+        r#"<form method="post" action="{}" class="action" autocomplete="off"><input type="hidden" name="csrf" value="{}">{fields}<label>Code <input name="totp" inputmode="numeric" pattern="[0-9]{{6}}" autocomplete="one-time-code" required maxlength="6" size="7"></label><button type="submit">{}</button></form>"#,
+        esc(action),
+        esc(csrf),
+        esc(button)
+    )
+}
+
+fn hidden(name: &str, value: &str) -> String {
+    format!(
+        r#"<input type="hidden" name="{}" value="{}">"#,
+        esc(name),
+        esc(value)
+    )
+}
+
+fn reason_field() -> String {
+    r#"<label>Reason <input name="reason" required maxlength="200" size="24"></label>"#.into()
+}
+
+/// The outcome of a panel action.
+pub fn result(ok: bool, message: &str, back: &str) -> String {
+    format!(
+        r#"<p class="{}" role="status">{}</p><p><a href="{}">Back</a></p>"#,
+        if ok { "ok" } else { "error" },
+        esc(message),
+        esc(back)
+    )
+}
+
+pub fn bans(now: u64, manual: &[ManualBan], auto: &[(IpAddr, u64)], csrf: &str) -> String {
+    let mut b = String::from(
+        r#"<p>Manual bans are kept across restarts and checked before anything else on every public request (<code>429</code> with <code>Retry-After</code>). Automatic bans come from repeated authentication failures and live in memory only.</p><h2>Ban an IP or prefix</h2>"#,
+    );
+    b += &action_form(
+        "/admin/bans/add",
+        csrf,
+        &format!(
+            r#"<label>IP or CIDR <input name="target" required maxlength="64" size="22" placeholder="192.0.2.0/24"></label><label>Duration <select name="duration">{}</select></label>{}"#,
+            ["15m", "1h", "6h", "1d", "7d", "30d"]
+                .iter()
+                .map(|d| format!(r#"<option value="{d}">{d}</option>"#))
+                .collect::<String>(),
+            reason_field()
+        ),
+        "Ban",
+    );
+    b += r#"<p class="muted">IPv4 /16 or longer, IPv6 /32 or longer; 15 minutes to 30 days.</p>"#;
+    let _ = write!(b, "<h2>Manual bans ({})</h2>", manual.len());
+    if manual.is_empty() {
+        b += r#"<p class="muted">None.</p>"#;
+    } else {
+        b += r#"<div class="scroll"><table><tr><th>Prefix</th><th>Expires</th><th>Reason</th><th>By</th><th>Since</th><th></th></tr>"#;
+        for m in manual {
+            let net = m.net.to_string();
+            let _ = write!(
+                b,
+                r#"<tr><td><code>{}</code></td><td title="{}">in {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                esc(&net),
+                fmt_ts(m.until),
+                fmt_dur(m.until.saturating_sub(now)),
+                esc(&m.reason),
+                esc(&m.actor),
+                fmt_ts(m.created_at),
+                action_form("/admin/bans/remove", csrf, &hidden("target", &net), "Lift")
+            );
+        }
+        b += "</table></div>";
+    }
+    let _ = write!(b, "<h2>Automatic bans ({})</h2>", auto.len());
+    if auto.is_empty() {
+        b += r#"<p class="muted">None.</p>"#;
+    } else {
+        b += r#"<div class="scroll"><table><tr><th>Address (IPv6: /64)</th><th>Expires</th><th></th></tr>"#;
+        for (ip, left) in auto {
+            let ip = ip.to_string();
+            let _ = write!(
+                b,
+                r#"<tr><td><code>{}</code></td><td>in {}</td><td>{}</td></tr>"#,
+                esc(&ip),
+                fmt_dur(*left),
+                action_form("/admin/bans/unban", csrf, &hidden("target", &ip), "Unban")
+            );
+        }
+        b += "</table></div>";
+    }
+    b
+}
+
+/// Effective gateway quotas, for the gateway pages.
+pub struct GatewayQuotas {
+    pub open: bool,
+    pub require_licence: bool,
+    pub per_hour: u32,
+    pub max_tokens: u32,
+    pub max_groups: u32,
+}
+
+fn gateway_state(r: &GatewayRow) -> String {
+    let mut parts = vec![if r.licensed {
+        "licensed".to_string()
+    } else if r.licensed_flag {
+        "licence revoked".to_string()
+    } else {
+        "unlicensed".to_string()
+    }];
+    if r.suspended {
+        parts.push("suspended".into());
+    }
+    parts.join(", ")
+}
+
+pub fn gateway(now: u64, g: &Gateway, q: &GatewayQuotas) -> String {
+    let mut b = format!(
+        r#"<p>Gateway <b>{}</b>{} · {} of {} groups · per group {} pushes per hour (licensed twice) · {} tokens per group. Change these on the <a href="/admin/limits">Limits</a> page.</p>"#,
+        if q.open { "open" } else { "closed" },
+        if q.require_licence {
+            " (licence required)"
+        } else {
+            ""
+        },
+        g.total,
+        q.max_groups,
+        q.per_hour,
+        q.max_tokens
+    );
+    b += &count_table("Refusals (24 h)", &g.refusals_24h);
+    let _ = write!(
+        b,
+        r#"<h2>Groups</h2><p class="muted">{} shown (max {}). "Sent 1 h" counts pushes answered <code>sent</code> in the last hour (raw events): the per-group hourly bucket itself cannot be read without using it up.</p>"#,
+        g.rows.len(),
+        super::queries::MAX_GROUP_ROWS
+    );
+    b += r#"<div class="scroll"><table><tr><th>Group</th><th>Joined</th><th>State</th><th>Tokens</th><th>Last use</th><th>Sent 1 h</th><th>Refused 24 h</th></tr>"#;
+    for r in &g.rows {
+        let quota = if r.licensed {
+            u64::from(q.per_hour) * 2
+        } else {
+            u64::from(q.per_hour)
+        };
+        let _ = write!(
+            b,
+            r#"<tr><td><a href="/admin/gateway/{}"><code>{}</code></a></td><td>{}</td><td>{}</td><td class="num">{} / {}</td><td>{}</td><td class="num">{} / {}</td><td class="num">{}</td></tr>"#,
+            qv(&r.group_id),
+            esc(&r.group_id),
+            fmt_date(r.created_at),
+            esc(&gateway_state(r)),
+            r.tokens,
+            q.max_tokens,
+            esc(&ago(now, r.last_used)),
+            r.sent_1h,
+            quota,
+            r.refused_24h
+        );
+    }
+    b += "</table></div><h2>Recent refusals</h2>";
+    b += &events_table(now, &g.recent_refusals, false);
+    b
+}
+
+pub fn gateway_detail(now: u64, d: &GatewayDetail, q: &GatewayQuotas, csrf: &str) -> String {
+    let r = &d.row;
+    let gid = qv(&r.group_id);
+    let mut b = format!(
+        r#"<p><a href="/admin/groups/{gid}"><code>{}</code></a> · joined {} · {} · {} of {} tokens · last use {} · sent in the last hour {}</p>"#,
+        esc(&r.group_id),
+        fmt_ts(r.created_at),
+        esc(&gateway_state(r)),
+        r.tokens,
+        q.max_tokens,
+        esc(&ago(now, r.last_used)),
+        r.sent_1h
+    );
+    b += "<h2>Remove from the gateway</h2><p>Deletes the membership and unbinds every token; the group's next push gets <code>403 not_gateway_group</code>. A new registration with <code>gateway: true</code> adds it again while the gateway is open: suspend the group to keep it out.</p>";
+    b += &action_form(
+        &format!("/admin/gateway/{gid}/remove"),
+        csrf,
+        "",
+        "Remove from gateway",
+    );
+    let _ = write!(
+        b,
+        r#"<h2>Bound tokens ({})</h2><p class="muted">Tokens are shown as a fingerprint (first 12 hex digits of their SHA-256).</p>"#,
+        d.tokens.len()
+    );
+    if d.tokens.is_empty() {
+        b += r#"<p class="muted">None.</p>"#;
+    } else {
+        b += "<table><tr><th>Token</th><th>Last used</th><th></th></tr>";
+        for t in &d.tokens {
+            let _ = write!(
+                b,
+                r#"<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>"#,
+                esc(&t.fp),
+                esc(&ago(now, Some(t.last_used))),
+                action_form(
+                    &format!("/admin/gateway/{gid}/unbind"),
+                    csrf,
+                    &hidden("token", &t.fp),
+                    "Unbind"
+                )
+            );
+        }
+        b += "</table>";
+    }
+    b += "<h2>Recent refusals</h2>";
+    b += &events_table(now, &d.recent_refusals, false);
+    b
+}
+
+pub fn licences(rows: &[RevokedRow], config: &[(String, u64)], csrf: &str) -> String {
+    let mut b = String::from(
+        r#"<p>A revoked purchase is refused at registration and <code>PUT /v2/licence</code>, and groups it is already attached to are treated as unlicensed at once: hosted groups follow <code>LICENCE_MODE</code>, gateway groups lose the licensed quotas (and are refused with <code>GATEWAY_REQUIRE_LICENCE</code>). Purchase ids are never shown: rows carry a fingerprint (first 12 hex digits of the id's SHA-256).</p><h2>Revoke a purchase</h2>"#,
+    );
+    b += &action_form(
+        "/admin/licences/revoke",
+        csrf,
+        &format!(
+            r#"<label>Purchase id (appTransactionId) <input name="tx" required maxlength="128" size="24"></label>{}"#,
+            reason_field()
+        ),
+        "Revoke",
+    );
+    let _ = write!(b, "<h2>Revoked in the panel ({})</h2>", rows.len());
+    if rows.is_empty() {
+        b += r#"<p class="muted">None.</p>"#;
+    } else {
+        b += r#"<div class="scroll"><table><tr><th>Purchase</th><th>Revoked</th><th>Reason</th><th>By</th><th>Groups attached</th><th></th></tr>"#;
+        for r in rows {
+            let _ = write!(
+                b,
+                r#"<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td class="num">{}</td><td>{}</td></tr>"#,
+                esc(&r.fp),
+                fmt_ts(r.revoked_at),
+                esc(&r.reason),
+                esc(&r.actor),
+                r.groups,
+                action_form(
+                    "/admin/licences/restore",
+                    csrf,
+                    &hidden("fp", &r.fp),
+                    "Restore"
+                )
+            );
+        }
+        b += "</table></div>";
+    }
+    let _ = write!(
+        b,
+        "<h2>Revoked by <code>LICENCE_REVOKED_TX</code> ({})</h2>",
+        config.len()
+    );
+    if config.is_empty() {
+        b += r#"<p class="muted">None.</p>"#;
+    } else {
+        b += r#"<p class="muted">Set in the environment; remove them there.</p><table><tr><th>Purchase</th><th>Groups attached</th></tr>"#;
+        for (fp, n) in config {
+            let _ = write!(
+                b,
+                r#"<tr><td><code>{}</code></td><td class="num">{n}</td></tr>"#,
+                esc(fp)
+            );
+        }
+        b += "</table>";
+    }
+    b
+}
+
+/// One row of the Limits page.
+pub struct LimitRow {
+    pub key: &'static str,
+    pub config: u32,
+    pub overridden: Option<u32>,
+}
+
+fn limit_value(kind: LimitKind, v: u32) -> String {
+    match kind {
+        LimitKind::Switch if v != 0 => "true".into(),
+        LimitKind::Switch => "false".into(),
+        LimitKind::Number => v.to_string(),
+    }
+}
+
+pub fn limits(rows: &[LimitRow], csrf: &str) -> String {
+    let mut b = String::from(
+        r#"<p>Overrides apply at once, without a restart, and are kept across restarts until reset. A changed rate replaces its limiter, so its buckets start full again. Each override must stay within the range shown.</p><div class="scroll"><table><tr><th>Key</th><th>Meaning</th><th>Config</th><th>Override</th><th>Effective</th><th>Range</th><th>Set</th><th>Reset</th></tr>"#,
+    );
+    for r in rows {
+        let Some(k) = LIMIT_KEYS.iter().find(|k| k.key == r.key) else {
+            continue;
+        };
+        let effective = r.overridden.unwrap_or(r.config);
+        let input = match k.kind {
+            LimitKind::Switch => format!(
+                r#"<select name="value"><option value="1"{}>true</option><option value="0"{}>false</option></select>"#,
+                if effective != 0 { " selected" } else { "" },
+                if effective == 0 { " selected" } else { "" }
+            ),
+            LimitKind::Number => format!(
+                r#"<input name="value" type="number" required min="{}" max="{}" value="{effective}" size="8">"#,
+                k.min, k.max
+            ),
+        };
+        let range = match k.kind {
+            LimitKind::Switch => "true / false".to_string(),
+            LimitKind::Number => format!("{} to {}", k.min, k.max),
+        };
+        let reset = if r.overridden.is_some() {
+            action_form("/admin/limits/reset", csrf, &hidden("key", k.key), "Reset")
+        } else {
+            "-".into()
+        };
+        let _ = write!(
+            b,
+            r#"<tr><td><code>{}</code></td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td class="num"><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            esc(k.key),
+            esc(k.help),
+            esc(&limit_value(k.kind, r.config)),
+            r.overridden
+                .map_or("-".into(), |v| esc(&limit_value(k.kind, v))),
+            esc(&limit_value(k.kind, effective)),
+            esc(&range),
+            action_form(
+                "/admin/limits/set",
+                csrf,
+                &format!("{}{input}", hidden("key", k.key)),
+                "Set"
+            ),
+            reset
+        );
+    }
+    b += "</table></div>";
+    b
+}
+
+pub fn audit(now: u64, rows: &[AuditRow]) -> String {
+    let mut b = format!(
+        r#"<p>Every panel action, including refused step-up codes; newest first, last {}. The panel cannot edit or delete these rows.</p>"#,
+        super::queries::MAX_AUDIT_ROWS
+    );
+    if rows.is_empty() {
+        b += r#"<p class="muted">No actions yet.</p>"#;
+        return b;
+    }
+    b += r#"<div class="scroll"><table><tr><th>Time</th><th>Actor</th><th>Network</th><th>Action</th><th>Target</th><th>Detail</th><th>Outcome</th></tr>"#;
+    for r in rows {
+        let _ = write!(
+            b,
+            r#"<tr><td title="{}">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            fmt_ts(r.ts),
+            esc(&ago(now, Some(r.ts))),
+            esc(&r.actor),
+            opt(&r.ip_prefix),
+            esc(&r.action),
+            opt(&r.target),
+            opt(&r.detail),
+            esc(&r.outcome)
+        );
+    }
+    b += "</table></div>";
     b
 }
 
