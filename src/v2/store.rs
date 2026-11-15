@@ -201,6 +201,8 @@ pub const ATTACH_WINDOW_SECS: u64 = 24 * 3600;
 pub const GATEWAY_BINDING_IDLE_SECS: u64 = 24 * 3600;
 /// `gateway_tokens.last_used` is written at most this often.
 pub const GATEWAY_TOUCH_SECS: u64 = 600;
+/// Bindings unused this long are deleted by [`cleanup`].
+pub const GATEWAY_BINDING_RETENTION_SECS: u64 = 7 * 24 * 3600;
 
 #[derive(Debug)]
 pub struct StoreError(pub String);
@@ -1154,6 +1156,12 @@ pub fn bind_gateway_token(
                     return Ok(Bind::TakenElsewhere);
                 }
             }
+            // The group's own idle bindings no longer count toward its cap
+            // (Live Activity tokens change with every activity).
+            tx.execute(
+                "DELETE FROM gateway_tokens WHERE group_id = ?1 AND last_used < ?2",
+                params![group_id, cutoff(now, GATEWAY_BINDING_IDLE_SECS)],
+            )?;
             let n: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM gateway_tokens WHERE group_id = ?1",
                 [group_id],
@@ -1207,6 +1215,10 @@ pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreErro
     c.execute(
         "DELETE FROM licence_attaches WHERE attached_at <= ?1",
         [cutoff(now, ATTACH_WINDOW_SECS)],
+    )?;
+    c.execute(
+        "DELETE FROM gateway_tokens WHERE last_used <= ?1",
+        [cutoff(now, GATEWAY_BINDING_RETENTION_SECS)],
     )?;
     Ok((m, k))
 }
@@ -1352,6 +1364,16 @@ mod tests {
         assert_eq!(bind(&mut c, "b", "t4", idle + 3), Bind::TokenLimit);
         unbind_gateway_token(&mut c, "b", "t3").unwrap();
         assert_eq!(bind(&mut c, "b", "t4", idle + 3), Bind::Bound);
+        // At the cap, a binding idle for more than 24 h frees its slot.
+        let later = 2 * idle + 4;
+        assert_eq!(bind(&mut c, "b", "t4", later), Bind::Bound, "t4 in use");
+        assert_eq!(bind(&mut c, "b", "t5", later), Bind::Bound, "t1 was idle");
+        // Cleanup drops bindings unused for 7 days.
+        cleanup(&mut c, later + GATEWAY_BINDING_RETENTION_SECS).unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM gateway_tokens", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

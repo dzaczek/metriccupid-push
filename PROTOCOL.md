@@ -832,7 +832,10 @@ With `APNS_MODE=gateway` it forwards each push job to the hosted service (`GATEW
    strict mode (`GATEWAY_REQUIRE_LICENCE=true`) a registration without a valid licence gets `402`
    (`403` for an invalid or revoked one). Only a `gateway: true` registration makes a group a
    gateway group; at most `GATEWAY_MAX_GROUPS` exist (`503 gateway_full`). A closed gateway answers
-   `403 gateway_closed` even when a licence is sent. A refusal by the
+   `403 gateway_closed` even when a licence is sent. A group that exists without membership (for
+   example one created while the gateway was closed, or by a 0.2.0 server) becomes a gateway group
+   when the same `group_id` is registered again with the same `auth_key` and `"gateway": true`
+   (`200 {"status":"exists"}`). A refusal by the
    gateway is returned to the Mac (`402`, `403`, `409`, `502`); the request is idempotent and can be
    retried. A self-hosted server with licence support needs a gateway with licence support too (older
    gateways reject the `gateway` field with `400`).
@@ -868,20 +871,27 @@ The gateway guards every push, in this order:
 
 1. The group must be a gateway group, else `403 not_gateway_group` (a hosted group cannot push to
    arbitrary tokens).
-2. A bucket shared by all gateway pushes (`GATEWAY_GLOBAL_*`, default 20/s, burst 100), separate
-   from the hosted service's global bucket; then per group 1/s burst 30 and 600/h burst 100
-   (licensed groups: twice both). Refusals are `429` with `Retry-After`.
+2. Per group: 1/s burst 30 and 600/h burst 100 (licensed groups: twice both). Refusals are `429`
+   with `Retry-After`.
 3. `env: "sandbox"` is `400` unless `GATEWAY_APNS_SANDBOX=true` (App Store and TestFlight builds use
-   production APNs).
+   production APNs); then the body is validated as described above.
 4. Token binding: a token that is a hosted user's device or Live Activity token, or that another
    gateway group used within the last 24 h, is `403 token_bound`. A binding idle for more than
    24 h moves to the new group (a "Reset link"), at most 10 times per group per day
-   (`429 rebind_limit`). At most `GATEWAY_MAX_TOKENS_PER_GROUP` (30) distinct tokens per group
-   (`429 token_limit`). A `410` from APNs deletes the binding.
-5. At most 32 pushes in flight to APNs; beyond that `503 gateway_busy` with `Retry-After: 1`.
+   (`429 rebind_limit`). At most `GATEWAY_MAX_TOKENS_PER_GROUP` (30) tokens per group used within
+   the last 24 h (`429 token_limit`); older bindings of the group free their slot, so rotating Live
+   Activity tokens never fill it. APNs `410`, `BadDeviceToken` and `DeviceTokenNotForTopic` delete
+   the binding; bindings unused for 7 days are deleted.
+5. A bucket shared by all gateway pushes (`GATEWAY_GLOBAL_*`, default 20/s, burst 100), separate
+   from the hosted service's global bucket. Only pushes that passed every check above use it, so a
+   group's refused requests cannot drain it for others.
+6. At most 32 pushes in flight to APNs; beyond that `503 gateway_busy` with `Retry-After: 1`.
 
 The self-hosted server treats every answer other than `200` and `410` as a failed push and keeps
 the token.
+
+Rollback: a 0.2.0 server has none of these checks (any hosted group could push to any token), so an
+operator rolling back to it must set `GATEWAY_OPEN=false` first.
 
 Privacy: the gateway learns the group id, `auth_key`, device tokens, ciphertext, sizes, urgency and
 timing of pushes. It never sees `enc_key`, plaintext, device names or the mailbox, and stores

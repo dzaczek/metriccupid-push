@@ -2214,9 +2214,8 @@ async fn gateway_push(
             }
             Err(e) => return Err(storage_error(e)),
         };
-        if let Err(ra) = v2.limits.check_gateway_global() {
-            return Err((too_many(ra), "rate_limited_gateway_global"));
-        }
+        // Per-group buckets first: a group's rejected requests use up only
+        // its own quota, never the bucket shared by all gateway groups.
         if let Err(ra) = v2.limits.check_gateway(&a.group, licensed) {
             return Err((too_many(ra), "rate_limited_gateway"));
         }
@@ -2327,6 +2326,10 @@ async fn gateway_push(
                 ))
             }
         }
+        // Charged only for a push that will really be sent.
+        if let Err(ra) = v2.limits.check_gateway_global() {
+            return Err((too_many(ra), "rate_limited_gateway_global"));
+        }
         // Fail fast instead of queueing behind a slow APNs.
         let Ok(_permit) = v2.gateway_sends.try_acquire() else {
             let mut r = error(StatusCode::SERVICE_UNAVAILABLE, "gateway_busy");
@@ -2346,10 +2349,9 @@ async fn gateway_push(
             collapse_id: req.collapse_id,
             expiration: req.expiration,
         };
-        match v2.sender.send(&job).await {
-            Ok(()) => Ok(ok(StatusCode::OK, json!({"status": "sent"}), "sent")),
-            Err(PushError::Unregistered) => {
-                let g = a.group.clone();
+        let unbind = |token: String| {
+            let g = a.group.clone();
+            async move {
                 if let Err(e) = v2
                     .store
                     .call(move |c| store::unbind_gateway_token(c, &g, &token))
@@ -2357,10 +2359,20 @@ async fn gateway_push(
                 {
                     tracing::error!(error = %e, "gateway: cannot forget token binding");
                 }
+            }
+        };
+        match v2.sender.send(&job).await {
+            Ok(()) => Ok(ok(StatusCode::OK, json!({"status": "sent"}), "sent")),
+            Err(PushError::Unregistered) => {
+                unbind(token).await;
                 Ok((error(StatusCode::GONE, "unregistered"), "unregistered"))
             }
             Err(PushError::Rejected { status, reason }) => {
                 tracing::warn!(status, reason, "gateway: APNs rejected push");
+                // A token APNs will never accept must not keep its slot.
+                if matches!(reason.as_str(), "BadDeviceToken" | "DeviceTokenNotForTopic") {
+                    unbind(token).await;
+                }
                 Ok((
                     error(StatusCode::BAD_GATEWAY, "upstream_error"),
                     "upstream_error",

@@ -125,8 +125,10 @@ pub struct LicencePolicy {
     /// self-hosted servers. Closed by default so nobody uses the operator's
     /// APNs key and quota without being let in explicitly.
     pub gateway_open: bool,
-    /// `GATEWAY_REQUIRE_LICENCE`: gateway registrations need a production
-    /// licence (strict). Off (compatible): a licence only raises the quotas.
+    /// `GATEWAY_REQUIRE_LICENCE`: gateway registrations need a licence that
+    /// counts for the gateway (production, or sandbox while
+    /// `GATEWAY_SANDBOX_LICENCES_COUNT=true`). Off (compatible): a licence
+    /// only raises the quotas.
     pub gateway_require_licence: bool,
     /// `GATEWAY_ACTIVITY_LINES`: keep Live Activity text lines on gateway pushes.
     pub gateway_activity_lines: bool,

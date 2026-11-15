@@ -533,7 +533,7 @@ pub struct RecordedPush {
     pub collapse_id: Option<String>,
     pub expiration: u64,
     pub payload: Value,
-    /// `sent` or `unregistered`.
+    /// `sent`, `unregistered` or `rejected`.
     pub outcome: &'static str,
 }
 
@@ -544,6 +544,7 @@ pub const MOCK_CAP: usize = 1000;
 pub struct MockApns {
     pushes: Mutex<Vec<RecordedPush>>,
     unregistered: Mutex<HashSet<String>>,
+    rejected: Mutex<std::collections::HashMap<String, (u16, String)>>,
 }
 
 impl MockApns {
@@ -557,6 +558,15 @@ impl MockApns {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(token.to_ascii_lowercase());
+    }
+
+    /// Make every later push to `token` fail like an APNs rejection
+    /// (`status`, `reason`), e.g. 400 `DeviceTokenNotForTopic`.
+    pub fn mark_rejected(&self, token: &str, status: u16, reason: &str) {
+        self.rejected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(token.to_ascii_lowercase(), (status, reason.to_string()));
     }
 
     pub fn pushes(&self) -> Vec<RecordedPush> {
@@ -582,6 +592,12 @@ impl ApnsSender for MockApns {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&job.device_token);
+            let rejected = self
+                .rejected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&job.device_token)
+                .cloned();
             let payload: Value = serde_json::from_str(&job.payload()).unwrap_or(Value::Null);
             let mut pushes = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
             if pushes.len() >= MOCK_CAP {
@@ -597,12 +613,16 @@ impl ApnsSender for MockApns {
                 collapse_id: job.collapse_id.clone(),
                 expiration: job.expiration,
                 payload,
-                outcome: if gone { "unregistered" } else { "sent" },
+                outcome: match (gone, &rejected) {
+                    (true, _) => "unregistered",
+                    (false, Some(_)) => "rejected",
+                    (false, None) => "sent",
+                },
             });
-            if gone {
-                Err(PushError::Unregistered)
-            } else {
-                Ok(())
+            match (gone, rejected) {
+                (true, _) => Err(PushError::Unregistered),
+                (false, Some((status, reason))) => Err(PushError::Rejected { status, reason }),
+                (false, None) => Ok(()),
             }
         })
     }

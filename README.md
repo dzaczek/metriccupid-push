@@ -254,14 +254,14 @@ exposes them at `GET /v2/debug/pushes`.
 | `APNS_TEAM_ID` | required for `direct` | 10-character team id. |
 | `APNS_TOPIC` | `cat.sysop.MetricCupid` | iOS app bundle id (`apns-topic`). |
 | `GATEWAY_URL` | `https://push-metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. |
-| `GATEWAY_OPEN` | `false` | Hosted only: relay APNs for self-hosted servers (`/v2/gateway/push`). Off by default; while off, gateway registrations and pushes get `403 gateway_closed`, so self-hosters need their own APNs key. |
+| `GATEWAY_OPEN` | `false` | Hosted only: relay APNs for self-hosted servers (`/v2/gateway/push`). Off by default; while off, gateway registrations and pushes get `403 gateway_closed`, so self-hosters need their own APNs key. Only groups registered with `gateway: true` while it is on are gateway groups; an existing group becomes one when its server registers the same `group_id` and key again. **Before rolling back to 0.2.0** (which lacks the gateway checks of PROTOCOL.md section 9) set `GATEWAY_OPEN=false`. |
 | `GATEWAY_REQUIRE_LICENCE` | `false` | Hosted gateway, strict mode: a `gateway: true` registration needs a valid licence (`402 licence_required` without one, `403` for an invalid or revoked one). Off (compatible): a licence is optional and only doubles the gateway quotas. Shipped Macs (1.33.3) never send a licence to a self-hosted server, so turn this on only after a Mac release that does. |
 | `GATEWAY_SANDBOX_LICENCES_COUNT` | `true` | TestFlight (`sandbox`) licences count as licensed for the gateway (quotas, strict mode). `false`: only App Store (`production`) purchases do. |
 | `GATEWAY_ACTIVITY_LINES` | `false` | Keep the Live Activity host/service `lines` on gateway pushes. Off: they are dropped (counts, `start` and its fixed alert stay), so gateway callers cannot put arbitrary text on a Lock Screen. |
 | `GATEWAY_APNS_SANDBOX` | `false` | Accept gateway pushes with `env: sandbox` (Xcode development builds only); otherwise `400`. App Store and TestFlight builds use production APNs. |
 | `GATEWAY_GLOBAL_PER_SEC` / `_BURST` | `20` / `100` | Bucket shared by all gateway pushes. Gateway pushes do not draw from `RATE_GLOBAL_*`, so they cannot starve hosted users. |
 | `GATEWAY_GROUP_PER_HOUR` / `_BURST` | `600` / `100` | Per gateway group and hour, on top of `RATE_V2_GATEWAY_*`. Licensed groups get twice both. |
-| `GATEWAY_MAX_TOKENS_PER_GROUP` | `30` | Distinct device / activity tokens one gateway group may push to; more get `429 token_limit`. |
+| `GATEWAY_MAX_TOKENS_PER_GROUP` | `30` | Device / activity tokens one gateway group may have used within 24 h; more get `429 token_limit`. Older bindings free their slot; bindings unused for 7 days are deleted. |
 | `GATEWAY_MAX_GROUPS` | `2000` | Gateway groups in total; new ones beyond get `503 gateway_full`. |
 | `LICENCE_REVOKED_TX` | empty | Comma-separated purchase ids (`appTransactionId`) refused with `403 licence_invalid` (`reason: revoked`). Never logged. |
 | `DATA_DIR` | `/data` | Directory for the SQLite database (`metriccupid-push.sqlite3`, WAL). Must be writable. |

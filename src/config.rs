@@ -96,8 +96,9 @@ pub struct V2Config {
     /// Unix seconds until which unlicensed groups may still send.
     pub licence_grace_until: Option<u64>,
     pub gateway_open: bool,
-    /// `GATEWAY_REQUIRE_LICENCE`: gateway registrations need a production
-    /// licence (strict mode). Off: a licence only raises the quotas.
+    /// `GATEWAY_REQUIRE_LICENCE`: gateway registrations need a licence that
+    /// counts for the gateway (production, or sandbox while
+    /// `gateway_sandbox_licences_count`). Off: a licence only raises the quotas.
     pub gateway_require_licence: bool,
     /// `GATEWAY_ACTIVITY_LINES`: keep Live Activity `lines` on gateway pushes.
     pub gateway_activity_lines: bool,

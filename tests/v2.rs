@@ -2989,3 +2989,147 @@ async fn self_hosted_alert_reaches_hosted_debug_pushes_through_hardened_gateway(
         .unwrap();
     assert_eq!(bound, TOKEN_A);
 }
+
+// Review fix 1: idle bindings free their slot; rejected tokens are unbound.
+#[tokio::test]
+async fn rotating_activity_tokens_never_hit_the_token_cap() {
+    let (_d, s) = server(&with(GW_OPEN, &[("GATEWAY_MAX_TOKENS_PER_GROUP", "3")])).await;
+    let gw = gw_group(&s, 110, json!({})).await;
+    // A new Live Activity token every 9 h for almost 4 days: never more than
+    // 3 used within 24 h.
+    for i in 0..10u32 {
+        s.set_time(T0 + u64::from(i) * 9 * 3600);
+        let r = gw
+            .post(
+                "/v2/gateway/push",
+                &gw_msg(&tok(1000 + i), &format!("r{i}")),
+            )
+            .await;
+        assert_eq!(r.status, 200, "{i}: {:?}", r.json);
+    }
+    // Four within 24 h still hit the cap.
+    s.set_time(T0 + 9 * 9 * 3600 + 86_401);
+    for i in 0..3u32 {
+        assert_eq!(
+            gw.post(
+                "/v2/gateway/push",
+                &gw_msg(&tok(2000 + i), &format!("x{i}"))
+            )
+            .await
+            .status,
+            200
+        );
+    }
+    let r = gw.post("/v2/gateway/push", &gw_msg(&tok(2003), "x3")).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (429, Some("token_limit"))
+    );
+}
+
+async fn bindings(s: &Server) -> i64 {
+    s.state
+        .v2()
+        .store
+        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM gateway_tokens", [], |r| r.get(0))?))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn apns_bad_token_rejections_unbind_the_token() {
+    let (_d, s) = server(GW_OPEN).await;
+    let gw = gw_group(&s, 112, json!({})).await;
+    for (i, reason) in ["BadDeviceToken", "DeviceTokenNotForTopic"]
+        .iter()
+        .enumerate()
+    {
+        let t = tok(3000 + i as u32);
+        s.mock().mark_rejected(&t, 400, reason);
+        let r = gw
+            .post("/v2/gateway/push", &gw_msg(&t, &format!("bt{i}")))
+            .await;
+        assert_eq!(r.status, 502, "{reason}");
+        assert_eq!(bindings(&s).await, 0, "{reason}");
+    }
+    // Other rejections keep the binding.
+    let t = tok(3100);
+    s.mock().mark_rejected(&t, 429, "TooManyRequests");
+    assert_eq!(
+        gw.post("/v2/gateway/push", &gw_msg(&t, "tm")).await.status,
+        502
+    );
+    assert_eq!(bindings(&s).await, 1);
+}
+
+// Review fix 2: refused requests do not use the shared gateway bucket.
+#[tokio::test]
+async fn refused_gateway_requests_do_not_drain_the_shared_bucket() {
+    let (_d, s) = server(&with(
+        GW_OPEN,
+        &[
+            ("RATE_V2_GATEWAY_BURST", "5"),
+            ("GATEWAY_GLOBAL_PER_SEC", "1"),
+            ("GATEWAY_GLOBAL_BURST", "3"),
+        ],
+    ))
+    .await;
+    let (_mac, _phone) = setup(&s, 120).await; // hosted TOKEN_A
+    let spammer = gw_group(&s, 122, json!({})).await;
+    let victim = gw_group(&s, 124, json!({})).await;
+    let mut invalid = gw_msg(TOKEN_B, "i1");
+    invalid["message"]["s"] = json!("not sealed");
+    assert_eq!(spammer.post("/v2/gateway/push", &invalid).await.status, 400);
+    let mut sandbox = gw_msg(TOKEN_B, "i2");
+    sandbox["urgency"] = json!("bogus");
+    assert_eq!(spammer.post("/v2/gateway/push", &sandbox).await.status, 400);
+    for id in ["tb1", "tb2"] {
+        assert_eq!(
+            spammer
+                .post("/v2/gateway/push", &gw_msg(TOKEN_A, id))
+                .await
+                .status,
+            403
+        );
+    }
+    assert_eq!(
+        spammer
+            .post("/v2/gateway/push", &gw_msg(TOKEN_B, "ok"))
+            .await
+            .status,
+        200
+    );
+    for i in 0..5 {
+        let r = spammer
+            .post("/v2/gateway/push", &gw_msg(TOKEN_B, &format!("over{i}")))
+            .await;
+        assert_eq!(r.status, 429, "own per-group limit");
+    }
+    // 1 of 3 shared tokens used: the victim gets the other 2.
+    let vt = tok(4000);
+    for id in ["v1", "v2"] {
+        let r = victim.post("/v2/gateway/push", &gw_msg(&vt, id)).await;
+        assert_eq!(r.status, 200, "{id}: {:?}", r.json);
+    }
+    let r = victim.post("/v2/gateway/push", &gw_msg(&vt, "v3")).await;
+    assert_eq!(r.status, 429, "shared bucket now empty");
+}
+
+// Review item 3: a group without membership (e.g. created while the gateway
+// was closed, or by 0.2.0) becomes a member by re-registering.
+#[tokio::test]
+async fn re_registering_an_existing_group_with_gateway_promotes_it() {
+    let (_d, s) = server(GW_OPEN).await;
+    let c = s.group(126);
+    let (g, key) = (c.group_id.clone(), c.keys.auth);
+    s.state
+        .v2()
+        .store
+        .call(move |conn| store::create_group(conn, &g, &key, T0))
+        .await
+        .unwrap();
+    assert_eq!(member(&s, &c.group_id).await, None);
+    let r = c.create_group_with(json!({"gateway": true})).await;
+    assert_eq!((r.status, r.json["status"].as_str()), (200, Some("exists")));
+    assert_eq!(member(&s, &c.group_id).await, Some(false));
+}
