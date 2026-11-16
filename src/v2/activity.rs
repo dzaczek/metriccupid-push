@@ -238,7 +238,7 @@ impl Activities {
         }
         g.pending = true;
         let due =
-            event == ActivityEvent::End || g.last_sent.map_or(true, |t| now >= t + COALESCE_SECS);
+            event == ActivityEvent::End || g.last_sent.is_none_or(|t| now >= t + COALESCE_SECS);
         due.then(|| take(g, now))
     }
 
@@ -254,7 +254,7 @@ impl Activities {
     pub fn due(&self, now: u64) -> Vec<(String, Batch)> {
         let mut map = self.lock();
         map.iter_mut()
-            .filter(|(_, g)| g.pending && g.last_sent.map_or(true, |t| now >= t + COALESCE_SECS))
+            .filter(|(_, g)| g.pending && g.last_sent.is_none_or(|t| now >= t + COALESCE_SECS))
             .map(|(k, g)| (k.clone(), take(g, now)))
             .collect()
     }
@@ -272,7 +272,7 @@ impl Activities {
         g.pending = true;
         g.event.get_or_insert(ActivityEvent::Update);
         g.last_sent
-            .map_or(true, |t| now >= t + COALESCE_SECS)
+            .is_none_or(|t| now >= t + COALESCE_SECS)
             .then(|| take(g, now))
     }
 

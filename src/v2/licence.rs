@@ -212,7 +212,7 @@ impl LicencePolicy {
 
     /// Unlicensed groups are refused from sending at `now` (grace over).
     pub fn enforced(&self, now: u64) -> bool {
-        self.mode == LicenceMode::AppTransaction && self.grace_until.map_or(true, |g| now >= g)
+        self.mode == LicenceMode::AppTransaction && self.grace_until.is_none_or(|g| now >= g)
     }
 
     pub fn verify(&self, req: &LicenceReq) -> Result<VerifiedLicence, LicenceError> {

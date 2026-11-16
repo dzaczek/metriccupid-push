@@ -210,7 +210,7 @@ pub const MAX_ACTIVITY_TOKEN_HEX: usize = 512;
 
 fn normalize_hex_token(s: &str, max: usize) -> Option<String> {
     let ok = (64..=max).contains(&s.len())
-        && s.len() % 2 == 0
+        && s.len().is_multiple_of(2)
         && s.bytes().all(|b| b.is_ascii_hexdigit());
     ok.then(|| s.to_ascii_lowercase())
 }
@@ -2474,8 +2474,8 @@ async fn gateway_push(
                 n.state.validate().map_err(bad)?;
                 let near = |t: u64| t.abs_diff(now) <= MAX_TTL_SECS;
                 if !near(n.timestamp)
-                    || !n.stale_date.map_or(true, near)
-                    || !n.dismissal_date.map_or(true, near)
+                    || !n.stale_date.is_none_or(near)
+                    || !n.dismissal_date.is_none_or(near)
                 {
                     return Err(bad("activity times must be within 24 h of now"));
                 }
