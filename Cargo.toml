@@ -1,8 +1,8 @@
 [package]
 name = "metriccupid-push"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 description = "Self-hostable server for MetricCupid: signed Pushover relay (v1) and end-to-end encrypted Mac <-> iPhone mailbox with APNs (v2)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dzaczek/metriccupid-push"
@@ -32,7 +32,7 @@ ipnet = "2"
 base64 = "0.22"
 # Already in the tree via rustls; used directly for the APNs ES256 provider token.
 ring = "0.17"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # App Store licences: the AppTransaction x5c chain (signatures checked with ring).
 x509-parser = { version = "0.18", default-features = false }
 time = { version = "0.3", default-features = false, features = ["parsing", "std"] }
