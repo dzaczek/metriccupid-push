@@ -69,6 +69,20 @@ impl Presence {
         g.pending = Some(Pending { due, reason, since });
     }
 
+    /// The group was deleted: drop its state (a pending or sent notice).
+    pub fn forget(&self, group: &str) {
+        self.lock().remove(group);
+    }
+
+    /// Groups with state (tests, diagnostics).
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Offline notices due at `now`, marked as sent. Groups for which
     /// `online` is true (a Mac reconnected in a race) are dropped instead.
     pub fn due(&self, now: u64, online: impl Fn(&str) -> bool) -> Vec<(String, PresenceNote)> {

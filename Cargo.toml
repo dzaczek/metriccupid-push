@@ -1,6 +1,6 @@
 [package]
 name = "metriccupid-push"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.80"
 description = "Self-hostable server for MetricCupid: signed Pushover relay (v1) and end-to-end encrypted Mac <-> iPhone mailbox with APNs (v2)"
@@ -37,6 +37,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 x509-parser = { version = "0.18", default-features = false }
 time = { version = "0.3", default-features = false, features = ["parsing", "std"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+# Already in the tree via tokio / hyper-util; used directly for TCP keepalive.
+socket2 = "0.6"
 
 [dev-dependencies]
 wiremock = "0.6"

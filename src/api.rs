@@ -13,7 +13,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use tower::limit::ConcurrencyLimitLayer;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -35,7 +34,16 @@ use crate::v2::{self as v2, V2State};
 pub const NOTIFY_PATH: &str = "/v1/notify";
 pub const MAX_BODY_BYTES: usize = 8 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-pub const MAX_CONCURRENCY: usize = 64;
+/// Requests handled at once on the public listener (after their body is
+/// read); see [`guard`].
+pub const MAX_CONCURRENCY: usize = 256;
+/// How long a request may wait for one of the [`MAX_CONCURRENCY`] permits
+/// before it is shed with `503` and `Retry-After: 1`.
+pub const PERMIT_WAIT: Duration = Duration::from_secs(1);
+/// Deadline for reading a request body (16 KB routes) before `408`.
+pub const BODY_DEADLINE: Duration = Duration::from_secs(3);
+/// Deadline for the snapshot route's larger body.
+pub const SNAPSHOT_BODY_DEADLINE: Duration = Duration::from_secs(10);
 const DEDUP_CAP: usize = 10_000;
 
 /// A finished response plus a short outcome label for the log line.
@@ -57,6 +65,10 @@ pub struct AppState {
     metrics: Arc<Metrics>,
     /// Manual bans, suspensions and live limit overrides (admin panel).
     controls: Controls,
+    /// [`MAX_CONCURRENCY`] request permits shared by every route.
+    permits: Arc<tokio::sync::Semaphore>,
+    /// `MAX_CONNECTIONS` (see `crate::serve`).
+    max_connections: usize,
 }
 
 impl AppState {
@@ -86,6 +98,21 @@ impl AppState {
         // not the panel is enabled now.
         let controls = Controls::new(config);
         let now = clock.now();
+        if config.mode == Mode::Hosted && config.v2.apns_mode == ApnsMode::Mock {
+            tracing::error!(
+                "SECURITY: MODE=hosted with APNS_MODE=mock: no real pushes are sent. \
+                 GET /v2/debug/pushes answers loopback clients only. Never run this in production."
+            );
+        }
+        let replay_need = u64::from(l.global.per_sec.get()) * crate::auth::REPLAY_TTL.as_secs()
+            + u64::from(l.global.burst.get());
+        if replay_need > l.replay_cap as u64 {
+            tracing::warn!(
+                replay_cap = l.replay_cap,
+                needed = replay_need,
+                "REPLAY_CAP is below RATE_GLOBAL_PER_SEC x 600 + burst: signed requests get 503 when the replay cache is full"
+            );
+        }
         let loaded = v2
             .store
             .blocking(|c| controls.load(c, now))
@@ -99,15 +126,19 @@ impl AppState {
             allow_emergency: config.allow_emergency,
             quota_reserve: config.quota_reserve,
             resolver,
-            auth: Authenticator::new(config.secrets.clone()),
+            // Timestamps from before this start are refused: the replay
+            // cache is in memory only.
+            auth: Authenticator::with_replay(config.secrets.clone(), now, l.replay_cap),
             limits: RateLimits::new(l, config.secrets.len()),
-            bans: AuthBans::new(l.ban_threshold, l.ban_window, l.ban_duration),
+            bans: AuthBans::with_abuse(l.ban_threshold, l.ban_window, l.ban_duration, l.abuse),
             dedup: Mutex::new(ExpiringSet::new(config.dedup_window, DEDUP_CAP)),
             pushover,
             clock,
             v2,
             metrics,
             controls,
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY)),
+            max_connections: config.max_connections,
         };
         for key in loaded.overrides {
             tracing::info!(
@@ -141,6 +172,11 @@ impl AppState {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// `MAX_CONNECTIONS`.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
     }
 
     pub fn v2(&self) -> &V2State {
@@ -178,6 +214,20 @@ impl AppState {
             "RATE_GLOBAL_PER_SEC" | "RATE_GLOBAL_BURST" => self
                 .limits
                 .set_global(rate("RATE_GLOBAL_PER_SEC", "RATE_GLOBAL_BURST")),
+            "RATE_ANON_GLOBAL_PER_SEC" | "RATE_ANON_GLOBAL_BURST" => self
+                .limits
+                .set_anon(rate("RATE_ANON_GLOBAL_PER_SEC", "RATE_ANON_GLOBAL_BURST")),
+            "RATE_GROUP_PER_SEC" | "RATE_GROUP_BURST" => self
+                .v2
+                .limits
+                .set_group(rate("RATE_GROUP_PER_SEC", "RATE_GROUP_BURST")),
+            "WS_MAX_STREAMS" => self.v2.hub.max_streams.store(c.effective(key), Relaxed),
+            "WS_MAX_MACS_PER_GROUP" => self
+                .v2
+                .hub
+                .max_macs_per_group
+                .store(c.effective(key), Relaxed),
+            "WS_MAX_PER_IP" => self.v2.hub.max_per_ip.store(c.effective(key), Relaxed),
             "RATE_IP_PER_SEC" | "RATE_IP_BURST" => self
                 .limits
                 .set_per_ip(rate("RATE_IP_PER_SEC", "RATE_IP_BURST")),
@@ -225,13 +275,18 @@ impl AppState {
         self.resolver.resolve(peer.ip(), headers)
     }
 
-    /// Record an auth failure for `ip` and build the generic 401.
+    /// Record an auth failure for `ip` and build the generic 401. Failures
+    /// are anonymous work: they draw from the anonymous bucket, never from
+    /// the authenticated one; when it is empty the answer is `429`.
     pub fn auth_failed(&self, ip: IpAddr, now: u64, reason: &str) -> Outcome {
         if self.bans.record_failure(ip_key(ip), now) {
             tracing::warn!(client_ip = %ip, "auth failure threshold reached, IP banned");
             self.metrics.record(Event::new("ban").ip(ip).detail(reason));
         }
         tracing::debug!(client_ip = %ip, reason, "auth failed");
+        if let Err(ra) = self.limits.check_anon() {
+            return (too_many(ra), "rate_limited_anon");
+        }
         // Generic body: do not tell the client which check failed.
         (
             error(StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -239,15 +294,75 @@ impl AppState {
         )
     }
 
-    /// Delete expired v2 messages and commands.
+    /// The answer to a failed signature check.
+    pub fn auth_error(&self, ip: IpAddr, now: u64, e: crate::auth::AuthError) -> Outcome {
+        use crate::auth::AuthError;
+        match e {
+            // Signed before this process started: refused, but not held
+            // against the client (its clock may just be a little behind).
+            AuthError::BeforeBoot => (
+                error(StatusCode::UNAUTHORIZED, "unauthorized"),
+                "before_boot",
+            ),
+            AuthError::ReplayCacheFull => {
+                tracing::warn!("replay cache full: refusing signed requests (REPLAY_CAP)");
+                let mut r = error(StatusCode::SERVICE_UNAVAILABLE, "busy");
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                (r, "replay_cache_full")
+            }
+            e => self.auth_failed(ip, now, e.as_str()),
+        }
+    }
+
+    /// A `429` with `outcome` on `route` went to `ip`: IP-keyed refusals
+    /// count toward an abuse ban (`AUTH_ABUSE_*`). Group-keyed and
+    /// server-wide limits do not, so one group cannot get a shared address
+    /// (NAT) banned; nor does the gateway push, where one self-hosted relay
+    /// speaks for all its users.
+    pub fn note_rate_limited(&self, ip: IpAddr, route: &str, outcome: &str) {
+        if route == "gateway.push"
+            || !matches!(
+                outcome,
+                "rate_limited_ip" | "rate_limited_anon" | "rate_limited_registration"
+            )
+        {
+            return;
+        }
+        if self.bans.record_abuse(ip_key(ip), self.clock.now()) {
+            tracing::warn!(client_ip = %ip, outcome, "sustained rate limiting, IP banned");
+            self.metrics
+                .record(Event::new("ban").ip(ip).detail("rate_limited"));
+        }
+    }
+
+    /// Delete expired v2 rows, in batches (one storage call each), so other
+    /// requests get the database in between.
     pub async fn cleanup_storage(&self) {
         let now = self.clock.now();
-        match self.v2.store.call(move |c| store::cleanup(c, now)).await {
-            Ok((m, c)) if m + c > 0 => {
-                tracing::debug!(messages = m, commands = c, "retention cleanup")
+        let (mut m, mut k) = (0, 0);
+        loop {
+            match self
+                .v2
+                .store
+                .call(move |c| store::cleanup_step(c, now, store::CLEANUP_BATCH))
+                .await
+            {
+                Ok(step) => {
+                    m += step.messages;
+                    k += step.commands;
+                    if !step.more {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "retention cleanup failed");
+                    return;
+                }
             }
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "retention cleanup failed"),
+        }
+        if m + k > 0 {
+            tracing::debug!(messages = m, commands = k, "retention cleanup");
         }
     }
 
@@ -311,7 +426,7 @@ fn build_v2(
     });
     Ok(V2State {
         store,
-        hub: Hub::new(),
+        hub: Hub::with_limits(c.ws_max_streams, c.ws_max_macs_per_group, c.ws_max_per_ip),
         limits: V2Limits::new(c),
         sender,
         mock,
@@ -368,9 +483,74 @@ pub fn router(state: Arc<AppState>) -> Router {
                     StatusCode::REQUEST_TIMEOUT,
                     REQUEST_TIMEOUT,
                 ))
-                .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENCY)),
+                .layer(axum::middleware::from_fn_with_state(state.clone(), guard)),
         )
         .with_state(state)
+}
+
+/// In front of every route: read the whole body within a deadline (`408`
+/// after [`BODY_DEADLINE`], [`SNAPSHOT_BODY_DEADLINE`] for the snapshot),
+/// then wait at most [`PERMIT_WAIT`] for one of the shared
+/// [`MAX_CONCURRENCY`] permits (`503`, `Retry-After: 1`). A slow client
+/// therefore never holds a permit, and nobody queues for one without bound.
+/// Also feeds IP-keyed `429`s to the abuse bans.
+async fn guard(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let ip = state.client_ip(peer, req.headers());
+    let path = req.uri().path();
+    let health = path == "/healthz";
+    let (limit, deadline) = if path == "/v2/snapshot" {
+        (
+            v2::snapshot_body_limit(state.v2.snapshot_max),
+            SNAPSHOT_BODY_DEADLINE,
+        )
+    } else {
+        (v2::MAX_BODY_BYTES, BODY_DEADLINE)
+    };
+    let declared = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
+    }
+    let (parts, body) = req.into_parts();
+    let bytes = match tokio::time::timeout(deadline, axum::body::to_bytes(body, limit)).await {
+        Ok(Ok(b)) => b,
+        // Over the limit while streaming (or the client went away).
+        Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+        Err(_) => {
+            tracing::debug!(client_ip = %ip, "request body not received in time");
+            return error(StatusCode::REQUEST_TIMEOUT, "request_timeout");
+        }
+    };
+    let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+    // The health check is never shed: a busy server is not an unhealthy one.
+    let _permit = if health {
+        None
+    } else {
+        match tokio::time::timeout(PERMIT_WAIT, state.permits.clone().acquire_owned()).await {
+            Ok(Ok(p)) => Some(p),
+            _ => {
+                let mut r = error(StatusCode::SERVICE_UNAVAILABLE, "busy");
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return r;
+            }
+        }
+    };
+    let response = next.run(req).await;
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(tag) = response.extensions().get::<ApiTag>() {
+            state.note_rate_limited(ip, tag.route, tag.outcome);
+        }
+    }
+    response
 }
 
 async fn healthz() -> &'static str {
@@ -526,13 +706,13 @@ async fn handle_notify(
     }
 
     let now = state.clock.now();
-    if let Err(o) = precheck(state, ip, now, GlobalClass::Hosted) {
+    if let Err(o) = precheck(state, ip, now, GlobalClass::V1) {
         return o;
     }
 
     let secret = match state.auth.verify(now, "POST", NOTIFY_PATH, headers, body) {
         Ok(i) => i,
-        Err(e) => return state.auth_failed(ip, now, e.as_str()),
+        Err(e) => return state.auth_error(ip, now, e),
     };
 
     if let Err(ra) = state.limits.check_secret(secret) {
@@ -605,18 +785,25 @@ async fn handle_notify(
     }
 }
 
-/// Which global bucket a request draws from.
+/// Which global bucket a request draws from before authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalClass {
-    /// Every route except the gateway: `RATE_GLOBAL_*`.
-    Hosted,
-    /// `POST /v2/gateway/push`: skips the hosted bucket; the gateway's own
-    /// `GATEWAY_GLOBAL_*` bucket is checked once the caller is known to be a
-    /// gateway group, so gateway traffic cannot starve hosted users.
+    /// `POST /v2/groups`: the anonymous bucket (`RATE_ANON_GLOBAL_*`).
+    Anonymous,
+    /// Signed v2 routes: no global bucket before the signature; once it
+    /// verifies, `authenticate` charges the group's and the authenticated
+    /// (`RATE_GLOBAL_*`) buckets. Failed requests draw from the anonymous
+    /// bucket ([`AppState::auth_failed`]), so a flood of them cannot starve
+    /// signed users.
+    Signed,
+    /// `POST /v2/gateway/push`: like `Signed`, but the gateway's own
+    /// `GATEWAY_GLOBAL_*` bucket replaces `RATE_GLOBAL_*`.
     Gateway,
+    /// `POST /v1/notify`: `RATE_GLOBAL_*` before the signature, as before.
+    V1,
 }
 
-/// Manual ban, ban, per-IP and global checks, done before any
+/// Manual ban, ban, per-IP and (by class) global checks, done before any
 /// authentication work.
 // The error is the finished HTTP response; it is only built on the cold path.
 #[allow(clippy::result_large_err)]
@@ -637,12 +824,29 @@ pub(crate) fn precheck(
     if let Err(ra) = state.limits.check_ip(key) {
         return Err((too_many(ra), "rate_limited_ip"));
     }
-    if class == GlobalClass::Hosted {
-        if let Err(ra) = state.limits.check_global() {
-            return Err((too_many(ra), "rate_limited_global"));
+    match class {
+        GlobalClass::Anonymous => {
+            if let Err(ra) = state.limits.check_anon() {
+                return Err((too_many(ra), "rate_limited_anon"));
+            }
         }
+        GlobalClass::V1 => {
+            if let Err(ra) = state.limits.check_global() {
+                return Err((too_many(ra), "rate_limited_global"));
+            }
+        }
+        GlobalClass::Signed | GlobalClass::Gateway => {}
     }
     Ok(())
+}
+
+/// The authenticated global bucket (signed v2 routes, after the signature).
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_signed_global(state: &AppState) -> Result<(), Outcome> {
+    state
+        .limits
+        .check_global()
+        .map_err(|ra| (too_many(ra), "rate_limited_global"))
 }
 
 /// Describe a JSON error without echoing request contents.

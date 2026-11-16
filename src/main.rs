@@ -171,7 +171,7 @@ async fn async_main(config: Config) -> Result<(), String> {
     };
     if config.v2.apns_mode == ApnsMode::Mock {
         tracing::warn!(
-            "APNS_MODE=mock: no real pushes, GET /v2/debug/pushes is open. Development only."
+            "APNS_MODE=mock: no real pushes, GET /v2/debug/pushes answers loopback clients. Development only."
         );
     }
     tracing::info!(

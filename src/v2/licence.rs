@@ -392,6 +392,17 @@ impl AppTransactionVerifier {
     }
 }
 
+/// Prefix of [`fallback_id`].
+pub const FALLBACK_PREFIX: &str = "sha256:";
+
+/// `id` is a [`fallback_id`], not Apple's `appTransactionId`: unrelated
+/// buyers can share it (same purchase date and platform, or sandbox), so it
+/// is not counted against `LICENCE_MAX_GROUPS`; attaches are limited per
+/// client IP instead.
+pub fn is_fallback_id(id: &str) -> bool {
+    id.starts_with(FALLBACK_PREFIX)
+}
+
 /// Stand-in purchase id when `appTransactionId` is missing.
 pub fn fallback_id(
     purchase_ms: Option<u64>,
@@ -404,7 +415,10 @@ pub fn fallback_id(
         app_id.unwrap_or(0),
         platform.unwrap_or("")
     );
-    format!("sha256:{}", hex::encode(Sha256::digest(input.as_bytes())))
+    format!(
+        "{FALLBACK_PREFIX}{}",
+        hex::encode(Sha256::digest(input.as_bytes()))
+    )
 }
 
 fn parse_cert(der: &[u8]) -> Result<X509Certificate<'_>, LicenceError> {

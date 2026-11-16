@@ -228,6 +228,26 @@ CREATE TABLE IF NOT EXISTS limit_overrides (
     updated_at INTEGER NOT NULL,
     actor      TEXT NOT NULL
 ) WITHOUT ROWID;
+-- Id tombstones (0.2.3): a command or message id is remembered after its
+-- row is acked, evicted or expired, so a re-post within the window is a
+-- duplicate (with the original cursor) instead of a new command or push.
+CREATE TABLE IF NOT EXISTS command_ids (
+    group_id   TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+    cmd_id     TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    first_seen INTEGER NOT NULL,
+    PRIMARY KEY (group_id, cmd_id)
+);
+CREATE INDEX IF NOT EXISTS command_ids_seen ON command_ids(first_seen);
+CREATE TABLE IF NOT EXISTS message_ids (
+    group_id   TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+    msg_id     TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    first_seen INTEGER NOT NULL,
+    PRIMARY KEY (group_id, msg_id)
+);
+CREATE INDEX IF NOT EXISTS message_ids_seen ON message_ids(first_seen);
+CREATE INDEX IF NOT EXISTS message_ids_group_seq ON message_ids(group_id, seq);
 "#;
 
 /// New attaches of one purchase to another group per 24 h.
@@ -240,6 +260,16 @@ pub const GATEWAY_BINDING_IDLE_SECS: u64 = 24 * 3600;
 pub const GATEWAY_TOUCH_SECS: u64 = 600;
 /// Bindings unused this long are deleted by [`cleanup`].
 pub const GATEWAY_BINDING_RETENTION_SECS: u64 = 7 * 24 * 3600;
+/// Command ids are remembered this long after the first post: a receiver
+/// accepts a command timestamp up to 24 h old, plus twice the 300 s
+/// signature skew, plus margin (PROTOCOL.md section 4.4).
+pub const COMMAND_ID_RETENTION_SECS: u64 = 25 * 3600;
+/// Message ids are remembered for the mailbox retention plus 10 min.
+pub const MESSAGE_ID_RETENTION_SECS: u64 = MESSAGE_RETENTION_SECS + 600;
+/// Message id tombstones kept per group (the oldest are dropped first).
+pub const MAX_MESSAGE_IDS: usize = 5000;
+/// Rows deleted per table and statement by [`cleanup_step`].
+pub const CLEANUP_BATCH: usize = 5000;
 
 #[derive(Debug)]
 pub struct StoreError(pub String);
@@ -509,7 +539,8 @@ pub fn group_licence(
 }
 
 /// Attach (or refresh) `lic` on an existing group, unless that purchase is
-/// already attached to `max_groups` other groups.
+/// already attached to `max_groups` other groups (not checked for a
+/// fallback id, see [`super::licence::is_fallback_id`]).
 pub fn attach_licence(
     c: &mut Connection,
     group_id: &str,
@@ -562,7 +593,10 @@ fn attach_in(
         )
         .optional()?;
     let same = current.as_deref() == Some(lic.app_transaction_id.as_str());
-    if !same {
+    // A stand-in id (no `appTransactionId`) can be shared by unrelated
+    // buyers, so it gets no per-purchase pool: the handlers rate-limit such
+    // attaches per client IP instead.
+    if !same && !super::licence::is_fallback_id(&lic.app_transaction_id) {
         let others: i64 = tx.query_row(
             "SELECT COUNT(*) FROM group_licences WHERE app_transaction_id = ?1 AND group_id != ?2",
             [&lic.app_transaction_id, group_id],
@@ -780,13 +814,26 @@ pub fn insert_message(
     now: u64,
 ) -> Result<Insert, StoreError> {
     let tx = c.transaction()?;
-    let dup: Option<i64> = tx
+    // The tombstone outlives the row (500 cap, summary purge, expiry), so a
+    // re-post is never stored and pushed again; the row check covers rows
+    // stored by 0.2.2 and older, which have no tombstone.
+    let tomb: Option<i64> = tx
         .query_row(
-            "SELECT seq FROM messages WHERE group_id = ?1 AND msg_id = ?2 AND created_at > ?3",
-            params![group_id, m.id, cutoff(now, MESSAGE_RETENTION_SECS)],
+            "SELECT seq FROM message_ids WHERE group_id = ?1 AND msg_id = ?2 AND first_seen > ?3",
+            params![group_id, m.id, cutoff(now, MESSAGE_ID_RETENTION_SECS)],
             |r| r.get(0),
         )
         .optional()?;
+    let dup: Option<i64> = match tomb {
+        Some(seq) => Some(seq),
+        None => tx
+            .query_row(
+                "SELECT seq FROM messages WHERE group_id = ?1 AND msg_id = ?2 AND created_at > ?3",
+                params![group_id, m.id, cutoff(now, MESSAGE_RETENTION_SECS)],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
     if let Some(seq) = dup {
         return Ok(Insert::Duplicate(ts(seq)));
     }
@@ -813,8 +860,33 @@ pub fn insert_message(
         "DELETE FROM messages WHERE group_id = ?1 AND seq <= ?2",
         params![group_id, seq as i64 - MAX_MESSAGES as i64],
     )?;
+    put_tombstone(&tx, "message_ids", "msg_id", group_id, &m.id, seq, now)?;
+    tx.execute(
+        "DELETE FROM message_ids WHERE group_id = ?1 AND seq <= ?2",
+        params![group_id, seq as i64 - MAX_MESSAGE_IDS as i64],
+    )?;
     tx.commit()?;
     Ok(Insert::Stored(seq))
+}
+
+/// Remember (or renew an expired) id tombstone.
+fn put_tombstone(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    id_col: &str,
+    group_id: &str,
+    id: &str,
+    seq: u64,
+    now: u64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        &format!(
+            "INSERT INTO {table} (group_id, {id_col}, seq, first_seen) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (group_id, {id_col}) DO UPDATE SET seq = ?3, first_seen = ?4"
+        ),
+        params![group_id, id, seq as i64, now as i64],
+    )?;
+    Ok(())
 }
 
 fn cutoff(now: u64, retention: u64) -> i64 {
@@ -867,13 +939,26 @@ pub fn insert_command(
 ) -> Result<Insert, StoreError> {
     let tx = c.transaction()?;
     let live = cutoff(now, COMMAND_RETENTION_SECS);
-    let dup: Option<i64> = tx
+    // Acks and cleanup delete the row but not the tombstone: a re-post of
+    // the same id within 25 h is a duplicate (lead #2). The row check covers
+    // commands stored by 0.2.2 and older.
+    let tomb: Option<i64> = tx
         .query_row(
-            "SELECT seq FROM commands WHERE group_id = ?1 AND cmd_id = ?2 AND created_at > ?3",
-            params![group_id, id, live],
+            "SELECT seq FROM command_ids WHERE group_id = ?1 AND cmd_id = ?2 AND first_seen > ?3",
+            params![group_id, id, cutoff(now, COMMAND_ID_RETENTION_SECS)],
             |r| r.get(0),
         )
         .optional()?;
+    let dup: Option<i64> = match tomb {
+        Some(seq) => Some(seq),
+        None => tx
+            .query_row(
+                "SELECT seq FROM commands WHERE group_id = ?1 AND cmd_id = ?2 AND created_at > ?3",
+                params![group_id, id, live],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
     if let Some(seq) = dup {
         return Ok(Insert::Duplicate(ts(seq)));
     }
@@ -894,6 +979,7 @@ pub fn insert_command(
         "INSERT INTO commands (group_id, seq, cmd_id, sealed, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![group_id, seq as i64, id, sealed, now as i64],
     )?;
+    put_tombstone(&tx, "command_ids", "cmd_id", group_id, id, seq, now)?;
     tx.commit()?;
     Ok(Insert::Stored(seq))
 }
@@ -932,6 +1018,7 @@ pub fn commands_since(
     Ok((rows, more))
 }
 
+/// Delete the acked command; its id tombstone stays (see [`insert_command`]).
 pub fn ack_command(c: &mut Connection, group_id: &str, cursor: u64) -> Result<bool, StoreError> {
     Ok(c.execute(
         "DELETE FROM commands WHERE group_id = ?1 AND seq = ?2",
@@ -1259,32 +1346,113 @@ pub fn unbind_gateway_token(
     Ok(())
 }
 
-/// Delete expired messages, commands and snapshots; returns (messages,
+/// What one [`cleanup_step`] removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupStep {
+    pub messages: usize,
+    pub commands: usize,
+    /// Some table had a full batch: call again.
+    pub more: bool,
+}
+
+/// `DELETE` at most `batch` rows of `table` matching `cond` (one `?1`).
+fn delete_batch(
+    c: &Connection,
+    table: &str,
+    key: &str,
+    cond: &str,
+    arg: i64,
+    batch: usize,
+) -> Result<usize, StoreError> {
+    Ok(c.execute(
+        &format!(
+            "DELETE FROM {table} WHERE {key} IN (SELECT {key} FROM {table} WHERE {cond} LIMIT {batch})"
+        ),
+        [arg],
+    )?)
+}
+
+/// Delete up to `batch` expired rows per table (messages, commands,
+/// snapshots, id tombstones, licence attaches, idle gateway bindings,
+/// manual bans), so one call never holds the database for long. Repeat
+/// while `more`.
+pub fn cleanup_step(c: &mut Connection, now: u64, batch: usize) -> Result<CleanupStep, StoreError> {
+    let msg_cut = cutoff(now, MESSAGE_RETENTION_SECS);
+    let m = delete_batch(c, "messages", "rowid", "created_at <= ?1", msg_cut, batch)?;
+    let s = delete_batch(
+        c,
+        "snapshots",
+        "group_id",
+        "created_at <= ?1",
+        msg_cut,
+        batch,
+    )?;
+    let k = delete_batch(
+        c,
+        "commands",
+        "rowid",
+        "created_at <= ?1",
+        cutoff(now, COMMAND_RETENTION_SECS),
+        batch,
+    )?;
+    let rest = [
+        delete_batch(
+            c,
+            "command_ids",
+            "rowid",
+            "first_seen <= ?1",
+            cutoff(now, COMMAND_ID_RETENTION_SECS),
+            batch,
+        )?,
+        delete_batch(
+            c,
+            "message_ids",
+            "rowid",
+            "first_seen <= ?1",
+            cutoff(now, MESSAGE_ID_RETENTION_SECS),
+            batch,
+        )?,
+        delete_batch(
+            c,
+            "licence_attaches",
+            "rowid",
+            "attached_at <= ?1",
+            cutoff(now, ATTACH_WINDOW_SECS),
+            batch,
+        )?,
+        delete_batch(
+            c,
+            "gateway_tokens",
+            "token",
+            "last_used <= ?1",
+            cutoff(now, GATEWAY_BINDING_RETENTION_SECS),
+            batch,
+        )?,
+        delete_batch(c, "manual_bans", "net", "until <= ?1", now as i64, batch)?,
+    ];
+    let more = m >= batch || s >= batch || k >= batch || rest.iter().any(|&n| n >= batch);
+    if !more {
+        crate::controls::prune_audit(c, now, crate::controls::AUDIT_MAX_ROWS)?;
+    }
+    Ok(CleanupStep {
+        messages: m,
+        commands: k,
+        more,
+    })
+}
+
+/// Every [`cleanup_step`] until nothing expired is left; returns (messages,
 /// commands) removed.
 pub fn cleanup(c: &mut Connection, now: u64) -> Result<(usize, usize), StoreError> {
-    let m = c.execute(
-        "DELETE FROM messages WHERE created_at <= ?1",
-        [cutoff(now, MESSAGE_RETENTION_SECS)],
-    )?;
-    c.execute(
-        "DELETE FROM snapshots WHERE created_at <= ?1",
-        [cutoff(now, MESSAGE_RETENTION_SECS)],
-    )?;
-    let k = c.execute(
-        "DELETE FROM commands WHERE created_at <= ?1",
-        [cutoff(now, COMMAND_RETENTION_SECS)],
-    )?;
-    c.execute(
-        "DELETE FROM licence_attaches WHERE attached_at <= ?1",
-        [cutoff(now, ATTACH_WINDOW_SECS)],
-    )?;
-    c.execute(
-        "DELETE FROM gateway_tokens WHERE last_used <= ?1",
-        [cutoff(now, GATEWAY_BINDING_RETENTION_SECS)],
-    )?;
-    c.execute("DELETE FROM manual_bans WHERE until <= ?1", [now as i64])?;
-    crate::controls::prune_audit(c, now, crate::controls::AUDIT_MAX_ROWS)?;
-    Ok((m, k))
+    let (mut m, mut k) = (0, 0);
+    loop {
+        let step = cleanup_step(c, now, CLEANUP_BATCH)?;
+        m += step.messages;
+        k += step.commands;
+        if !step.more {
+            return Ok((m, k));
+        }
+    }
 }
 
 /// Row counts (messages, commands) for one group, including expired rows not
@@ -1358,10 +1526,14 @@ mod tests {
             bind_gateway_token(&mut c, "g", "t", 0, 30, || true).unwrap(),
             Bind::Bound
         );
+        // 0.2.3 tombstones, written the way 0.2.3 does.
+        insert_command(&mut c, "g", "c", "AAAA", 0).unwrap();
+        insert_message(&mut c, "g", &msg("m"), 0).unwrap();
         assert!(delete_group(&mut c, "g").unwrap());
         let n: i64 = c
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM gateway_groups) + (SELECT COUNT(*) FROM gateway_tokens)",
+                "SELECT (SELECT COUNT(*) FROM gateway_groups) + (SELECT COUNT(*) FROM gateway_tokens)
+                      + (SELECT COUNT(*) FROM command_ids) + (SELECT COUNT(*) FROM message_ids)",
                 [],
                 |r| r.get(0),
             )
@@ -1719,5 +1891,189 @@ mod tests {
             device(&mut c, "g", "mac").unwrap().unwrap().last_seen,
             Some(42)
         );
+    }
+
+    /// Lead #2: an acked or expired command id stays known for 25 h.
+    #[test]
+    fn command_id_tombstone_survives_ack_and_cleanup() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        let t0 = 1_000_000;
+        assert_eq!(
+            insert_command(&mut c, "g", "c1", "AAAA", t0).unwrap(),
+            Insert::Stored(1)
+        );
+        assert!(ack_command(&mut c, "g", 1).unwrap());
+        assert_eq!(counts(&mut c, "g").unwrap().1, 0, "acked row gone");
+        // Re-post right after the ack, after the row would have expired,
+        // and a day later: always the original cursor, nothing stored.
+        for t in [t0 + 1, t0 + 3601, t0 + 86_400] {
+            cleanup(&mut c, t).unwrap();
+            assert_eq!(
+                insert_command(&mut c, "g", "c1", "AAAA", t).unwrap(),
+                Insert::Duplicate(1),
+                "at +{}",
+                t - t0
+            );
+        }
+        assert_eq!(counts(&mut c, "g").unwrap().1, 0);
+        // After 25 h the id may be used again (and is remembered anew).
+        let later = t0 + COMMAND_ID_RETENTION_SECS + 1;
+        cleanup(&mut c, later).unwrap();
+        assert_eq!(
+            insert_command(&mut c, "g", "c1", "AAAA", later).unwrap(),
+            Insert::Stored(2)
+        );
+        assert_eq!(
+            insert_command(&mut c, "g", "c1", "AAAA", later + 1).unwrap(),
+            Insert::Duplicate(2)
+        );
+        // Tombstones go with the group.
+        delete_group(&mut c, "g").unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM command_ids", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Mailbox review: eviction by the 500 cap or the summary purge must not
+    /// re-enable a duplicate.
+    #[test]
+    fn message_id_tombstone_survives_eviction_and_summary_purge() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        for i in 0..(MAX_MESSAGES + 5) {
+            insert_message(&mut c, "g", &msg(&format!("m{i}")), 10).unwrap();
+        }
+        // m0 was evicted from the mailbox but its id is remembered.
+        assert_eq!(
+            insert_message(&mut c, "g", &msg("m0"), 20).unwrap(),
+            Insert::Duplicate(1)
+        );
+        assert_eq!(counts(&mut c, "g").unwrap().0, MAX_MESSAGES);
+        // An old summary re-posted does not replace the newest one.
+        let summary = |id: &str| NewMessage {
+            kind: "summary".into(),
+            ..msg(id)
+        };
+        let Insert::Stored(s1) = insert_message(&mut c, "g", &summary("s1"), 30).unwrap() else {
+            panic!("stored");
+        };
+        insert_message(&mut c, "g", &summary("s2"), 31).unwrap();
+        assert_eq!(
+            insert_message(&mut c, "g", &summary("s1"), 32).unwrap(),
+            Insert::Duplicate(s1)
+        );
+        let (rows, _) = messages_since(&mut c, "g", s1 - 1, 32).unwrap();
+        let summaries: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "summary")
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(summaries, ["s2"], "the newest summary is kept");
+        // Remembered for 24 h + 600 s, then the id is free again.
+        let t = 10 + MESSAGE_ID_RETENTION_SECS - 1;
+        assert_eq!(
+            insert_message(&mut c, "g", &msg("m1"), t).unwrap(),
+            Insert::Duplicate(2)
+        );
+        cleanup(&mut c, t + 1).unwrap();
+        assert!(matches!(
+            insert_message(&mut c, "g", &msg("m1"), t + 1).unwrap(),
+            Insert::Stored(_)
+        ));
+    }
+
+    #[test]
+    fn message_id_tombstones_are_capped_per_group() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        let tx = c.transaction().unwrap();
+        for i in 0..(MAX_MESSAGE_IDS + 10) {
+            put_tombstone(
+                &tx,
+                "message_ids",
+                "msg_id",
+                "g",
+                &format!("x{i}"),
+                i as u64 + 1,
+                5,
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE groups SET next_msg_seq = ?1",
+            [(MAX_MESSAGE_IDS + 10) as i64],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        insert_message(&mut c, "g", &msg("new"), 10).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM message_ids WHERE group_id = 'g'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n as usize, MAX_MESSAGE_IDS, "the oldest are dropped");
+        assert!(
+            matches!(
+                insert_message(&mut c, "g", &msg("x0"), 11).unwrap(),
+                Insert::Stored(_)
+            ),
+            "beyond the cap an id is forgotten (accepted trade-off)"
+        );
+    }
+
+    /// Mailbox review: cleanup deletes in bounded batches.
+    #[test]
+    fn cleanup_runs_in_bounded_batches() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        for i in 0..25 {
+            insert_message(&mut c, "g", &msg(&format!("m{i}")), 10).unwrap();
+            insert_command(&mut c, "g", &format!("c{i}"), "AAAA", 10).unwrap();
+        }
+        let now = 10 + COMMAND_ID_RETENTION_SECS + 1;
+        let mut steps = Vec::new();
+        loop {
+            let step = cleanup_step(&mut c, now, 10).unwrap();
+            assert!(step.messages <= 10 && step.commands <= 10);
+            steps.push(step);
+            if !step.more {
+                break;
+            }
+        }
+        assert_eq!(steps.len(), 3, "25 rows in batches of 10");
+        assert_eq!(steps.iter().map(|s| s.messages).sum::<usize>(), 25);
+        assert_eq!(counts(&mut c, "g").unwrap(), (0, 0));
+        let ids: i64 = c
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM message_ids) + (SELECT COUNT(*) FROM command_ids)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ids, 0, "expired tombstones cleaned too");
+        assert_eq!(cleanup(&mut c, now).unwrap(), (0, 0));
+    }
+
+    /// A fallback purchase id is not one buyer: no shared 3-group pool.
+    #[test]
+    fn fallback_purchase_ids_are_not_pooled() {
+        let (_d, mut c) = store();
+        let fb = lic(&crate::v2::licence::fallback_id(Some(1), None, None));
+        for (i, g) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            create_group(&mut c, g, &[1; 32], 0).unwrap();
+            assert_eq!(
+                attach_licence(&mut c, g, &fb, 3, i as u64).unwrap(),
+                Attach::Attached,
+                "{g}"
+            );
+        }
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM licence_attaches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "not counted per purchase");
     }
 }

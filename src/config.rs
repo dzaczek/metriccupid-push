@@ -119,7 +119,15 @@ pub struct V2Config {
     pub rate_commands: Rate,
     pub rate_gateway: Rate,
     pub rate_groups: HourlyRate,
+    /// `RATE_GROUP_*`: every signed request of one group.
+    pub rate_group: Rate,
     pub ws_ping: Duration,
+    /// `WS_MAX_STREAMS`: open Mac streams on the server.
+    pub ws_max_streams: u32,
+    /// `WS_MAX_MACS_PER_GROUP`: open Mac streams per group.
+    pub ws_max_macs_per_group: u32,
+    /// `WS_MAX_PER_IP`: open Mac streams per client IP (IPv6 /64).
+    pub ws_max_per_ip: u32,
     /// Seconds the last Mac of a group may stay offline (stream lost without
     /// a `bye`) before its phones get a presence push. 0 = immediately.
     pub mac_offline_grace: u64,
@@ -152,13 +160,22 @@ pub struct Rate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
+    /// `RATE_GLOBAL_*`: authenticated requests (v2: checked after the
+    /// signature; v1: before it, as before).
     pub global: Rate,
+    /// `RATE_ANON_GLOBAL_*`: group registrations and failed authentications.
+    pub anon_global: Rate,
     pub per_ip: Rate,
     pub per_secret: Rate,
     /// Auth failures from one IP within `ban_window` that trigger a ban.
     pub ban_threshold: u32,
     pub ban_window: Duration,
     pub ban_duration: Duration,
+    /// `AUTH_ABUSE_*`: rate-limited answers that trigger a ban.
+    pub abuse: crate::limits::AbuseRule,
+    /// `REPLAY_CAP`: signatures remembered at once; when full, new signed
+    /// requests get `503` (fail closed) instead of evicting live entries.
+    pub replay_cap: usize,
 }
 
 /// A relay secret. `Debug` never prints the value.
@@ -256,6 +273,9 @@ impl AdminSetting {
 
 #[derive(Clone)]
 pub struct Config {
+    /// `MAX_CONNECTIONS`: open TCP connections on the public listener
+    /// (WebSocket streams included); further clients wait in the backlog.
+    pub max_connections: usize,
     pub pushover_app_token: String,
     pub pushover_user_key: String,
     pub pushover_api_url: String,
@@ -278,6 +298,7 @@ pub struct Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
+            .field("max_connections", &self.max_connections)
             .field("pushover_app_token", &"<redacted>")
             .field("pushover_user_key", &"<redacted>")
             .field("pushover_api_url", &self.pushover_api_url)
@@ -369,11 +390,10 @@ impl Config {
             get("CF_IPS_EXTRA_ALLOW_SUBNET"),
         )?;
 
+        // Not trimmed: the Pushover client posts to this exact URL.
         let pushover_api_url =
             get("PUSHOVER_API_URL").unwrap_or_else(|| DEFAULT_PUSHOVER_API_URL.to_string());
-        if !(pushover_api_url.starts_with("https://") || pushover_api_url.starts_with("http://")) {
-            return err("PUSHOVER_API_URL must start with http:// or https://");
-        }
+        parse_url("PUSHOVER_API_URL", pushover_api_url.clone())?;
 
         let allow_emergency = parse_bool("ALLOW_EMERGENCY", get("ALLOW_EMERGENCY"), false)?;
         let dedup_window = Duration::from_secs(parse_num(
@@ -393,6 +413,7 @@ impl Config {
         };
         let limits = Limits {
             global: rate("GLOBAL", 50, 100)?,
+            anon_global: rate("ANON_GLOBAL", 20, 60)?,
             per_ip: rate("IP", 5, 20)?,
             per_secret: rate("SECRET", 2, 30)?,
             ban_threshold: parse_nonzero("AUTH_BAN_THRESHOLD", get("AUTH_BAN_THRESHOLD"), 10)?
@@ -407,7 +428,20 @@ impl Config {
                 get("AUTH_BAN_SECS"),
                 900,
             )?),
+            abuse: crate::limits::AbuseRule {
+                threshold: parse_nonzero("AUTH_ABUSE_THRESHOLD", get("AUTH_ABUSE_THRESHOLD"), 100)?
+                    .get(),
+                window: parse_nonzero("AUTH_ABUSE_WINDOW_SECS", get("AUTH_ABUSE_WINDOW_SECS"), 60)?
+                    .get()
+                    .into(),
+                duration: parse_nonzero("AUTH_ABUSE_BAN_SECS", get("AUTH_ABUSE_BAN_SECS"), 900)?
+                    .get()
+                    .into(),
+            },
+            replay_cap: parse_nonzero("REPLAY_CAP", get("REPLAY_CAP"), 100_000)?.get() as usize,
         };
+        let max_connections =
+            parse_nonzero("MAX_CONNECTIONS", get("MAX_CONNECTIONS"), 8192)?.get() as usize;
 
         let log_format = match get("LOG_FORMAT").as_deref() {
             None | Some("text") => LogFormat::Text,
@@ -425,6 +459,7 @@ impl Config {
         let admin = parse_admin(&get);
 
         Ok(Config {
+            max_connections,
             pushover_app_token,
             pushover_user_key,
             pushover_api_url,
@@ -490,7 +525,10 @@ fn parse_admin_on(get: &impl Fn(&str) -> Option<String>) -> Result<AdminConfig, 
         Some(v) => parse_cidrs("ADMIN_ALLOW_IPS", &v)?,
         None => Vec::new(),
     };
-    let allow_any = parse_bool("ADMIN_ALLOW_ANY", get("ADMIN_ALLOW_ANY"), false)?;
+    // `0.0.0.0/0` or `::/0` allows every address: it is allow-any, with the
+    // same Cloudflare Access requirement and startup warning.
+    let allow_any = parse_bool("ADMIN_ALLOW_ANY", get("ADMIN_ALLOW_ANY"), false)?
+        || allow_ips.iter().any(|n| n.prefix_len() == 0);
     if allow_ips.is_empty() && !allow_any {
         return err("ADMIN_ALLOW_IPS is empty; set it (or ADMIN_ALLOW_ANY=true to allow every IP)");
     }
@@ -590,11 +628,39 @@ fn parse_rate(
     })
 }
 
+/// An upstream URL: `https://`, or `http://` only to a loopback host (local
+/// tests and development). Plain HTTP elsewhere would expose auth keys,
+/// licences and push contents on the network.
 fn parse_url(var: &str, v: String) -> Result<String, ConfigError> {
-    if !(v.starts_with("https://") || v.starts_with("http://")) {
-        return err(format!("{var} must start with http:// or https://"));
+    if v.starts_with("https://") {
+        return Ok(v.trim_end_matches('/').to_string());
+    }
+    let Some(rest) = v.strip_prefix("http://") else {
+        return err(format!("{var} must start with https://"));
+    };
+    if !is_loopback_authority(rest) {
+        return err(format!(
+            "{var} must use https:// (http:// is accepted only for 127.0.0.1, ::1 or localhost)"
+        ));
     }
     Ok(v.trim_end_matches('/').to_string())
+}
+
+/// The host of `authority[/path]` is a loopback address or `localhost`.
+fn is_loopback_authority(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        // [v6]:port
+        Some(r) => r.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Config, ConfigError> {
@@ -735,11 +801,20 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
             per_hour: parse_nonzero("RATE_V2_GROUPS_PER_HOUR", get("RATE_V2_GROUPS_PER_HOUR"), 6)?,
             burst: parse_nonzero("RATE_V2_GROUPS_BURST", get("RATE_V2_GROUPS_BURST"), 3)?,
         },
+        rate_group: parse_rate(get, "GROUP", 5, 60)?,
         ws_ping: Duration::from_secs(
             parse_nonzero("WS_PING_SECS", get("WS_PING_SECS"), 30)?
                 .get()
                 .into(),
         ),
+        ws_max_streams: parse_nonzero("WS_MAX_STREAMS", get("WS_MAX_STREAMS"), 1024)?.get(),
+        ws_max_macs_per_group: parse_nonzero(
+            "WS_MAX_MACS_PER_GROUP",
+            get("WS_MAX_MACS_PER_GROUP"),
+            3,
+        )?
+        .get(),
+        ws_max_per_ip: parse_nonzero("WS_MAX_PER_IP", get("WS_MAX_PER_IP"), 20)?.get(),
         mac_offline_grace: parse_num("MAC_OFFLINE_GRACE_SECS", get("MAC_OFFLINE_GRACE_SECS"), 120)?,
         snapshot_max_bytes: parse_snapshot_max(get("V2_SNAPSHOT_MAX_BYTES"))?,
     })
@@ -1264,6 +1339,115 @@ mod tests {
     }
 
     #[test]
+    fn phase1_limits_defaults_and_overrides() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!(
+            (
+                c.limits.anon_global.per_sec.get(),
+                c.limits.anon_global.burst.get()
+            ),
+            (20, 60)
+        );
+        assert_eq!(
+            (c.v2.rate_group.per_sec.get(), c.v2.rate_group.burst.get()),
+            (5, 60)
+        );
+        assert_eq!(c.limits.abuse, crate::limits::AbuseRule::default());
+        assert_eq!(
+            (
+                c.limits.abuse.threshold,
+                c.limits.abuse.window,
+                c.limits.abuse.duration
+            ),
+            (100, 60, 900)
+        );
+        assert_eq!(c.limits.replay_cap, 100_000);
+        assert_eq!(c.max_connections, 8192);
+        assert_eq!(
+            (
+                c.v2.ws_max_streams,
+                c.v2.ws_max_macs_per_group,
+                c.v2.ws_max_per_ip
+            ),
+            (1024, 3, 20)
+        );
+        let c = cfg(&[
+            ("RATE_ANON_GLOBAL_PER_SEC", "7"),
+            ("RATE_GROUP_BURST", "11"),
+            ("AUTH_ABUSE_THRESHOLD", "5"),
+            ("AUTH_ABUSE_WINDOW_SECS", "30"),
+            ("AUTH_ABUSE_BAN_SECS", "60"),
+            ("REPLAY_CAP", "500"),
+            ("MAX_CONNECTIONS", "64"),
+            ("WS_MAX_STREAMS", "6000"),
+            ("WS_MAX_MACS_PER_GROUP", "4"),
+            ("WS_MAX_PER_IP", "50"),
+        ])
+        .unwrap();
+        assert_eq!(c.limits.anon_global.per_sec.get(), 7);
+        assert_eq!(c.v2.rate_group.burst.get(), 11);
+        assert_eq!(
+            c.limits.abuse,
+            crate::limits::AbuseRule {
+                threshold: 5,
+                window: 30,
+                duration: 60
+            }
+        );
+        assert_eq!((c.limits.replay_cap, c.max_connections), (500, 64));
+        assert_eq!(
+            (
+                c.v2.ws_max_streams,
+                c.v2.ws_max_macs_per_group,
+                c.v2.ws_max_per_ip
+            ),
+            (6000, 4, 50)
+        );
+        for zero in [
+            "WS_MAX_STREAMS",
+            "WS_MAX_MACS_PER_GROUP",
+            "WS_MAX_PER_IP",
+            "MAX_CONNECTIONS",
+            "REPLAY_CAP",
+            "AUTH_ABUSE_THRESHOLD",
+            "RATE_GROUP_PER_SEC",
+        ] {
+            assert!(cfg(&[(zero, "0")]).is_err(), "{zero}");
+        }
+    }
+
+    #[test]
+    fn upstream_urls_need_https_except_loopback() {
+        for ok in [
+            "https://gw.example",
+            "http://127.0.0.1:9999",
+            "http://127.0.0.5",
+            "http://[::1]:8080/x",
+            "http://localhost:1234",
+        ] {
+            assert!(cfg(&[("GATEWAY_URL", ok)]).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://gw.example",
+            "http://10.0.0.1",
+            "http://127.0.0.1.example.com",
+            "http://user@127.0.0.1:1",
+            "http://localhost.evil",
+            "ftp://x",
+        ] {
+            assert!(cfg(&[("GATEWAY_URL", bad)]).is_err(), "{bad}");
+            assert!(cfg(&[("APNS_PRODUCTION_URL", bad)]).is_err(), "{bad}");
+            assert!(cfg(&[("APNS_SANDBOX_URL", bad)]).is_err(), "{bad}");
+            assert!(cfg(&[("PUSHOVER_API_URL", bad)]).is_err(), "{bad}");
+        }
+        let c = cfg(&[("PUSHOVER_API_URL", "http://127.0.0.1:1/1/messages.json/")]).unwrap();
+        assert_eq!(
+            c.pushover_api_url, "http://127.0.0.1:1/1/messages.json/",
+            "kept as is"
+        );
+    }
+
+    #[test]
     fn invalid_values() {
         assert!(cfg(&[("BIND", "8080")]).is_err());
         assert!(cfg(&[("ALLOW_EMERGENCY", "maybe")]).is_err());
@@ -1383,6 +1567,27 @@ mod tests {
             pairs.extend(bad.iter().copied());
             assert!(matches!(admin(&pairs), AdminSetting::Refused(_)), "{bad:?}");
         }
+        // An all-addresses allowlist is allow-any: same Access rules.
+        for all in ["0.0.0.0/0", "::/0", "10.0.0.0/8, 0.0.0.0/0"] {
+            assert!(
+                matches!(
+                    admin(&[("ADMIN_ALLOW_IPS", all)]),
+                    AdminSetting::On(ref a) if a.allow_any
+                ),
+                "{all}"
+            );
+            assert!(
+                matches!(
+                    admin(&[("ADMIN_ALLOW_IPS", all), ("ADMIN_ALLOW_ANY_WITHOUT_ACCESS", "false")]),
+                    AdminSetting::Refused(ref e) if e.contains("ADMIN_CF_ACCESS_TEAM")
+                ),
+                "{all}"
+            );
+        }
+        assert!(matches!(
+            admin(&[("ADMIN_ALLOW_IPS", "10.0.0.0/8"), ("ADMIN_ALLOW_ANY_WITHOUT_ACCESS", "false")]),
+            AdminSetting::On(ref a) if !a.allow_any
+        ));
         let mut no_user = cfg(&[("ADMIN_BIND", "127.0.0.1:8081")]).unwrap().admin;
         assert!(matches!(no_user, AdminSetting::Refused(ref e) if e.contains("ADMIN_USER")));
         no_user = AdminSetting::Off;

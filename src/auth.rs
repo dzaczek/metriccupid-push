@@ -23,6 +23,7 @@ pub const MAX_SKEW_SECS: u64 = 300;
 /// A signature stays valid for at most 2 * MAX_SKEW_SECS, so remembering it
 /// that long is enough to stop every replay.
 pub const REPLAY_TTL: Duration = Duration::from_secs(2 * MAX_SKEW_SECS);
+/// Default `REPLAY_CAP`.
 pub const REPLAY_CAP: usize = 100_000;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -86,6 +87,13 @@ pub enum AuthError {
     StaleTimestamp,
     BadSignature,
     Replay,
+    /// Signed before this process started: the in-memory replay cache does
+    /// not know it, so it is refused (boot cut-off). Not a client error worth
+    /// a ban: a client whose clock is a little behind sees it once after a
+    /// restart.
+    BeforeBoot,
+    /// The replay cache is full of live signatures: fail closed (`503`).
+    ReplayCacheFull,
 }
 
 impl AuthError {
@@ -96,6 +104,8 @@ impl AuthError {
             AuthError::StaleTimestamp => "stale_timestamp",
             AuthError::BadSignature => "bad_signature",
             AuthError::Replay => "replay",
+            AuthError::BeforeBoot => "before_boot",
+            AuthError::ReplayCacheFull => "replay_cache_full",
         }
     }
 }
@@ -103,13 +113,23 @@ impl AuthError {
 pub struct Authenticator {
     secrets: Vec<Secret>,
     replay: Mutex<ExpiringSet<[u8; 32]>>,
+    /// Process start (unix seconds): older timestamps are refused.
+    boot: u64,
 }
 
 impl Authenticator {
     pub fn new(secrets: Vec<Secret>) -> Self {
+        Self::with_replay(secrets, 0, REPLAY_CAP)
+    }
+
+    /// `boot`: refuse timestamps before it (the replay cache is in memory
+    /// only, so a signature made before a restart could otherwise be
+    /// replayed after it). `cap`: replay cache size (`REPLAY_CAP`).
+    pub fn with_replay(secrets: Vec<Secret>, boot: u64, cap: usize) -> Self {
         Self {
             secrets,
-            replay: Mutex::new(ExpiringSet::new(REPLAY_TTL, REPLAY_CAP)),
+            replay: Mutex::new(ExpiringSet::new(REPLAY_TTL, cap)),
+            boot,
         }
     }
 
@@ -122,7 +142,7 @@ impl Authenticator {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<usize, AuthError> {
-        let (ts, provided) = parse_headers(now, headers)?;
+        let (ts, provided) = parse_headers(now, self.boot, headers)?;
 
         // Check every secret (no early exit) with a constant-time compare.
         let mut matched = None;
@@ -151,22 +171,50 @@ impl Authenticator {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<(), AuthError> {
-        let (ts, provided) = parse_headers(now, headers)?;
+        let sig = self.check_v2(now, key, method, target, group, device, headers, body)?;
+        self.remember(sig, now)
+    }
+
+    /// The signature check of [`Authenticator::verify_v2`] without the
+    /// replay cache; returns the signature for [`Authenticator::remember`].
+    /// The v2 handlers charge the group and global buckets in between, so
+    /// the cache never fills faster than those allow.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_v2(
+        &self,
+        now: u64,
+        key: &[u8],
+        method: &str,
+        target: &str,
+        group: &str,
+        device: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<[u8; 32], AuthError> {
+        let (ts, provided) = parse_headers(now, self.boot, headers)?;
         let expected = mac_v2(key, ts, method, target, group, device, body);
         if !bool::from(expected.ct_eq(&provided)) {
             return Err(AuthError::BadSignature);
         }
-        self.remember(provided, now)
+        Ok(provided)
     }
 
-    /// Only remember signatures that verified, so unauthenticated traffic
-    /// cannot fill the cache.
-    fn remember(&self, sig: [u8; 32], now: u64) -> Result<(), AuthError> {
+    /// Record a verified signature: `Replay` if it was seen before,
+    /// `ReplayCacheFull` (fail closed) if the cache holds `cap` live entries.
+    /// Only signatures that verified are remembered, so unauthenticated
+    /// traffic cannot fill the cache.
+    pub fn remember(&self, sig: [u8; 32], now: u64) -> Result<(), AuthError> {
         let mut replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
-        if !replay.insert_if_absent(sig, now) {
-            return Err(AuthError::Replay);
+        match replay.try_insert(sig, now) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AuthError::Replay),
+            Err(_) => Err(AuthError::ReplayCacheFull),
         }
-        Ok(())
+    }
+
+    /// Signatures currently remembered.
+    pub fn replay_len(&self) -> usize {
+        self.replay.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn cleanup(&self, now: u64) {
@@ -178,7 +226,7 @@ impl Authenticator {
 }
 
 /// Check presence and format of the timestamp and signature headers.
-fn parse_headers(now: u64, headers: &HeaderMap) -> Result<(&str, [u8; 32]), AuthError> {
+fn parse_headers(now: u64, boot: u64, headers: &HeaderMap) -> Result<(&str, [u8; 32]), AuthError> {
     let ts = headers.get(TIMESTAMP_HEADER).and_then(|v| v.to_str().ok());
     let sig = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
     let (Some(ts), Some(sig)) = (ts, sig) else {
@@ -191,6 +239,9 @@ fn parse_headers(now: u64, headers: &HeaderMap) -> Result<(&str, [u8; 32]), Auth
     let ts_num: u64 = ts.parse().map_err(|_| AuthError::BadTimestamp)?;
     if now.abs_diff(ts_num) > MAX_SKEW_SECS {
         return Err(AuthError::StaleTimestamp);
+    }
+    if ts_num < boot {
+        return Err(AuthError::BeforeBoot);
     }
 
     if sig.len() != 64 || !sig.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -314,6 +365,37 @@ mod tests {
         );
         // Failures did not poison the replay cache.
         assert_eq!(verify(&a, now + 300, &h), Ok(0));
+    }
+
+    /// The replay cache is in memory: nothing signed before this process
+    /// started is accepted, and a full cache refuses instead of forgetting.
+    #[test]
+    fn boot_cut_off_and_full_replay_cache_fail_closed() {
+        let key = [7u8; 32];
+        let boot = 1_700_000_100;
+        let a = Authenticator::with_replay(Vec::new(), boot, 2);
+        let req = |ts: u64, n: u32| {
+            let target = format!("/v2/status?n={n}");
+            let sig = sign_v2(&key, &ts.to_string(), "GET", &target, "g", "d", b"");
+            (target, headers(&ts.to_string(), &sig))
+        };
+        let v = |now: u64, (t, h): (String, HeaderMap)| {
+            a.verify_v2(now, &key, "GET", &t, "g", "d", &h, b"")
+        };
+        // Signed 1 s before the restart, within the 300 s skew: refused.
+        assert_eq!(v(boot + 10, req(boot - 1, 0)), Err(AuthError::BeforeBoot));
+        assert_eq!(v(boot + 10, req(boot, 1)), Ok(()));
+        assert_eq!(v(boot + 10, req(boot + 5, 2)), Ok(()));
+        assert_eq!(
+            v(boot + 10, req(boot + 6, 3)),
+            Err(AuthError::ReplayCacheFull),
+            "cap 2, both live"
+        );
+        assert_eq!(v(boot + 10, req(boot, 1)), Err(AuthError::Replay));
+        // Once the entries expire there is room again.
+        let later = boot + 10 + REPLAY_TTL.as_secs();
+        assert_eq!(v(later, req(later, 4)), Ok(()));
+        assert_eq!(a.replay_len(), 1);
     }
 
     #[test]

@@ -3133,3 +3133,518 @@ async fn re_registering_an_existing_group_with_gateway_promotes_it() {
     assert_eq!((r.status, r.json["status"].as_str()), (200, Some("exists")));
     assert_eq!(member(&s, &c.group_id).await, Some(false));
 }
+
+// ------------------------------------------------- phase 1 (0.2.3) security ---
+
+/// A copy of `c` whose requests come from `ip` (behind `TRUST_PROXY=xff`).
+fn from_ip(c: &Client, ip: &str) -> Client {
+    let mut c = c.clone();
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert("x-forwarded-for", ip.parse().unwrap());
+    c.http = reqwest::Client::builder()
+        .default_headers(h)
+        .build()
+        .unwrap();
+    c
+}
+
+/// Lead #2 (audit local plan): a command acked by the Mac and re-posted with
+/// the same id (fresh signature) is a duplicate for 25 h, not a new command.
+#[tokio::test]
+async fn acked_command_reposted_within_25h_is_a_duplicate() {
+    let (_d, s) = server(&[]).await;
+    let (mac, phone) = setup(&s, 170).await;
+    let id = "cHFyc3R1dnd4eXp7fH1-fw";
+    let body = command_body(&phone, id);
+    let r = phone.post("/v2/commands", &body).await;
+    assert_eq!(r.json["status"], "queued", "{:?}", r.json);
+    let cursor = r.json["cursor"].clone();
+    let r = mac
+        .post("/v2/commands/ack", &json!({ "cursor": cursor }))
+        .await;
+    assert_eq!(r.json["removed"], true);
+    for t in [T0 + 1, T0 + 3601, T0 + 86_400, T0 + 25 * 3600 - 1] {
+        s.set_time(t);
+        metriccupid_push::AppState::cleanup_storage(&s.state).await;
+        let r = phone.post("/v2/commands", &body).await;
+        assert_eq!(
+            (r.json["status"].clone(), r.json["cursor"].clone()),
+            (json!("duplicate"), cursor.clone()),
+            "at +{} s",
+            t - T0
+        );
+        let r = mac.get("/v2/commands?since=0").await;
+        assert_eq!(r.json["commands"], json!([]), "never queued again");
+    }
+    s.set_time(T0 + 25 * 3600 + 1);
+    metriccupid_push::AppState::cleanup_storage(&s.state).await;
+    let r = phone.post("/v2/commands", &body).await;
+    assert_eq!(r.json["status"], "queued", "after 25 h the id is new");
+    assert_ne!(r.json["cursor"], cursor);
+}
+
+/// Mailbox review: a message evicted by the 500 cap is not stored and
+/// pushed again; an old summary re-posted does not replace the newest.
+#[tokio::test]
+async fn evicted_message_or_old_summary_reposted_is_a_duplicate() {
+    let (_d, s) = server(&[
+        ("RATE_V2_MESSAGES_PER_SEC", "10000"),
+        ("RATE_V2_MESSAGES_BURST", "10000"),
+        ("RATE_GROUP_PER_SEC", "10000"),
+        ("RATE_GROUP_BURST", "10000"),
+    ])
+    .await;
+    let (mac, phone) = setup(&s, 172).await;
+    let first = alert_body(&mac, "m0", "normal", 10);
+    assert_eq!(mac.post("/v2/messages", &first).await.json["cursor"], 1);
+    for i in 1..505 {
+        let r = mac
+            .post(
+                "/v2/messages",
+                &alert_body(&mac, &format!("m{i}"), "normal", 10),
+            )
+            .await;
+        assert_eq!(r.json["status"], "stored");
+    }
+    let pushes = s.mock().pushes().len();
+    s.set_time(T0 + 1);
+    let r = mac.post("/v2/messages", &first).await;
+    assert_eq!(
+        (r.json["status"].clone(), r.json["cursor"].clone()),
+        (json!("duplicate"), json!(1))
+    );
+    assert_eq!(s.mock().pushes().len(), pushes, "no second push");
+
+    let summary = |id: &str| {
+        let pt = json!({"v": 1, "type": "summary", "id": id, "ts": T0, "critical": 1,
+                        "warning": 0, "unknown": 0, "top": []});
+        json!({"id": id, "type": "summary", "sealed": mac.seal_json("summary", id, &pt, [3; 12]),
+               "urgency": "silent", "ttl_secs": 86400})
+    };
+    let old = mac.post("/v2/messages", &summary("s-old")).await;
+    assert_eq!(old.json["status"], "stored");
+    mac.post("/v2/messages", &summary("s-new")).await;
+    s.set_time(T0 + 2);
+    let r = mac.post("/v2/messages", &summary("s-old")).await;
+    assert_eq!(
+        (r.json["status"].clone(), r.json["cursor"].clone()),
+        (json!("duplicate"), old.json["cursor"].clone())
+    );
+    let since = old.json["cursor"].as_u64().unwrap() - 1;
+    let r = phone.get(&format!("/v2/messages?since={since}")).await;
+    let ids: Vec<_> = r.json["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["s-new"], "the newest summary is kept");
+}
+
+/// Lead #4 (audit local plan, handler part): with the hub full, a device
+/// replacing its own stream is accepted; a new group's Mac gets 503, a
+/// fourth Mac of a group 429.
+#[tokio::test]
+async fn full_hub_still_accepts_reconnects_and_caps_macs_per_group() {
+    let (_d, s) = server(&[("WS_MAX_STREAMS", "2"), ("WS_MAX_MACS_PER_GROUP", "1")]).await;
+    let (mac, _) = setup(&s, 174).await;
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    // A second Mac of the same group: per-group cap.
+    let mac2 = mac.as_device(&id128(190));
+    assert_eq!(mac2.register("mac", "Mac 2", None).await.status, 201);
+    assert_eq!(open_ws(&mac2).await.err(), Some(429));
+    let (other, _) = setup(&s, 176).await;
+    let mut ws_other = open_ws(&other).await.unwrap();
+    wait_ready(&mut ws_other).await;
+    assert_eq!(s.state.v2().hub.len(), 2);
+    // Full: a new group is refused ...
+    let (third, _) = setup(&s, 178).await;
+    assert_eq!(open_ws(&third).await.err(), Some(503));
+    // ... but a reconnect replacing an open stream is not.
+    s.set_time(T0 + 1);
+    let mut again = open_ws(&mac).await.expect("replacement is not 503");
+    wait_ready(&mut again).await;
+    assert_eq!(s.state.v2().hub.len(), 2);
+}
+
+/// Lead #5 (audit local plan): six IPs flooding registrations neither
+/// starve a signed request of another group nor escape a ban.
+#[tokio::test]
+async fn registration_flood_does_not_starve_signed_users_and_gets_banned() {
+    let (_d, s) = server(&[
+        ("TRUST_PROXY", "xff:127.0.0.1/32"),
+        ("RATE_GLOBAL_PER_SEC", "5"),
+        ("RATE_GLOBAL_BURST", "5"),
+        ("RATE_IP_PER_SEC", "1"),
+        ("RATE_IP_BURST", "2"),
+        ("RATE_V2_GROUPS_BURST", "1"),
+        ("AUTH_ABUSE_THRESHOLD", "5"),
+    ])
+    .await;
+    // The victim group registers from .49 (two requests: its IP burst).
+    let victim = from_ip(&s.group(180), "198.51.100.49");
+    assert_eq!(victim.create_group().await.status, 201);
+    assert_eq!(victim.register("mac", "Mac", None).await.status, 201);
+    let mut limited = 0;
+    for n in 1..=6u8 {
+        let ip = format!("198.51.100.{n}");
+        for k in 0..10u8 {
+            let c = from_ip(&s.group(n.wrapping_mul(16).wrapping_add(k)), &ip);
+            let r = c.create_group().await;
+            if r.status == 429 {
+                limited += 1;
+            }
+        }
+    }
+    assert!(limited >= 50, "the flood is refused ({limited})");
+    let r = from_ip(&victim, "198.51.100.50").get("/v2/status").await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    let banned: Vec<String> = s
+        .state
+        .auth_bans()
+        .active(s.state.now())
+        .into_iter()
+        .map(|(ip, _)| ip.to_string())
+        .collect();
+    for n in 1..=6 {
+        assert!(
+            banned.contains(&format!("198.51.100.{n}")),
+            "198.51.100.{n} banned: {banned:?}"
+        );
+    }
+    assert!(!banned.contains(&"198.51.100.50".to_string()));
+}
+
+/// Lead #5: one bucket per group over every signed route.
+#[tokio::test]
+async fn signed_routes_share_one_bucket_per_group() {
+    let (_d, s) = server(&[("RATE_GROUP_PER_SEC", "1"), ("RATE_GROUP_BURST", "6")]).await;
+    let (_mac, phone) = setup(&s, 182).await; // 2 signed requests
+    let mut codes = Vec::new();
+    for _ in 0..5 {
+        let r = phone.get("/v2/status").await;
+        codes.push((r.status, r.json["error"].as_str().map(str::to_string)));
+    }
+    assert_eq!(
+        codes[..4].iter().filter(|c| c.0 == 200).count(),
+        4,
+        "{codes:?}"
+    );
+    assert_eq!(codes[4], (429, Some("rate_limited".into())), "{codes:?}");
+    let (_m2, p2) = setup(&s, 184).await;
+    assert_eq!(
+        p2.get("/v2/status").await.status,
+        200,
+        "other groups unaffected"
+    );
+}
+
+/// Replay cache: nothing signed before the process started is accepted
+/// (and not held against the client); a full cache fails closed with 503.
+#[tokio::test]
+async fn boot_cut_off_is_not_banned_and_full_replay_cache_is_503() {
+    let (_d, s) = server(&[("REPLAY_CAP", "8"), ("AUTH_BAN_THRESHOLD", "3")]).await;
+    let (mac, phone) = setup(&s, 186).await; // 2 signatures remembered
+    let mut early = phone.clone();
+    early.now = Arc::new(|| T0 - 10);
+    for _ in 0..5 {
+        assert_eq!(early.get("/v2/status").await.status, 401);
+    }
+    assert_eq!(phone.get("/v2/status").await.status, 200, "not banned");
+    let mut last = 200;
+    for _ in 0..5 {
+        last = mac.get("/v2/devices").await.status;
+    }
+    let r = phone.get("/v2/status").await;
+    assert_eq!((last, r.status), (200, 503), "cap 8 reached");
+    assert_eq!(r.headers["retry-after"], "1");
+    s.set_time(T0 + 601);
+    assert_eq!(
+        phone.get("/v2/status").await.status,
+        200,
+        "expired: room again"
+    );
+}
+
+async fn raw_slow_post(base: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let addr = base.trim_start_matches("http://");
+    let mut t = tokio::net::TcpStream::connect(addr).await.unwrap();
+    t.write_all(
+        b"POST /v2/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{",
+    )
+    .await
+    .unwrap();
+    t
+}
+
+async fn read_status_line(t: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 64];
+    let n = t.read(&mut buf).await.unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Lead #6 (audit local plan): 128 slow bodies hold no permit; a signed POST
+/// answers at once and the slow ones get 408 after about 3 s.
+#[tokio::test]
+async fn slow_bodies_hold_no_permit_and_time_out_with_408() {
+    let (_d, s) = server(&[]).await;
+    let (mac, _) = setup(&s, 188).await;
+    let started = std::time::Instant::now();
+    let mut slow = Vec::new();
+    for _ in 0..128 {
+        slow.push(raw_slow_post(&s.base).await);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t = std::time::Instant::now();
+    let r = mac
+        .post("/v2/messages", &alert_body(&mac, "fast", "normal", 10))
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "signed POST waited {:?}",
+        t.elapsed()
+    );
+    let r = mac.get("/v2/devices").await;
+    assert_eq!(r.status, 200);
+    for t in slow.iter_mut() {
+        let line = tokio::time::timeout(Duration::from_secs(8), read_status_line(t))
+            .await
+            .expect("answered");
+        assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+    }
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(2900) && took < Duration::from_secs(6),
+        "408 after the 3 s deadline, not the 10 s timeout: {took:?}"
+    );
+}
+
+/// Lead #6: waiting for a request permit is bounded (503, Retry-After: 1).
+#[tokio::test]
+async fn permit_wait_is_bounded_with_503() {
+    let (_d, s) = server(&[
+        ("RATE_GROUP_PER_SEC", "10000"),
+        ("RATE_GROUP_BURST", "10000"),
+    ])
+    .await;
+    let (_, phone) = setup(&s, 192).await;
+    // Hold the database so the first requests keep their permits.
+    let store = s.state.v2().store.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        store
+            .blocking(|_| {
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(2500));
+                Ok(())
+            })
+            .unwrap()
+    });
+    locked_rx.recv().unwrap();
+    let n = metriccupid_push::api::MAX_CONCURRENCY + 40;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..n {
+        let p = phone.clone();
+        // Staggered: a burst of connects would overflow the listen backlog
+        // (128 on macOS) and be reset before the server sees them.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        tasks.spawn(async move {
+            let r = p.get("/v2/status").await;
+            (r.status, r.headers.get("retry-after").cloned())
+        });
+    }
+    let mut shed = 0;
+    let mut ok = 0;
+    while let Some(r) = tasks.join_next().await {
+        match r.unwrap() {
+            (503, ra) => {
+                assert_eq!(ra.unwrap(), "1");
+                shed += 1;
+            }
+            (200, _) => ok += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    holder.join().unwrap();
+    assert!(
+        shed >= 1 && ok >= metriccupid_push::api::MAX_CONCURRENCY - 10,
+        "shed {shed}, ok {ok}"
+    );
+}
+
+/// Lead #6: at MAX_CONNECTIONS the server stops accepting until one closes.
+#[tokio::test]
+async fn connection_cap_holds_new_connections_until_one_closes() {
+    use tokio::io::AsyncWriteExt;
+    let (_d, s) = server(&[("MAX_CONNECTIONS", "2")]).await;
+    let addr = s.base.trim_start_matches("http://").to_string();
+    let a = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let _b = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    c.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), read_status_line(&mut c))
+            .await
+            .is_err(),
+        "third connection not served while two are open"
+    );
+    drop(a);
+    let line = tokio::time::timeout(Duration::from_secs(5), read_status_line(&mut c))
+        .await
+        .expect("served once a slot is free");
+    assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+}
+
+/// Hardening: the mock push log is for loopback peers only.
+#[tokio::test]
+async fn debug_pushes_answer_loopback_peers_only() {
+    use tower::ServiceExt;
+    let (_d, s) = server(&[("MODE", "hosted"), ("LICENCE_MODE", "open")]).await;
+    let get = |peer: &str| {
+        let mut req = axum::http::Request::builder()
+            .uri("/v2/debug/pushes")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        metriccupid_push::router(s.state.clone()).oneshot(req)
+    };
+    assert_eq!(get("192.0.2.7:5555").await.unwrap().status(), 404);
+    assert_eq!(get("[2001:db8::1]:5555").await.unwrap().status(), 404);
+    assert_eq!(get("127.0.0.1:5555").await.unwrap().status(), 200);
+    assert_eq!(get("[::1]:5555").await.unwrap().status(), 200);
+}
+
+/// Hardening: a device deleted between authentication and the upgrade does
+/// not keep a stream.
+#[tokio::test]
+async fn stream_of_a_device_deleted_during_the_upgrade_is_refused() {
+    let (_d, s) = server(&[]).await;
+    let (mac, _) = setup(&s, 194).await;
+    let v2 = s.state.v2();
+    let reg = v2
+        .hub
+        .register(&mac.group_id, &mac.device_id, "127.0.0.1".parse().unwrap())
+        .unwrap();
+    let (g, d) = (mac.group_id.clone(), mac.device_id.clone());
+    assert!(v2
+        .store
+        .call(move |c| store::delete_device(c, &g, &d))
+        .await
+        .unwrap());
+    assert_eq!(
+        metriccupid_push::v2::admit_stream(&s.state, &mac.group_id, &mac.device_id, reg.id).await,
+        Err((1008, "unknown device"))
+    );
+    assert!(v2.hub.is_empty());
+    // Still registered: admitted.
+    let (mac2, _) = setup(&s, 196).await;
+    let reg = v2
+        .hub
+        .register(
+            &mac2.group_id,
+            &mac2.device_id,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        metriccupid_push::v2::admit_stream(&s.state, &mac2.group_id, &mac2.device_id, reg.id).await,
+        Ok(())
+    );
+}
+
+/// Hardening: deleting a group drops its presence and Live Activity state,
+/// also when its stream ends afterwards.
+#[tokio::test]
+async fn deleted_group_leaves_no_presence_or_activity_state() {
+    let (_d, s) = server(&[("MAC_OFFLINE_GRACE_SECS", "0")]).await;
+    let (mac, _) = setup(&s, 198).await;
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    let r = mac
+        .post(
+            "/v2/activity-state",
+            &json!({"event": "update", "state": {"critical": 1, "warning": 0, "unknown": 0}}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    let v2 = s.state.v2();
+    assert!(!v2.activities.is_empty());
+    s.set_time(T0 + 1);
+    assert_eq!(mac.send("DELETE", "/v2/groups", "").await.status, 204);
+    assert!(v2.activities.is_empty());
+    wait_offline(&s, &mac.group_id).await;
+    // The stream's end recorded an offline notice for the deleted group;
+    // the presence tick finds no group and forgets it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tick(&s).await;
+    assert!(v2.presence.is_empty());
+    assert!(v2.activities.is_empty());
+}
+
+/// Hardening: at most 6 presence pushes per group and hour.
+#[tokio::test]
+async fn presence_pushes_are_limited_per_group() {
+    let (_d, s) = server(&[]).await;
+    let (mac, _) = setup(&s, 200).await;
+    let mut t = T0;
+    for _ in 0..5 {
+        t += 10;
+        s.set_time(t);
+        let mut ws = open_ws(&mac).await.unwrap();
+        wait_ready(&mut ws).await;
+        ws.send(WsMessage::Text(r#"{"type":"bye","reason":"sleep"}"#.into()))
+            .await
+            .unwrap();
+        wait_offline(&s, &mac.group_id).await;
+        tick(&s).await;
+    }
+    // 5 offline + 4 online notices would be 9 pushes; the bucket allows 6.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let n = s
+        .mock()
+        .pushes()
+        .iter()
+        .filter(|p| p.collapse_id.as_deref() == Some("mc-presence"))
+        .count();
+    assert_eq!(n, 6);
+}
+
+fn fallback_licence() -> Value {
+    let mut p = common::licence::app_transaction("unused", T0);
+    p.as_object_mut().unwrap().remove("appTransactionId");
+    json!({ "kind": "app_transaction", "jws": common::licence::CHAIN.sign(&p) })
+}
+
+/// Hardening: a licence without `appTransactionId` (shared fallback id) is
+/// not pooled across unrelated buyers; it is limited per client IP.
+#[tokio::test]
+async fn fallback_id_licences_are_limited_per_ip_not_per_purchase() {
+    let (_d, s) = server(&[("MODE", "hosted"), ("LICENCE_MODE", "app_transaction")]).await;
+    let lic = fallback_licence();
+    let limit = metriccupid_push::limits::FALLBACK_ATTACHES_PER_DAY as u8;
+    for i in 0..limit {
+        let r = s
+            .group(210 + i * 2)
+            .create_group_with(json!({ "licence": lic }))
+            .await;
+        assert_eq!(r.status, 201, "{i}: {:?}", r.json);
+    }
+    let r = s
+        .group(210 + limit * 2)
+        .create_group_with(json!({ "licence": lic }))
+        .await;
+    assert_eq!(r.status, 429, "{:?}", r.json);
+}

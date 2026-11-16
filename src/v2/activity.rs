@@ -184,9 +184,23 @@ struct GroupActivity {
     last_sent: Option<u64>,
     last_ts: u64,
     sent_critical: u32,
-    /// device id -> when the server last sent it a push-to-start.
-    started: HashMap<String, u64>,
+    /// device id -> when the server last sent it a push-to-start, and
+    /// whether an activity came up since (an `update` token registered).
+    started: HashMap<String, Started>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct Started {
+    at: u64,
+    /// The phone registered an `update` token after this push-to-start.
+    consumed: bool,
+}
+
+/// After a push-to-start was followed by a running activity (its `update`
+/// token registered), the next one may come this soon instead of 8 h later
+/// (the activity may have been ended by the user). A phone registering
+/// tokens on purpose can therefore get at most one per hour.
+pub const RESTART_AFTER_SECS: u64 = 3600;
 
 /// Latest state and coalescing per group. In memory only: after a restart
 /// the next state from the Mac (at most 15 min later, heartbeat) restores it.
@@ -268,19 +282,56 @@ impl Activities {
         let mut map = self.lock();
         let g = map.entry(group.to_string()).or_default();
         g.started
-            .retain(|_, t| now.saturating_sub(*t) < ACTIVITY_MAX_SECS);
-        if g.started.contains_key(device) {
-            return false;
+            .retain(|_, s| now.saturating_sub(s.at) < ACTIVITY_MAX_SECS);
+        if let Some(s) = g.started.get(device) {
+            // 8 h after a start nobody used; 1 h after one that started an
+            // activity (the user may have ended it since).
+            if !s.consumed || now.saturating_sub(s.at) < RESTART_AFTER_SECS {
+                return false;
+            }
         }
-        g.started.insert(device.to_string(), now);
+        g.started.insert(
+            device.to_string(),
+            Started {
+                at: now,
+                consumed: false,
+            },
+        );
         true
     }
 
-    /// The device registered an activity token: its activity is running.
+    /// The device registered an `update` token: the activity started by the
+    /// last push-to-start is running. This no longer clears the limit (the
+    /// phone could otherwise reset it at will); see [`RESTART_AFTER_SECS`].
     pub fn token_registered(&self, group: &str, device: &str) {
+        if let Some(s) = self
+            .lock()
+            .get_mut(group)
+            .and_then(|g| g.started.get_mut(device))
+        {
+            s.consumed = true;
+        }
+    }
+
+    /// The group was deleted: drop its state.
+    pub fn forget_group(&self, group: &str) {
+        self.lock().remove(group);
+    }
+
+    /// The device was deleted: drop its push-to-start record.
+    pub fn forget_device(&self, group: &str, device: &str) {
         if let Some(g) = self.lock().get_mut(group) {
             g.started.remove(device);
         }
+    }
+
+    /// Groups with state (tests, diagnostics).
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Latest state of `group` (tests, diagnostics).
@@ -468,7 +519,30 @@ mod tests {
         assert!(!a.may_start("g", "p", 100));
         assert!(a.may_start("g", "q", 100), "per device");
         a.token_registered("g", "q");
-        assert!(a.may_start("g", "q", 101), "its activity registered");
         assert!(a.may_start("g", "p", ACTIVITY_MAX_SECS));
+    }
+
+    #[test]
+    fn phone_cannot_reset_the_push_to_start_limit_at_will() {
+        let a = Activities::new();
+        assert!(a.may_start("g", "q", 100));
+        // Registering an update token (even repeatedly) only marks the start
+        // as used; the next start needs RESTART_AFTER_SECS.
+        a.token_registered("g", "q");
+        a.token_registered("g", "q");
+        assert!(!a.may_start("g", "q", 101), "no immediate reset");
+        assert!(!a.may_start("g", "q", 100 + RESTART_AFTER_SECS - 1));
+        assert!(a.may_start("g", "q", 100 + RESTART_AFTER_SECS));
+        // Unused start (no activity came up): still 8 h.
+        let t = 100 + RESTART_AFTER_SECS;
+        assert!(!a.may_start("g", "q", t + RESTART_AFTER_SECS));
+        assert!(a.may_start("g", "q", t + ACTIVITY_MAX_SECS));
+        // A token registered without any start sent does nothing.
+        a.token_registered("g", "r");
+        assert!(a.may_start("g", "r", 0));
+        a.forget_device("g", "r");
+        assert!(a.may_start("g", "r", 1), "deleted device forgotten");
+        a.forget_group("g");
+        assert!(a.is_empty());
     }
 }

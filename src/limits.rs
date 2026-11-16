@@ -77,6 +77,23 @@ impl<K: Eq + Hash + Clone> ExpiringSet<K> {
         true
     }
 
+    /// Like [`ExpiringSet::insert_if_absent`], but fail closed: when the set
+    /// is full of live entries, nothing is evicted and `Err(SetFull)` is
+    /// returned (the replay cache must not forget a signature that is still
+    /// valid).
+    pub fn try_insert(&mut self, key: K, now: u64) -> Result<bool, SetFull> {
+        self.purge(now);
+        if self.map.contains_key(&key) {
+            return Ok(false);
+        }
+        if self.map.len() >= self.cap {
+            return Err(SetFull);
+        }
+        self.map.insert(key.clone(), now);
+        self.order.push_back((key, now));
+        Ok(true)
+    }
+
     pub fn remove(&mut self, key: &K) {
         // The stale `order` entry is skipped later because its timestamp no
         // longer matches the map.
@@ -110,29 +127,117 @@ impl<K: Eq + Hash + Clone> ExpiringSet<K> {
     }
 }
 
+/// [`ExpiringSet::try_insert`] found the set full of live entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetFull;
+
 #[derive(Debug, Clone, Copy)]
 struct FailureEntry {
     window_start: u64,
     failures: u32,
     banned_until: u64,
+    /// Rate-limited answers (`record_abuse`) in the window starting here.
+    abuse_start: u64,
+    abused: u32,
 }
 
-/// Bans an IP for `duration` after `threshold` auth failures within `window`.
+/// Bans an IP for `duration` after `threshold` auth failures within `window`,
+/// and for the abuse duration after `abuse.threshold` rate-limited answers
+/// within the abuse window (sustained flooding without any auth failure).
 pub struct AuthBans {
     threshold: u32,
     window: u64,
     duration: u64,
+    abuse: AbuseRule,
     map: Mutex<HashMap<IpAddr, FailureEntry>>,
+}
+
+/// `AUTH_ABUSE_*`: rate-limited answers per IP key that start a ban.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbuseRule {
+    pub threshold: u32,
+    pub window: u64,
+    pub duration: u64,
+}
+
+impl Default for AbuseRule {
+    fn default() -> Self {
+        Self {
+            threshold: 100,
+            window: 60,
+            duration: 900,
+        }
+    }
 }
 
 impl AuthBans {
     pub fn new(threshold: u32, window: Duration, duration: Duration) -> Self {
+        Self::with_abuse(threshold, window, duration, AbuseRule::default())
+    }
+
+    pub fn with_abuse(
+        threshold: u32,
+        window: Duration,
+        duration: Duration,
+        abuse: AbuseRule,
+    ) -> Self {
         Self {
             threshold,
             window: window.as_secs(),
             duration: duration.as_secs(),
+            abuse,
             map: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The entry for `key`, unless the map is full of live entries.
+    fn entry<'a>(
+        &self,
+        map: &'a mut HashMap<IpAddr, FailureEntry>,
+        key: IpAddr,
+        now: u64,
+    ) -> Option<&'a mut FailureEntry> {
+        if map.len() >= MAX_BAN_ENTRIES && !map.contains_key(&key) {
+            Self::cleanup_locked(map, now, self.window.max(self.abuse.window));
+            if map.len() >= MAX_BAN_ENTRIES {
+                // Map full of live entries: stop tracking new IPs rather than
+                // grow without bound. Rate limits still apply.
+                return None;
+            }
+        }
+        Some(map.entry(key).or_insert(FailureEntry {
+            window_start: now,
+            failures: 0,
+            banned_until: 0,
+            abuse_start: now,
+            abused: 0,
+        }))
+    }
+
+    /// Record one rate-limited answer (429) for `key`; returns `true` if it
+    /// started a ban. A client that keeps hammering after being told to back
+    /// off is banned like one that keeps failing authentication.
+    pub fn record_abuse(&self, key: IpAddr, now: u64) -> bool {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let rule = self.abuse;
+        let Some(e) = self.entry(&mut map, key, now) else {
+            return false;
+        };
+        if e.banned_until > now {
+            return false;
+        }
+        if now.saturating_sub(e.abuse_start) >= rule.window {
+            e.abuse_start = now;
+            e.abused = 0;
+        }
+        e.abused = e.abused.saturating_add(1);
+        if e.abused >= rule.threshold {
+            e.banned_until = now + rule.duration;
+            e.abused = 0;
+            e.abuse_start = now;
+            return true;
+        }
+        false
     }
 
     /// Seconds remaining on a ban for `key`, if banned.
@@ -146,19 +251,9 @@ impl AuthBans {
     /// Record one auth failure; returns `true` if this failure started a ban.
     pub fn record_failure(&self, key: IpAddr, now: u64) -> bool {
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= MAX_BAN_ENTRIES && !map.contains_key(&key) {
-            Self::cleanup_locked(&mut map, now, self.window);
-            if map.len() >= MAX_BAN_ENTRIES {
-                // Map full of live entries: stop tracking new IPs rather than
-                // grow without bound. Rate limits still apply.
-                return false;
-            }
-        }
-        let e = map.entry(key).or_insert(FailureEntry {
-            window_start: now,
-            failures: 0,
-            banned_until: 0,
-        });
+        let Some(e) = self.entry(&mut map, key, now) else {
+            return false;
+        };
         if now.saturating_sub(e.window_start) >= self.window {
             e.window_start = now;
             e.failures = 0;
@@ -175,7 +270,7 @@ impl AuthBans {
 
     pub fn cleanup(&self, now: u64) {
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        Self::cleanup_locked(&mut map, now, self.window);
+        Self::cleanup_locked(&mut map, now, self.window.max(self.abuse.window));
     }
 
     /// Keys banned at `now` with the seconds left, longest first.
@@ -205,7 +300,11 @@ impl AuthBans {
     }
 
     fn cleanup_locked(map: &mut HashMap<IpAddr, FailureEntry>, now: u64, window: u64) {
-        map.retain(|_, e| e.banned_until > now || now.saturating_sub(e.window_start) < window);
+        map.retain(|_, e| {
+            e.banned_until > now
+                || now.saturating_sub(e.window_start) < window
+                || now.saturating_sub(e.abuse_start) < window
+        });
         map.shrink_to_fit();
     }
 }
@@ -235,7 +334,12 @@ impl<T> Live<T> {
 
 /// Global, per-IP and per-secret token buckets.
 pub struct RateLimits {
+    /// Authenticated requests (`RATE_GLOBAL_*`): v2 checks it only after the
+    /// signature verified, so anonymous floods cannot drain it.
     global: Live<DefaultDirectRateLimiter>,
+    /// Anonymous work (`RATE_ANON_GLOBAL_*`): `POST /v2/groups` and requests
+    /// that failed authentication.
+    anon: Live<DefaultDirectRateLimiter>,
     per_ip: Live<DefaultKeyedRateLimiter<IpAddr>>,
     per_secret: Vec<DefaultDirectRateLimiter>,
 }
@@ -253,6 +357,7 @@ impl RateLimits {
     pub fn new(limits: &Limits, secret_count: usize) -> Self {
         Self {
             global: Live::new(RateLimiter::direct(quota(limits.global))),
+            anon: Live::new(RateLimiter::direct(quota(limits.anon_global))),
             per_ip: Live::new(RateLimiter::keyed(quota(limits.per_ip))),
             per_secret: (0..secret_count)
                 .map(|_| RateLimiter::direct(quota(limits.per_secret)))
@@ -266,6 +371,15 @@ impl RateLimits {
 
     pub fn check_global(&self) -> Result<(), RetryAfter> {
         self.global.get().check().map_err(retry_after)
+    }
+
+    pub fn check_anon(&self) -> Result<(), RetryAfter> {
+        self.anon.get().check().map_err(retry_after)
+    }
+
+    /// Replace the anonymous bucket (`RATE_ANON_GLOBAL_*` live override).
+    pub fn set_anon(&self, r: Rate) {
+        self.anon.set(RateLimiter::direct(quota(r)));
     }
 
     /// Replace the per-IP buckets (`RATE_IP_*` live override).
@@ -315,6 +429,31 @@ pub struct V2Limits {
     snapshot: DefaultKeyedRateLimiter<String>,
     heartbeat: DefaultKeyedRateLimiter<String>,
     groups: DefaultKeyedRateLimiter<IpAddr>,
+    /// Every signed request of a group (`RATE_GROUP_*`).
+    per_group: Live<DefaultKeyedRateLimiter<String>>,
+    /// Presence pushes per group ([`presence_quota`]).
+    presence: DefaultKeyedRateLimiter<String>,
+    /// Attaches of licences with a fallback purchase id, per client IP.
+    fallback_attach: DefaultKeyedRateLimiter<IpAddr>,
+}
+
+/// Presence pushes per group: 6 per hour, burst 6. Beyond that the state
+/// still changes but no push is sent (a connect / bye loop must not page
+/// the phones without limit).
+pub fn presence_quota() -> Quota {
+    let n = std::num::NonZeroU32::new(6).expect("non-zero");
+    Quota::per_hour(n).allow_burst(n)
+}
+
+/// Licence attaches with a fallback purchase id per client IP and day.
+pub const FALLBACK_ATTACHES_PER_DAY: u32 = 10;
+
+/// One per 2.4 h, burst 10.
+pub fn fallback_attach_quota() -> Quota {
+    let n = std::num::NonZeroU32::new(FALLBACK_ATTACHES_PER_DAY).expect("non-zero");
+    Quota::with_period(Duration::from_secs(86_400 / u64::from(n.get())))
+        .expect("non-zero period")
+        .allow_burst(n)
 }
 
 /// `POST /v2/activity-state` per group: one per 5 s, burst 10 (the server
@@ -393,7 +532,35 @@ impl V2Limits {
             snapshot: RateLimiter::keyed(snapshot_quota()),
             heartbeat: RateLimiter::keyed(heartbeat_quota()),
             groups: RateLimiter::keyed(hourly(c.rate_groups)),
+            per_group: Live::new(RateLimiter::keyed(quota(c.rate_group))),
+            presence: RateLimiter::keyed(presence_quota()),
+            fallback_attach: RateLimiter::keyed(fallback_attach_quota()),
         }
+    }
+
+    /// The group's bucket over all signed routes (after the signature).
+    pub fn check_group(&self, group: &str) -> Result<(), RetryAfter> {
+        self.per_group
+            .get()
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
+    /// Replace the per-group buckets (`RATE_GROUP_*` live override).
+    pub fn set_group(&self, r: Rate) {
+        self.per_group.set(RateLimiter::keyed(quota(r)));
+    }
+
+    /// One more presence push for `group`.
+    pub fn check_presence(&self, group: &str) -> Result<(), RetryAfter> {
+        self.presence
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
+    /// One more attach of a fallback-id licence from `ip` (an IP key).
+    pub fn check_fallback_attach(&self, ip: IpAddr) -> Result<(), RetryAfter> {
+        self.fallback_attach.check_key(&ip).map_err(retry_after)
     }
 
     pub fn check_messages(&self, group: &str) -> Result<(), RetryAfter> {
@@ -469,8 +636,14 @@ impl V2Limits {
     }
 
     pub fn cleanup(&self) {
-        let (gw, gwh) = (self.gateway.get(), self.gateway_hourly.get());
+        let (gw, gwh, pg) = (
+            self.gateway.get(),
+            self.gateway_hourly.get(),
+            self.per_group.get(),
+        );
         for l in [
+            &*pg,
+            &self.presence,
             &self.messages,
             &self.commands,
             &gw[0],
@@ -485,8 +658,10 @@ impl V2Limits {
             l.retain_recent();
             l.shrink_to_fit();
         }
-        self.groups.retain_recent();
-        self.groups.shrink_to_fit();
+        for l in [&self.groups, &self.fallback_attach] {
+            l.retain_recent();
+            l.shrink_to_fit();
+        }
     }
 }
 
@@ -569,6 +744,9 @@ mod tests {
             ban_threshold: 10,
             ban_window: Duration::from_secs(900),
             ban_duration: Duration::from_secs(900),
+            anon_global: r(100, 100),
+            abuse: AbuseRule::default(),
+            replay_cap: 10,
         };
         let rl = RateLimits::new(&limits, 0);
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
@@ -610,6 +788,88 @@ mod tests {
     }
 
     #[test]
+    fn expiring_set_try_insert_fails_closed() {
+        let mut s = ExpiringSet::new(Duration::from_secs(10), 2);
+        assert_eq!(s.try_insert("a", 0), Ok(true));
+        assert_eq!(s.try_insert("a", 1), Ok(false));
+        assert_eq!(s.try_insert("b", 1), Ok(true));
+        assert_eq!(
+            s.try_insert("c", 2),
+            Err(SetFull),
+            "nothing live is evicted"
+        );
+        assert_eq!(s.try_insert("a", 3), Ok(false), "a still remembered");
+        assert_eq!(s.try_insert("c", 10), Ok(true), "a expired, room again");
+    }
+
+    /// Lead #5: sustained rate-limited answers ban the IP like auth failures.
+    #[test]
+    fn abuse_bans_after_threshold_within_window() {
+        let rule = AbuseRule {
+            threshold: 100,
+            window: 60,
+            duration: 900,
+        };
+        let bans =
+            AuthBans::with_abuse(10, Duration::from_secs(900), Duration::from_secs(900), rule);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for i in 0..99 {
+            assert!(!bans.record_abuse(ip, i / 2));
+        }
+        assert_eq!(bans.banned_for(ip, 50), None);
+        assert!(bans.record_abuse(ip, 50), "100th within 60 s");
+        assert_eq!(bans.banned_for(ip, 50), Some(900));
+        assert!(!bans.record_abuse(ip, 51), "already banned");
+        // Spread out over more than the window: no ban.
+        let other: IpAddr = "192.0.2.2".parse().unwrap();
+        for i in 0..200 {
+            assert!(!bans.record_abuse(other, i * 2), "{i}");
+        }
+        // Auth-failure counting is separate.
+        assert!(!bans.record_failure(other, 400));
+        bans.cleanup(10_000);
+        assert!(bans.is_empty());
+    }
+
+    #[test]
+    fn group_presence_and_fallback_buckets() {
+        let c = crate::config::Config::from_lookup(|k| match k {
+            "APNS_MODE" => Some("mock".into()),
+            "RATE_GROUP_BURST" => Some("2".into()),
+            _ => None,
+        })
+        .unwrap();
+        let v2 = V2Limits::new(&c.v2);
+        assert!(v2.check_group("g").is_ok());
+        assert!(v2.check_group("g").is_ok());
+        assert!(v2.check_group("g").is_err());
+        assert!(v2.check_group("h").is_ok(), "per group");
+        v2.set_group(Rate {
+            per_sec: nz(1),
+            burst: nz(3),
+        });
+        assert!(v2.check_group("g").is_ok(), "replaced: full bucket");
+        for _ in 0..6 {
+            assert!(v2.check_presence("g").is_ok());
+        }
+        assert!(v2.check_presence("g").is_err(), "6 per hour");
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..FALLBACK_ATTACHES_PER_DAY {
+            assert!(v2.check_fallback_attach(ip).is_ok());
+        }
+        assert!(v2.check_fallback_attach(ip).is_err());
+        let rl = RateLimits::new(&c.limits, 0);
+        for _ in 0..60 {
+            assert!(rl.check_anon().is_ok());
+        }
+        assert!(rl.check_anon().is_err(), "anonymous burst 60");
+        assert!(
+            rl.check_global().is_ok(),
+            "the authenticated bucket is separate"
+        );
+    }
+
+    #[test]
     fn ban_window_resets() {
         let bans = AuthBans::new(3, Duration::from_secs(60), Duration::from_secs(100));
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
@@ -638,6 +898,9 @@ mod tests {
             ban_threshold: 10,
             ban_window: Duration::from_secs(900),
             ban_duration: Duration::from_secs(900),
+            anon_global: r,
+            abuse: AbuseRule::default(),
+            replay_cap: 10,
         };
         let rl = RateLimits::new(&limits, 1);
         let ip: IpAddr = "192.0.2.1".parse().unwrap();

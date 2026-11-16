@@ -1047,6 +1047,22 @@ pub fn audit_log(c: &Connection) -> R<Vec<AuditRow>> {
 
 pub const MAX_CSV_ROWS: i64 = 200_000;
 
+/// One CSV cell: quoted when needed, and never a spreadsheet formula (a
+/// group id may start with `-`; tab and CR are formula prefixes too in some
+/// spreadsheets).
+pub fn csv_field(s: String) -> String {
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{s}")
+    } else {
+        s
+    };
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
 /// `daily_agg` as CSV, newest day first.
 pub fn daily_csv(c: &Connection) -> R<String> {
     let mut out = String::from(
@@ -1058,32 +1074,42 @@ pub fn daily_csv(c: &Connection) -> R<String> {
     )?;
     let mut rows = st.query([MAX_CSV_ROWS])?;
     while let Some(r) = rows.next()? {
-        let field = |s: String| -> String {
-            // No spreadsheet formulas (a group id may start with `-`).
-            let s = if s.starts_with(['=', '+', '-', '@']) {
-                format!("'{s}")
-            } else {
-                s
-            };
-            if s.contains([',', '"', '\n']) {
-                format!("\"{}\"", s.replace('"', "\"\""))
-            } else {
-                s
-            }
-        };
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{},{},{}\n",
-            field(r.get(0)?),
-            field(r.get(1)?),
-            field(r.get(2)?),
+            csv_field(r.get(0)?),
+            csv_field(r.get(1)?),
+            csv_field(r.get(2)?),
             r.get::<_, i64>(3)?,
-            field(r.get(4)?),
-            field(r.get(5)?),
-            field(r.get(6)?),
+            csv_field(r.get(4)?),
+            csv_field(r.get(5)?),
+            csv_field(r.get(6)?),
             r.get::<_, i64>(7)?,
             r.get::<_, i64>(8)?,
             r.get::<_, i64>(9)?,
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::csv_field;
+
+    #[test]
+    fn csv_cells_are_never_formulas() {
+        for (input, want) in [
+            ("ok", "ok"),
+            ("=1+1", "'=1+1"),
+            ("+1", "'+1"),
+            ("-AAAA", "'-AAAA"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("\t=1", "'\t=1"),
+            ("\r=1", "\"'\r=1\""),
+            ("a,b", "\"a,b\""),
+            ("say \"hi\"", "\"say \"\"hi\"\"\""),
+            ("a\nb", "\"a\nb\""),
+        ] {
+            assert_eq!(csv_field(input.to_string()), want, "{input:?}");
+        }
+    }
 }

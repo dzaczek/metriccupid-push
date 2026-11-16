@@ -2423,3 +2423,119 @@ async fn invalid_input_does_not_use_up_a_code() {
         .await;
     assert_eq!(st, 200, "the code is still unused: {body}");
 }
+
+/// Lead #3 (audit local plan): with `CF_IPS_EXTRA` set to the cloudflared
+/// container's /32, a host-local peer on the Docker bridge gateway (.1)
+/// cannot forge `CF-Connecting-IP` past `ADMIN_ALLOW_IPS`.
+#[tokio::test]
+async fn bridge_gateway_peer_cannot_forge_cf_connecting_ip() {
+    use tower::ServiceExt;
+    let dir = tempfile::tempdir().unwrap();
+    let hash = test_hash();
+    let env: HashMap<String, String> = HashMap::from([
+        ("APNS_MODE".into(), "mock".into()),
+        ("DATA_DIR".into(), dir.path().display().to_string()),
+        ("ADMIN_BIND".into(), "127.0.0.1:0".into()),
+        ("ADMIN_USER".into(), "admin".into()),
+        ("ADMIN_PASSWORD_HASH".into(), hash),
+        ("ADMIN_TOTP_SECRET".into(), SECRET_B32.into()),
+        ("ADMIN_ALLOW_IPS".into(), "203.0.113.7/32".into()),
+        ("TRUST_PROXY".into(), "cloudflare".into()),
+        ("CF_IPS_EXTRA".into(), "172.30.53.20/32".into()),
+    ]);
+    let config = Config::from_lookup(|k| env.get(k).cloned()).unwrap();
+    let clock = Arc::new(TestClock(AtomicU64::new(T0)));
+    let resolver = ClientIpResolver::from_config(&config.trust_proxy).await;
+    let state = Arc::new(AppState::new(&config, resolver, clock).unwrap());
+    let admin_state = Arc::new(AdminState::new(state, &config).unwrap());
+    let get = |peer: &str, forged: Option<&str>| {
+        let mut b = axum::http::Request::builder().uri("/admin/login");
+        if let Some(ip) = forged {
+            b = b.header("cf-connecting-ip", ip);
+        }
+        let mut req = b.body(axum::body::Body::empty()).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        admin::router(admin_state.clone()).oneshot(req)
+    };
+    // The bridge gateway (every host-published connection) forging the header.
+    let r = get("172.30.53.1:5555", Some("203.0.113.7")).await.unwrap();
+    assert_eq!(r.status(), 404, "forged header from the bridge gateway");
+    assert_eq!(get("172.30.53.1:5555", None).await.unwrap().status(), 404);
+    // cloudflared itself (the /32) relays the real client.
+    let r = get("172.30.53.20:5555", Some("203.0.113.7")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(get("172.30.53.20:5555", None).await.unwrap().status(), 404);
+}
+
+/// Phase 1 limits are live keys on the Limits page, with sane bounds.
+#[tokio::test]
+async fn phase1_limits_are_live_and_bounded() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = servers(&[]).await;
+    let session = s.login().await;
+    for (key, value) in [
+        ("RATE_GROUP_BURST", "9"),
+        ("RATE_GROUP_PER_SEC", "0"),
+        ("WS_MAX_STREAMS", "15"),
+        ("WS_MAX_MACS_PER_GROUP", "11"),
+        ("WS_MAX_PER_IP", "0"),
+        ("RATE_ANON_GLOBAL_PER_SEC", "0"),
+    ] {
+        let (st, body) = s
+            .act(
+                &session,
+                "/admin/limits/set",
+                &[("key", key), ("value", value)],
+            )
+            .await;
+        assert_eq!(st, 400, "{key}={value}: {body}");
+    }
+    let (_, _, html) = s.get("/admin/limits", Some(&session)).await;
+    for key in [
+        "RATE_ANON_GLOBAL_PER_SEC",
+        "RATE_ANON_GLOBAL_BURST",
+        "RATE_GROUP_PER_SEC",
+        "RATE_GROUP_BURST",
+        "WS_MAX_STREAMS",
+        "WS_MAX_MACS_PER_GROUP",
+        "WS_MAX_PER_IP",
+    ] {
+        assert!(html.contains(key), "{key} on the Limits page");
+    }
+    for (k, v) in [
+        ("WS_MAX_STREAMS", "6000"),
+        ("WS_MAX_MACS_PER_GROUP", "1"),
+        ("WS_MAX_PER_IP", "7"),
+        ("RATE_GROUP_PER_SEC", "1"),
+        ("RATE_GROUP_BURST", "10"),
+    ] {
+        let (st, body) = s
+            .act(&session, "/admin/limits/set", &[("key", k), ("value", v)])
+            .await;
+        assert_eq!(st, 200, "{k}: {body}");
+    }
+    let hub = &s.state.v2().hub;
+    assert_eq!(
+        (
+            hub.max_streams.load(Relaxed),
+            hub.max_macs_per_group.load(Relaxed),
+            hub.max_per_ip.load(Relaxed)
+        ),
+        (6000, 1, 7)
+    );
+    // The per-group bucket (burst 10) applies at once.
+    let mac = s.mac(120);
+    assert_eq!(mac.create_group().await.status, 201);
+    let mut codes = vec![mac.register("mac", "Mac", None).await.status];
+    for _ in 0..10 {
+        codes.push(mac.get("/v2/status").await.status);
+    }
+    assert_eq!(
+        codes.iter().filter(|&&c| c == 200 || c == 201).count(),
+        10,
+        "{codes:?}"
+    );
+    assert_eq!(codes.last(), Some(&429), "{codes:?}");
+}

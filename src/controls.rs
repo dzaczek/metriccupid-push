@@ -189,6 +189,48 @@ pub const LIMIT_KEYS: &[LimitKey] = &[
     ),
     num("RATE_IP_BURST", 1, 10_000, "Per client IP, burst"),
     num(
+        "RATE_ANON_GLOBAL_PER_SEC",
+        1,
+        10_000,
+        "Anonymous bucket, per second: group registrations and failed authentications",
+    ),
+    num(
+        "RATE_ANON_GLOBAL_BURST",
+        1,
+        100_000,
+        "Anonymous bucket, burst",
+    ),
+    num(
+        "RATE_GROUP_PER_SEC",
+        1,
+        1_000,
+        "Per group, signed requests per second (all routes together)",
+    ),
+    num(
+        "RATE_GROUP_BURST",
+        10,
+        10_000,
+        "Per group, signed requests, burst (at least 10: a phone sends several at once)",
+    ),
+    num(
+        "WS_MAX_STREAMS",
+        16,
+        100_000,
+        "Open Mac streams on the server (new streams beyond: 503)",
+    ),
+    num(
+        "WS_MAX_MACS_PER_GROUP",
+        1,
+        10,
+        "Open Mac streams per group (a reconnect replacing its own stream always fits)",
+    ),
+    num(
+        "WS_MAX_PER_IP",
+        1,
+        10_000,
+        "Open Mac streams per client IP (IPv6 /64)",
+    ),
+    num(
         "RATE_V2_GATEWAY_PER_SEC",
         1,
         1_000,
@@ -247,11 +289,17 @@ pub const LIMIT_KEYS: &[LimitKey] = &[
 ];
 
 /// Keys whose change always needs a fresh authenticator code (no step-up
-/// window): the gateway switches and the hosted global bucket.
+/// window): the gateway switches and the server-wide buckets and caps.
 pub fn limit_needs_fresh(key: &str) -> bool {
     matches!(
         key,
-        "GATEWAY_OPEN" | "GATEWAY_REQUIRE_LICENCE" | "RATE_GLOBAL_PER_SEC" | "RATE_GLOBAL_BURST"
+        "GATEWAY_OPEN"
+            | "GATEWAY_REQUIRE_LICENCE"
+            | "RATE_GLOBAL_PER_SEC"
+            | "RATE_GLOBAL_BURST"
+            | "RATE_ANON_GLOBAL_PER_SEC"
+            | "RATE_ANON_GLOBAL_BURST"
+            | "WS_MAX_STREAMS"
     )
 }
 
@@ -267,6 +315,13 @@ fn config_values(c: &Config) -> HashMap<&'static str, u32> {
         ("RATE_GLOBAL_BURST", l.global.burst.get()),
         ("RATE_IP_PER_SEC", l.per_ip.per_sec.get()),
         ("RATE_IP_BURST", l.per_ip.burst.get()),
+        ("RATE_ANON_GLOBAL_PER_SEC", l.anon_global.per_sec.get()),
+        ("RATE_ANON_GLOBAL_BURST", l.anon_global.burst.get()),
+        ("RATE_GROUP_PER_SEC", v.rate_group.per_sec.get()),
+        ("RATE_GROUP_BURST", v.rate_group.burst.get()),
+        ("WS_MAX_STREAMS", v.ws_max_streams),
+        ("WS_MAX_MACS_PER_GROUP", v.ws_max_macs_per_group),
+        ("WS_MAX_PER_IP", v.ws_max_per_ip),
         ("RATE_V2_GATEWAY_PER_SEC", v.rate_gateway.per_sec.get()),
         ("RATE_V2_GATEWAY_BURST", v.rate_gateway.burst.get()),
         (

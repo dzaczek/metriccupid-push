@@ -48,8 +48,11 @@ use self::presence::Presence;
 use self::store::{
     Attach, Bind, CreateGroup, Device, GroupLicence, Insert, NewMessage, Store, StoreError, Upsert,
 };
-use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME, MAX_STREAMS};
-use crate::api::{error, invalid, json_error, precheck, too_many, AppState, GlobalClass, Outcome};
+use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME};
+use crate::api::{
+    check_signed_global, error, invalid, json_error, precheck, too_many, AppState, GlobalClass,
+    Outcome,
+};
 use crate::config::Mode;
 use crate::limits::{ip_key, V2Limits};
 use crate::metrics::{ApiTag, Event};
@@ -234,7 +237,7 @@ async fn authenticate(
     let class = if rule == DeviceRule::None {
         GlobalClass::Gateway
     } else {
-        GlobalClass::Hosted
+        GlobalClass::Signed
     };
     precheck(state, ip, now, class)?;
 
@@ -258,7 +261,7 @@ async fn authenticate(
     } else {
         device_id.unwrap_or_default()
     };
-    if let Err(e) = state.auth().verify_v2(
+    let sig = match state.auth().check_v2(
         now,
         &key,
         method,
@@ -268,7 +271,22 @@ async fn authenticate(
         headers,
         body,
     ) {
-        return Err(state.auth_failed(ip, now, e.as_str()));
+        Ok(sig) => sig,
+        Err(e) => return Err(state.auth_error(ip, now, e)),
+    };
+    // Shared buckets only after the signature: anonymous or failed requests
+    // never reach them. The group's own bucket first, so one group's flood
+    // uses up its own quota before the one all signed users share.
+    if let Err(ra) = v2.limits.check_group(group) {
+        return Err((too_many(ra), "rate_limited_group_requests"));
+    }
+    if class == GlobalClass::Signed {
+        check_signed_global(state)?;
+    }
+    // Replay check last: the cache then fills no faster than the buckets
+    // above allow.
+    if let Err(e) = state.auth().remember(sig, now) {
+        return Err(state.auth_error(ip, now, e));
     }
     // Suspended from the admin panel: data kept, every signed route refused.
     if state.controls().is_suspended(group) {
@@ -456,7 +474,7 @@ async fn create_group(
 
 async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outcome {
     let now = state.now();
-    if let Err(o) = precheck(state, ip, now, GlobalClass::Hosted) {
+    if let Err(o) = precheck(state, ip, now, GlobalClass::Anonymous) {
         return o;
     }
     let v2 = state.v2();
@@ -521,6 +539,20 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
         },
         (None, Mode::Hosted) if required && !req.gateway => return licence_required(),
         (None, Mode::Hosted) => None,
+    };
+    // Fallback purchase ids have no per-purchase pool: limit them per IP.
+    let verified = match verified {
+        Some(v) if licence::is_fallback_id(&v.app_transaction_id) => {
+            match v2.limits.check_fallback_attach(ip_key(ip)) {
+                Ok(()) => Some(v),
+                Err(ra) if attach_required => return (too_many(ra), "rate_limited_licence"),
+                Err(_) => {
+                    tracing::info!("open registration: fallback-id licence rate-limited, ignored");
+                    None
+                }
+            }
+        }
+        v => v,
     };
     let gateway_licensed = verified
         .as_ref()
@@ -693,9 +725,14 @@ async fn delete_group(
             })
             .await
             .map_err(storage_error)?;
+        let v2 = state.v2();
         for d in devices {
-            state.v2().hub.remove_device(&a.group, &d.device_id);
+            v2.hub.remove_device(&a.group, &d.device_id);
         }
+        // No stale presence or Live Activity state for a deleted group (a
+        // stream that ends after this is handled in `push_presence`).
+        v2.presence.forget(&a.group);
+        v2.activities.forget_group(&a.group);
         Ok((StatusCode::NO_CONTENT.into_response(), "deleted"))
     }
     .await
@@ -732,6 +769,11 @@ async fn put_licence(
             record_licence(&state, Some(&a.group), "licence.put", "invalid", e.code());
             licence_invalid(e)
         })?;
+        if licence::is_fallback_id(&lic.app_transaction_id) {
+            if let Err(ra) = v2.limits.check_fallback_attach(ip_key(ip)) {
+                return Err((too_many(ra), "rate_limited_licence"));
+            }
+        }
         let (g, max, now) = (a.group.clone(), v2.licence.max_groups, state.now());
         let l = lic.clone();
         let attached = v2
@@ -887,6 +929,7 @@ async fn delete_device(
         {
             Ok(true) => {
                 state.v2().hub.remove_device(&a.group, &device_id);
+                state.v2().activities.forget_device(&a.group, &device_id);
                 Ok((StatusCode::NO_CONTENT.into_response(), "deleted"))
             }
             Ok(false) => Ok((error(StatusCode::NOT_FOUND, "not_found"), "not_found")),
@@ -1306,49 +1349,64 @@ pub async fn push_presence(state: &AppState, group: &str, note: PresenceNote) {
         .await
     {
         Ok(Some(k)) => k,
-        Ok(None) => return,
+        Ok(None) => {
+            // Deleted meanwhile: drop what is left of its state.
+            state.v2().presence.forget(group);
+            state.v2().activities.forget_group(group);
+            return;
+        }
         Err(e) => {
             tracing::error!(error = %e, "presence: cannot load group");
             return;
         }
     };
-    let urgency = match note {
-        PresenceNote::Offline { .. } => Urgency::Critical,
-        PresenceNote::Online { .. } => Urgency::Silent,
-    };
-    let expiration = state.now() + PRESENCE_TTL_SECS;
-    let state_label = match note {
-        PresenceNote::Offline { .. } => "offline",
-        PresenceNote::Online { .. } => "online",
-    };
-    let mut ev = Event::new("presence").group(group).outcome(state_label);
-    if let PresenceNote::Offline { reason, .. } = note {
-        ev = ev.detail(match reason {
-            OfflineReason::Quit => "quit",
-            OfflineReason::Sleep => "sleep",
-            OfflineReason::Disabled => "disabled",
-            OfflineReason::Lost => "lost",
-        });
-    }
-    state.metrics().record(ev);
-    match fan_out(
-        state,
-        group,
-        key,
-        PushContent::Presence(note),
-        urgency,
-        Some(PRESENCE_COLLAPSE_ID.to_string()),
-        expiration,
-    )
-    .await
-    {
-        Ok((pushed, failed, _)) => {
-            tracing::info!(group = %group, state = state_label, pushed, failed, "presence push")
+    let online = matches!(note, PresenceNote::Online { .. });
+    // At most 6 presence pushes per group and hour: beyond that the state
+    // still changes and the Live Activity (silent, coalesced) is still
+    // updated, but no presence notification is pushed.
+    if state.v2().limits.check_presence(group).is_err() {
+        tracing::info!(group = %group, "presence push skipped (per-group limit)");
+        state
+            .metrics()
+            .record(Event::new("presence").group(group).outcome("rate_limited"));
+    } else {
+        let urgency = match note {
+            PresenceNote::Offline { .. } => Urgency::Critical,
+            PresenceNote::Online { .. } => Urgency::Silent,
+        };
+        let expiration = state.now() + PRESENCE_TTL_SECS;
+        let state_label = match note {
+            PresenceNote::Offline { .. } => "offline",
+            PresenceNote::Online { .. } => "online",
+        };
+        let mut ev = Event::new("presence").group(group).outcome(state_label);
+        if let PresenceNote::Offline { reason, .. } = note {
+            ev = ev.detail(match reason {
+                OfflineReason::Quit => "quit",
+                OfflineReason::Sleep => "sleep",
+                OfflineReason::Disabled => "disabled",
+                OfflineReason::Lost => "lost",
+            });
         }
-        Err(e) => tracing::error!(error = %e, "presence: cannot load devices"),
+        state.metrics().record(ev);
+        match fan_out(
+            state,
+            group,
+            key,
+            PushContent::Presence(note),
+            urgency,
+            Some(PRESENCE_COLLAPSE_ID.to_string()),
+            expiration,
+        )
+        .await
+        {
+            Ok((pushed, failed, _)) => {
+                tracing::info!(group = %group, state = state_label, pushed, failed, "presence push")
+            }
+            Err(e) => tracing::error!(error = %e, "presence: cannot load devices"),
+        }
     }
     // The Live Activity shows "Mac offline" too.
-    let online = matches!(note, PresenceNote::Online { .. });
     if let Some(batch) = state.v2().activities.presence(group, online, state.now()) {
         send_activity(state, group, key, batch).await;
     }
@@ -1513,7 +1571,7 @@ pub async fn activity_tick(state: &AppState) {
         let g = group.clone();
         match v2.store.call(move |c| store::group_key(c, &g)).await {
             Ok(Some(key)) => send_activity(state, &group, key, batch).await,
-            Ok(None) => {}
+            Ok(None) => v2.activities.forget_group(&group),
             Err(e) => tracing::error!(error = %e, "activity: cannot load group"),
         }
     }
@@ -2158,58 +2216,87 @@ async fn open_stream(State(state): State<Arc<AppState>>, req: Request) -> Respon
         )
         .await?;
         group = Some(a.group.clone());
-        if state.v2().hub.len() >= MAX_STREAMS {
-            return Err((
-                error(StatusCode::SERVICE_UNAVAILABLE, "too_many_streams"),
-                "too_many_streams",
-            ));
+        let device = a.device_id.clone().unwrap_or_default();
+        // Same rules as `Hub::register`, so replacing the device's own
+        // stream is never refused here.
+        if let Err(full) = state.v2().hub.can_register(&a.group, &device, ip) {
+            let status = match full {
+                stream::HubFull::Server => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::TOO_MANY_REQUESTS,
+            };
+            return Err((error(status, full.code()), full.code()));
         }
         let ws = WebSocketUpgrade::from_request_parts(&mut parts, &state)
             .await
             .map_err(|rej| (rej.into_response(), "not_websocket"))?;
-        let device = a.device_id.clone().unwrap_or_default();
         let st = state.clone();
         let resp = ws
             .max_message_size(MAX_CLIENT_FRAME)
             .max_frame_size(MAX_CLIENT_FRAME)
             .on_upgrade(move |socket| async move {
                 let v2 = st.v2();
-                match v2.hub.register(&a.group, &device) {
-                    // Suspended between `authenticate` and here: the admin
-                    // sets the flag before dropping the group's streams, so
-                    // either that drop sees this registration or this check
-                    // sees the flag.
-                    Ok((id, _rx)) if st.controls().is_suspended(&a.group) => {
-                        v2.hub.unregister(&a.group, &device, id);
-                        let mut socket = socket;
-                        let _ = socket
-                            .send(axum::extract::ws::Message::Close(Some(
-                                axum::extract::ws::CloseFrame {
-                                    code: 1008,
-                                    reason: "group suspended".into(),
-                                },
-                            )))
-                            .await;
-                    }
-                    Ok((id, rx)) => stream::run(socket, st.clone(), a.group, device, id, rx).await,
+                let close = |code: u16, reason: &'static str| {
+                    axum::extract::ws::Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code,
+                        reason: reason.into(),
+                    }))
+                };
+                let mut socket = socket;
+                let reg = match v2.hub.register(&a.group, &device, ip) {
+                    Ok(reg) => reg,
                     Err(_) => {
-                        let mut socket = socket;
-                        let _ = socket
-                            .send(axum::extract::ws::Message::Close(Some(
-                                axum::extract::ws::CloseFrame {
-                                    code: 1013,
-                                    reason: "too many streams".into(),
-                                },
-                            )))
-                            .await;
+                        let _ = socket.send(close(1013, "too many streams")).await;
+                        return;
                     }
+                };
+                if let Err((code, reason)) = admit_stream(&st, &a.group, &device, reg.id).await {
+                    let _ = socket.send(close(code, reason)).await;
+                    return;
                 }
+                stream::run(socket, st.clone(), a.group, device, reg).await
             });
         Ok((resp, "upgraded"))
     }
     .await
     .unwrap_or_else(|o| o);
     finish("stream", ip, started, group.as_deref(), r)
+}
+
+/// Re-check a stream right after it registered in the hub; on refusal it
+/// is unregistered and the close code and reason are returned.
+///
+/// Suspended between `authenticate` and the upgrade: the admin sets the flag
+/// before dropping the group's streams, so either that drop sees this
+/// registration or this check sees the flag. Likewise a device (or group)
+/// deleted meanwhile: the delete removes the stream after deleting the row,
+/// so either it sees this registration or this lookup misses the row.
+pub async fn admit_stream(
+    state: &AppState,
+    group: &str,
+    device: &str,
+    conn_id: u64,
+) -> Result<(), (u16, &'static str)> {
+    let v2 = state.v2();
+    let refused = if state.controls().is_suspended(group) {
+        Some((1008, "group suspended"))
+    } else {
+        let (g, d) = (group.to_string(), device.to_string());
+        match v2.store.call(move |c| store::device(c, &g, &d)).await {
+            Ok(Some(_)) => None,
+            Ok(None) => Some((1008, "unknown device")),
+            Err(e) => {
+                tracing::error!(error = %e, "stream: cannot check device");
+                Some((1011, "storage error"))
+            }
+        }
+    };
+    match refused {
+        Some(r) => {
+            v2.hub.unregister(group, device, conn_id);
+            Err(r)
+        }
+        None => Ok(()),
+    }
 }
 
 /// 403 for gateway registrations while `GATEWAY_OPEN` is off.
@@ -2445,8 +2532,17 @@ async fn gateway_push(
 
 // ----------------------------------------------------------------- debug ---
 
-/// `APNS_MODE=mock` only: the recorded pushes. Unauthenticated, local dev.
-async fn debug_pushes(State(state): State<Arc<AppState>>) -> Response {
+/// `APNS_MODE=mock` only: the recorded pushes. Unauthenticated, local dev:
+/// only for loopback peers (the TCP peer, never a forwarded header), so a
+/// mock-mode server reachable from the network does not hand out device
+/// tokens and envelopes.
+async fn debug_pushes(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if !peer.ip().to_canonical().is_loopback() {
+        return error(StatusCode::NOT_FOUND, "not_found");
+    }
     match &state.v2().mock {
         Some(m) => Json(json!({ "pushes": m.pushes() })).into_response(),
         None => error(StatusCode::NOT_FOUND, "not_found"),
