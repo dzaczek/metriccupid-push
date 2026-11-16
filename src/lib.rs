@@ -151,6 +151,18 @@ impl LimitedListener {
                 .expect("the connection semaphore is never closed");
             let (io, addr) = match self.inner.accept().await {
                 Ok(c) => c,
+                // A client that gave up before the accept: just go on.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tracing::debug!(error = %e, "accept: connection gone");
+                    continue;
+                }
                 // Back off on errors such as EMFILE instead of spinning.
                 Err(e) => {
                     tracing::error!(error = %e, "accept failed");

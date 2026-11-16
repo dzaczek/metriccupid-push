@@ -71,10 +71,11 @@ impl Presence {
 
     /// An offline notice returned by [`Presence::due`] could not be sent
     /// now (rate limit): make it pending again, due at once, so the next
-    /// tick retries it. Nothing happens if a Mac reconnected meanwhile.
+    /// tick retries it. Nothing happens if a Mac reconnected meanwhile, or
+    /// if a newer notice is already pending (it is kept).
     pub fn retry(&self, group: &str, reason: OfflineReason, since: u64, now: u64) {
         let mut map = self.lock();
-        if let Some(g) = map.get_mut(group) {
+        if let Some(g) = map.get_mut(group).filter(|g| g.pending.is_none()) {
             g.notified_offline = false;
             g.pending = Some(Pending {
                 due: now,
@@ -171,6 +172,24 @@ mod tests {
                 PresenceNote::Offline {
                     reason: OfflineReason::Quit,
                     since: 10
+                }
+            )]
+        );
+        // A newer pending notice is not overwritten by a retry.
+        let q = Presence::new(120);
+        q.disconnected("h", None, 20, 20);
+        q.retry("h", OfflineReason::Quit, 5, 21);
+        assert!(
+            q.due(21, OFF).is_empty(),
+            "still the lost notice, due later"
+        );
+        assert_eq!(
+            q.due(140, OFF),
+            vec![(
+                "h".to_string(),
+                PresenceNote::Offline {
+                    reason: OfflineReason::Lost,
+                    since: 20
                 }
             )]
         );

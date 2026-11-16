@@ -96,6 +96,22 @@ async fn async_main(config: Config) -> Result<(), String> {
         tracing::warn!("SECURITY: {w}");
     }
     let resolver = ClientIpResolver::from_config(&config.trust_proxy).await;
+    match &config.trust_proxy {
+        TrustProxy::None => tracing::info!(
+            max_connections_per_ip = config.max_connections_per_ip,
+            "no trusted proxy: every TCP peer is subject to MAX_CONNECTIONS_PER_IP"
+        ),
+        TrustProxy::Cloudflare { extra, .. } => tracing::info!(
+            exempt = %extra.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+            idle_timeout_secs = config.trusted_proxy_idle_timeout.as_secs(),
+            "trusted proxies exempt from MAX_CONNECTIONS_PER_IP: Cloudflare ranges plus CF_IPS_EXTRA"
+        ),
+        TrustProxy::Xff(nets) => tracing::info!(
+            exempt = %nets.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+            idle_timeout_secs = config.trusted_proxy_idle_timeout.as_secs(),
+            "trusted proxies exempt from MAX_CONNECTIONS_PER_IP: TRUST_PROXY xff networks"
+        ),
+    }
     let state = Arc::new(AppState::new(&config, resolver, Arc::new(SystemClock))?);
     spawn_cleanup(state.clone());
     spawn_presence(state.clone());
