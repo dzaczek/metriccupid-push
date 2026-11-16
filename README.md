@@ -307,6 +307,38 @@ beyond that waits and is retried, never dropped), 10 attaches per client IP and 
 Every request body must arrive within 3 s (10 s for `POST /v2/snapshot`), else `408`; then it waits
 at most 1 s for one of 256 request slots shared by all routes, else `503 busy` with `Retry-After: 1`.
 
+### Sizing and load tests
+
+`scripts/loadtest.sh [N] [scenario]` runs `examples/loadgen` against a release build on loopback
+(`APNS_MODE=mock` with `MOCK_APNS_LATENCY_MS=30..80`): N users of 1 Mac (WebSocket stream) and 2
+phones each, at the request rates of PROTOCOL.md (about 75 signed requests per user per hour), with
+ramp, steady, alert-storm, reconnect-storm and abuse scenarios. It writes `target/loadtest/<N>.json`
+and exits non-zero when a latency, correctness, 429 or memory target fails.
+
+Measured with 0.2.5 (8 KiB WebSocket buffers), 10× compressed request rates, one server process:
+
+| Streams | Request rate | Peak RSS | Mean CPU (one core) | p99 reads / command end to end |
+|---|---|---|---|---|
+| 1000 | 208 req/s | 45 MB | 13% | 2.3 ms / 7.4 ms |
+| 5000 | 1038 req/s | 132 MB | 39% | 13 ms / 14 ms |
+
+The defaults (`RATE_GLOBAL` 50/s, `RATE_PRE_AUTH` 200/s, `REPLAY_CAP` 100 000, `WS_MAX_STREAMS`
+1024) suit a self-hosted relay and carry a hosted one to about 500 users. Beyond that:
+
+| Users | `RATE_GLOBAL_PER_SEC` / `_BURST` | `RATE_PRE_AUTH_*` | `REPLAY_CAP` | `WS_MAX_STREAMS` | `MAX_CONNECTIONS` (nofile above it) | Memory limit |
+|---|---|---|---|---|---|---|
+| ≤ 500 | defaults | defaults | defaults | defaults | 3500 (4096) | 192 MB |
+| 1000 | 100 / 300 | defaults | defaults | 1500 | 3500 (4096) | 192 MB |
+| 2500 | 200 / 600 | 300 / 600 | 150 000 | 3500 | 8192 (16384) | 192 MB |
+| 5000 | 400 / 1200 | 400 / 1200 | 260 000 | 6000 | 16384 (32768) | 256 MB |
+
+- Behind cloudflared every stream is its own TCP connection to the relay, so `MAX_CONNECTIONS` and
+  the container's `nofile` limit must stay above the number of streams plus the polling phones.
+- The rate and stream limits can be raised from the admin panel's **Limits** page without a
+  restart; `MAX_CONNECTIONS`, `nofile` and the memory limit need a container restart.
+- After a restart, 1000 Macs reconnect within 2 s with the raised limits and within about 35 s with
+  the defaults (stream upgrades are rate-limited, clients retry with backoff).
+
 ### Data and backups
 
 The database holds group ids with their `auth_key`, device names and APNs tokens, and ciphertext with
