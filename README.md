@@ -79,15 +79,21 @@ none of them set, `/v1/notify` returns `404` and only v2 runs. The v2 variables 
 | `ALLOW_EMERGENCY` | `false` | Allow priority `2` (Pushover emergency: repeats every 60 s for up to 1 h until acknowledged). Otherwise `403`. |
 | `DEDUP_WINDOW_SECS` | `300` | A second request with the same `dedup_key` inside this window is answered `deduplicated` and not sent. `0` disables. |
 | `QUOTA_RESERVE` | `500` | When Pushover's `X-Limit-App-Remaining` drops below this, only priority `>= 1` is sent; lower priorities get `503`. |
-| `RATE_GLOBAL_PER_SEC` / `RATE_GLOBAL_BURST` | `50` / `100` | Token bucket for all requests. |
+| `RATE_GLOBAL_PER_SEC` / `RATE_GLOBAL_BURST` | `50` / `100` | Token bucket for authenticated requests. v2 checks it only after the signature has verified, so anonymous or failing traffic cannot drain it; v1 checks it before authentication. |
+| `RATE_ANON_GLOBAL_PER_SEC` / `RATE_ANON_GLOBAL_BURST` | `20` / `60` | Token bucket for anonymous work: `POST /v2/groups` and requests that fail authentication (those get `429` instead of `401` while it is empty). |
 | `RATE_IP_PER_SEC` / `RATE_IP_BURST` | `5` / `20` | Token bucket per client IP (IPv6 grouped by /64). Checked before authentication. |
 | `RATE_SECRET_PER_SEC` / `RATE_SECRET_BURST` | `2` / `30` | Token bucket per relay secret (after authentication). |
 | `AUTH_BAN_THRESHOLD` | `10` | Auth failures from one IP within the window that trigger a ban. |
 | `AUTH_BAN_WINDOW_SECS` | `900` | Window for counting auth failures. |
 | `AUTH_BAN_SECS` | `900` | Ban length. Banned IPs get `429` with `Retry-After`. |
+| `AUTH_ABUSE_THRESHOLD` | `100` | IP-keyed `429` answers (per-IP bucket, anonymous bucket, group registration) to one IP (IPv6 /64) within the abuse window that ban it, like auth failures. Group-keyed limits and `POST /v2/gateway/push` never count. |
+| `AUTH_ABUSE_WINDOW_SECS` | `60` | Window for counting those answers. |
+| `AUTH_ABUSE_BAN_SECS` | `900` | Ban length after sustained rate limiting. |
+| `REPLAY_CAP` | `100000` | Signatures the replay cache holds (10 min each). When it is full of live entries, signed requests get `503 busy` (`Retry-After: 1`) instead of evicting one that could still be replayed. Keep it above `RATE_GLOBAL_PER_SEC × 600 + RATE_GLOBAL_BURST` (a startup warning says so). |
+| `MAX_CONNECTIONS` | `8192` | Open TCP connections on the API listener, WebSocket streams included. At the cap the server stops accepting; new clients wait in the listen backlog. Accepted connections get TCP keepalive (60 s idle, 15 s interval). |
 | `LOG_FORMAT` | `text` | `text` or `json`. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace`. |
-| `PUSHOVER_API_URL` | `https://api.pushover.net/1/messages.json` | Override for tests only. |
+| `PUSHOVER_API_URL` | `https://api.pushover.net/1/messages.json` | Override for tests only. Must be `https://`; `http://` only to `127.0.0.1`, `::1` or `localhost`. |
 | `TUNNEL_TOKEN` | empty | Used by the `cloudflared` Compose service only. |
 
 Fixed limits: request body 8 KB (`413`), request timeout 10 s, 64 requests in flight, upstream timeout
@@ -241,7 +247,8 @@ APNs only accepts pushes signed with the provider key of the team that ships the
 self-hosted server for the App Store app needs the gateway. In gateway mode the mailbox, command queue
 and WebSocket stay on your server; the gateway only receives, per push, the device token and the
 ciphertext (PROTOCOL.md section 9). `APNS_MODE=mock` records pushes in memory for development and
-exposes them at `GET /v2/debug/pushes`.
+exposes them at `GET /v2/debug/pushes` to loopback clients only (the TCP peer, never a forwarded
+header). `MODE=hosted` with `APNS_MODE=mock` logs a `SECURITY` error at startup.
 
 ### v2 configuration
 
@@ -253,7 +260,7 @@ exposes them at `GET /v2/debug/pushes`.
 | `APNS_KEY_ID` | required for `direct` | 10-character key id. |
 | `APNS_TEAM_ID` | required for `direct` | 10-character team id. |
 | `APNS_TOPIC` | `cat.sysop.MetricCupid` | iOS app bundle id (`apns-topic`). |
-| `GATEWAY_URL` | `https://push-metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. |
+| `GATEWAY_URL` | `https://push-metriccupid.sysop.cat` | Gateway for `APNS_MODE=gateway`. Must be `https://` (every group's `auth_key` goes there); `http://` only to a loopback host. |
 | `GATEWAY_OPEN` | `false` | Hosted only: relay APNs for self-hosted servers (`/v2/gateway/push`). Off by default; while off, gateway registrations and pushes get `403 gateway_closed`, so self-hosters need their own APNs key. Only groups registered with `gateway: true` while it is on are gateway groups; an existing group becomes one when its server registers the same `group_id` and key again. **Before rolling back to 0.2.0** (which lacks the gateway checks of PROTOCOL.md section 9) set `GATEWAY_OPEN=false`. |
 | `GATEWAY_REQUIRE_LICENCE` | `false` | Hosted gateway, strict mode: a `gateway: true` registration needs a valid licence (`402 licence_required` without one, `403` for an invalid or revoked one). Off (compatible): a licence is optional and only doubles the gateway quotas. Shipped Macs (1.33.3) never send a licence to a self-hosted server, so turn this on only after a Mac release that does. |
 | `GATEWAY_SANDBOX_LICENCES_COUNT` | `true` | TestFlight (`sandbox`) licences count as licensed for the gateway (quotas, strict mode). `false`: only App Store (`production`) purchases do. |
@@ -274,13 +281,21 @@ exposes them at `GET /v2/debug/pushes`.
 | `RATE_V2_COMMANDS_PER_SEC` / `_BURST` | `1` / `20` | Per-group bucket for `POST /v2/commands`. |
 | `RATE_V2_GATEWAY_PER_SEC` / `_BURST` | `1` / `30` | Hosted: per-group bucket for gateway pushes (licensed groups: twice). |
 | `RATE_V2_GROUPS_PER_HOUR` / `RATE_V2_GROUPS_BURST` | `6` / `3` | Per-IP bucket for `POST /v2/groups`. |
+| `RATE_GROUP_PER_SEC` / `RATE_GROUP_BURST` | `5` / `60` | Per-group bucket over **every** signed route together (checked after the signature, before `RATE_GLOBAL_*`), on top of the per-route buckets: one group cannot use more than its share. `429` with `Retry-After`. |
+| `WS_MAX_STREAMS` | `1024` | Open Mac streams on the server; new ones beyond get `503 too_many_streams`. A device replacing its own stream (reconnect) always fits. |
+| `WS_MAX_MACS_PER_GROUP` | `3` | Open Mac streams per group; a further Mac gets `429 too_many_group_streams` (its reconnects still fit). |
+| `WS_MAX_PER_IP` | `20` | Open Mac streams per client IP (IPv6 /64); beyond: `429 too_many_ip_streams`. |
 | `WS_PING_SECS` | `30` | WebSocket ping interval; idle streams are closed after 2 intervals + 5 s. |
 | `V2_SNAPSHOT_MAX_BYTES` | `196608` | Max base64 length of a snapshot's `sealed` (`POST /v2/snapshot`, the iPhone's Active tab; PROTOCOL.md 6.6a). 1024 to 1048576. Only that route accepts bodies above 16 KB. |
 | `MAC_OFFLINE_GRACE_SECS` | `120` | When a group's last Mac stream drops without a `bye`, wait this long before telling the phones "MetricCupid is offline on your Mac" (reconnects within it stay silent). `0` = immediately. A `bye` (quit, sleep, Phone & Watch turned off) is announced at once. |
-| `APNS_PRODUCTION_URL` / `APNS_SANDBOX_URL` | Apple's | Overrides for tests only. |
+| `APNS_PRODUCTION_URL` / `APNS_SANDBOX_URL` | Apple's | Overrides for tests only. `https://`, or `http://` to a loopback host. |
 
 The v1 per-IP, global and auth-ban limits apply to every v2 route too. Fixed limits: 16 KB v2 body,
-10 devices per group, mailbox 24 h / 500 messages, command queue 1 h / 200, 1024 streams.
+10 devices per group, mailbox 24 h / 500 messages, command queue 1 h / 200, command ids remembered
+25 h and message ids 24 h 10 min (up to 5000 per group) after their first post, 6 presence pushes
+per group and hour, 10 attaches per client IP and day for a licence without `appTransactionId`.
+Every request body must arrive within 3 s (10 s for `POST /v2/snapshot`), else `408`; then it waits
+at most 1 s for one of 256 request slots shared by all routes, else `503 busy` with `Retry-After: 1`.
 
 ### Data and backups
 
@@ -290,6 +305,11 @@ with the same id and key, phones re-register). A backup is optional; if you take
 `sqlite3 metriccupid-push.sqlite3 ".backup b.sqlite3"` rather than copying files under WAL. With a
 bind mount instead of the named volume, `chown 65532:65532` the directory (the container runs as
 `nonroot`).
+
+0.2.3 adds the tables `command_ids` and `message_ids` (id tombstones: group id, id, cursor, first
+seen; no content) the same way as the 0.2.1 / 0.2.2 tables (`CREATE TABLE IF NOT EXISTS`, schema
+version stays 6), so a rollback to 0.2.2 or 0.2.1 needs no database restore; those versions ignore
+the tables (and so lose the duplicate protection of PROTOCOL.md 6.5 / 6.7 while they run).
 
 ### Privacy model
 
@@ -452,7 +472,7 @@ The groups list also filters on `suspended=yes|no`.
 | `ADMIN_USER` | required | Login name. |
 | `ADMIN_PASSWORD_HASH` | required | argon2id PHC string from `admin-setup`. |
 | `ADMIN_TOTP_SECRET` | required | Base32 TOTP secret (RFC 6238, SHA-1, 6 digits, 30 s) from `admin-setup`. |
-| `ADMIN_ALLOW_IPS` | required | Comma-separated CIDRs (IPv4 / IPv6; a bare IP is a /32 or /128) allowed to reach the panel, checked on the real client IP from `TRUST_PROXY`. Anyone else gets the same plain `404` as an unknown public route. Empty: the panel does not start. |
+| `ADMIN_ALLOW_IPS` | required | Comma-separated CIDRs (IPv4 / IPv6; a bare IP is a /32 or /128) allowed to reach the panel, checked on the real client IP from `TRUST_PROXY`. Anyone else gets the same plain `404` as an unknown public route. Empty: the panel does not start. `0.0.0.0/0` or `::/0` counts as `ADMIN_ALLOW_ANY=true` (same Access requirement and warning). |
 | `ADMIN_ALLOW_ANY` | `false` | `true` allows every IP when `ADMIN_ALLOW_IPS` is empty. Only together with `ADMIN_CF_ACCESS_*` (or `ADMIN_ALLOW_ANY_WITHOUT_ACCESS=true`). |
 | `ADMIN_CF_ACCESS_TEAM` | unset | Cloudflare Zero Trust team name (`j23`) or team domain (`j23.cloudflareaccess.com`). With `ADMIN_CF_ACCESS_AUD`, every admin request must carry a valid Cloudflare Access JWT, else `404` (see below). Set both or neither. |
 | `ADMIN_CF_ACCESS_AUD` | unset | Application Audience (AUD) tag(s) of the Access application, comma-separated. |
@@ -516,8 +536,8 @@ code typed into the form that was not used before (for a login or an action) ope
 window** on the server-side session: for 5 minutes, and at most 10 actions, the code field may be
 left empty. The window is bound to the session, the admin's /24 or /48 and the Cloudflare Access
 identity, is shown in the page header, and ends with logout. These always need a fresh code:
-licence revoke / restore, changes of `GATEWAY_OPEN`, `GATEWAY_REQUIRE_LICENCE` and
-`RATE_GLOBAL_*`, and bans broader than IPv4 /24 or IPv6 /48. Wrong or reused codes count toward the
+licence revoke / restore, changes of `GATEWAY_OPEN`, `GATEWAY_REQUIRE_LICENCE`,
+`RATE_GLOBAL_*`, `RATE_ANON_GLOBAL_*` and `WS_MAX_STREAMS`, and bans broader than IPv4 /24 or IPv6 /48. Wrong or reused codes count toward the
 login lockout (5 per IP in 15 min lock logins *and* actions). Each action, each refused code and
 each refused input is written to the **audit log** (`/admin/audit`: time, admin user plus
 Cloudflare Access e-mail, /24 or /48, action, target, detail with `stepup=fresh` or
@@ -530,7 +550,7 @@ delete it. Rows are kept 90 days, at most 100 000.
 | **Gateway** | Gateway groups with licence state, join date, token count, last use, pushes sent in the last hour, refusals (`token_bound`, `not_gateway_group`, `token_limit`, ...). Per group: unbind one token (tokens are shown as a SHA-256 fingerprint only), remove the group from the gateway (membership deleted, tokens unbound). Removal is a **reset**, not a block: the group can register again while the gateway is open. Suspension is the block. |
 | **Groups** (detail page) | Suspend / unsuspend with a reason. A suspended group gets `403 group_suspended` on every signed route and on `POST /v2/groups` (no re-registration, licence attach or gateway re-add), its streams are closed, nothing is pushed to its phones; its data is kept. |
 | **Licences** | Revoke / restore an App Store purchase by its `appTransactionId`. Takes effect at once for groups already using it: hosted groups count as unlicensed (per `LICENCE_MODE`), gateway groups lose the licensed quotas and, with `GATEWAY_REQUIRE_LICENCE=true`, get `402` at push. Purchase ids are never shown, only a fingerprint (first 12 hex digits of the SHA-256). `LICENCE_REVOKED_TX` entries are listed but can only be removed in the environment. |
-| **Limits** | Effective values of `RATE_GLOBAL_*`, `RATE_IP_*`, `RATE_V2_GATEWAY_*`, `GATEWAY_GROUP_*`, `GATEWAY_GLOBAL_*`, `GATEWAY_MAX_TOKENS_PER_GROUP`, `GATEWAY_MAX_GROUPS`, `GATEWAY_OPEN` (kill switch) and `GATEWAY_REQUIRE_LICENCE`, with a per-key override applied without a restart (a changed rate replaces its limiter, whose buckets start full) and kept across restarts until **reset to config**. Overrides must stay within fixed ranges (shown on the page; `RATE_GLOBAL_*` cannot go below 20, so the panel cannot throttle the whole public API). |
+| **Limits** | Effective values of `RATE_GLOBAL_*`, `RATE_ANON_GLOBAL_*`, `RATE_IP_*`, `RATE_GROUP_*` (burst at least 10), `WS_MAX_STREAMS` (16 to 100 000), `WS_MAX_MACS_PER_GROUP` (1 to 10), `WS_MAX_PER_IP`, `RATE_V2_GATEWAY_*`, `GATEWAY_GROUP_*`, `GATEWAY_GLOBAL_*`, `GATEWAY_MAX_TOKENS_PER_GROUP`, `GATEWAY_MAX_GROUPS`, `GATEWAY_OPEN` (kill switch) and `GATEWAY_REQUIRE_LICENCE`, with a per-key override applied without a restart (a changed rate replaces its limiter, whose buckets start full) and kept across restarts until **reset to config**. Overrides must stay within fixed ranges (shown on the page; `RATE_GLOBAL_*` cannot go below 20, so the panel cannot throttle the whole public API). |
 
 The management state lives in SQLite tables added like the 0.2.1 gateway tables (`CREATE TABLE IF
 NOT EXISTS`, schema version stays 6): `admin_audit`, `manual_bans`, `group_suspensions`,
@@ -576,14 +596,20 @@ blocks the API.
 ## Security model and limits
 
 - **Authentication**: HMAC-SHA256 over timestamp, method, path and body; 300 s clock window; replay
-  cache of accepted signatures (10 min, up to 100 000 entries, oldest evicted first). Failed checks
+  cache of accepted signatures (10 min, up to `REPLAY_CAP` entries; when full, signed requests get
+  `503` rather than an entry being evicted). Timestamps from before the process started are refused
+  (the cache is in memory, so nothing signed before a restart can be replayed after it); a client
+  whose clock is a little behind sees one `401` that does not count toward a ban. Failed checks
   return the same generic `401`.
-- **Abuse**: per-IP and global token buckets are checked *before* the HMAC work; per-secret bucket
-  after. 10 auth failures from one IP within 15 min ban it for 15 min. All maps are bounded and swept
-  every 30 s.
-- **Resource limits**: 8 KB body (v1) / 16 KB (v2), 10 s request timeout, 64 concurrent requests
-  (WebSocket streams are capped separately at 1024), 8 s Pushover / 5 s APNs timeout, Compose limits
-  of 64 MB RAM and 0.5 CPU.
+- **Abuse**: the per-IP bucket (and, for v1, the global one) is checked *before* the HMAC work; v2
+  checks the per-group and authenticated global buckets after the signature, so failed or
+  anonymous requests (which draw from `RATE_ANON_GLOBAL_*`) never starve signed users. 10 auth
+  failures from one IP within 15 min ban it for 15 min, and so do 100 IP-keyed `429`s within 60 s
+  (`AUTH_ABUSE_*`). All maps are bounded and swept every 30 s.
+- **Resource limits**: 8 KB body (v1) / 16 KB (v2), bodies read within 3 s (10 s for the snapshot)
+  before any work, 10 s request timeout, 256 request slots shared by all routes with a 1 s wait
+  (then `503`), `MAX_CONNECTIONS` open connections, WebSocket streams capped per server, group and
+  IP (`WS_MAX_*`), 8 s Pushover / 5 s APNs timeout, Compose limits of 64 MB RAM and 0.5 CPU.
 - **Logging**: status, client IP, latency and an outcome label only. Secrets, the Pushover token/user
   key and message contents are never logged.
 - **Container**: static binary (SQLite compiled in) on `distroless/static:nonroot`, no shell,

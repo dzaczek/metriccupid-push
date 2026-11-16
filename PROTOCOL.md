@@ -297,6 +297,21 @@ A receiver MUST, in this order:
 A Mac MUST execute a command only if `action` is in the `actions` it sent for that `alert_id`.
 Delivery is at least once (section 7); step 4 makes execution at most once per device.
 
+**Command replay (recommended for receivers, required in a future version).** With the rules above
+a command is accepted for 24 h (step 3) but its id only has to be remembered for 1 h (step 4), so a
+command captured once could be executed again 1 to 24 h later. Since 0.2.3 the server remembers
+every command id for 25 h after its first post, also after the ack and after the queue entry
+expired, and answers a re-post `duplicate` with the original cursor (section 6.7): nobody holding
+the group's `auth_key` can queue the same command twice through the server. That does not protect
+against a malicious server operator or a replayed stream frame, so receivers SHOULD:
+
+- accept a **command** only if `|now - ts| <= 3900` (1 h plus twice the signature skew, plus
+  margin), instead of 86400;
+- keep seen command ids for **25 h**, persisted across restarts (not only in memory).
+
+The server does not change the 86400 s rule for clients: Mac 1.34 accepts command timestamps up to
+24 h old and its phones re-post with the same id, both of which keep working.
+
 ### 4.5 Collapse id
 
 So that a result (or a re-sent alert) replaces the earlier notification on the phone without telling
@@ -339,10 +354,21 @@ string_to_sign = "{timestamp}\n{METHOD}\n{target}\n{group_id}\n{device_id}\n{raw
 - `raw body` is the exact bytes sent; empty for GET and DELETE and for the WebSocket upgrade.
 - There is no newline after the body.
 
-The server rejects: a timestamp more than 300 s from its clock; an unknown group; a bad signature;
-and any signature it has already accepted in the last 10 minutes (replay). All of these return the
-same `401 {"error":"unauthorized"}`. Ten failures from one IP within 15 minutes ban that IP for 15
-minutes (`429`).
+The server rejects: a timestamp more than 300 s from its clock; a timestamp from before the server
+process started (its replay cache is in memory; such a request is not counted toward a ban); an
+unknown group; a bad signature; and any signature it has already accepted in the last 10 minutes
+(replay). All of these return the same `401 {"error":"unauthorized"}`. Ten failures from one IP
+within 15 minutes ban that IP for 15 minutes (`429`), and so do 100 rate-limited answers to one IP
+within 60 s (`AUTH_ABUSE_*`). If the replay cache is full the server answers `503 busy` with
+`Retry-After: 1` rather than forget a signature that is still valid.
+
+Rate limits around the signature: the per-IP bucket comes first; once the signature has verified,
+the group's bucket over all signed routes (`RATE_GROUP_*`, default 5/s, burst 60) and the
+authenticated global bucket (`RATE_GLOBAL_*`). Requests that fail authentication, and `POST
+/v2/groups`, draw from a separate anonymous bucket (`RATE_ANON_GLOBAL_*`) instead, so they cannot
+starve signed clients. A request body must arrive within 3 s (10 s for `POST /v2/snapshot`), else
+`408`; if the server is saturated a request waits at most 1 s and then gets `503 busy` with
+`Retry-After: 1`. Clients SHOULD honour `Retry-After` on `429` and `503`.
 
 Consequences for clients:
 
@@ -493,7 +519,10 @@ waits for the APNs answers:
 {"status": "stored", "cursor": 42, "pushed": 1, "failed": 0, "unregistered": 0}
 ```
 
-A repeated `id` (within 24 h) returns `200 {"status":"duplicate","cursor":42}` without a new push.
+A repeated `id` returns `200 {"status":"duplicate","cursor":42}` (the cursor it was first stored
+under) without a new push, for 24 h 10 min after the first post: the server keeps a tombstone of the
+id after the message left the mailbox (500 cap, newer summary, expiry), up to the newest 5000 ids per
+group. A re-posted older summary is therefore a duplicate too and never replaces the newest one.
 `413 payload_too_large` if the APNs payload would exceed 4096 bytes (nothing is stored),
 `429 rate_limited` above the per-group limit (default 2/s, burst 60). Tokens APNs reports as invalid
 are removed (`unregistered`).
@@ -622,8 +651,12 @@ Mac in the group:
 
 `delivered: true` means a Mac stream took the frame (it may still fail to execute it; wait for the
 `result`). `queued` means no Mac is online: show "Mac offline, queued". Queued commands expire after
-1 h. A repeated id returns `{"status":"duplicate","delivered":false,...}`. `429 queue_full` when 200
-commands are pending, `429 rate_limited` above the per-group limit (default 1/s, burst 20).
+1 h. A repeated id returns `{"status":"duplicate","delivered":false,"cursor":7}` with the cursor it
+was first queued under, for **25 h** after the first post, also after the Mac acked it or it
+expired (section 4.4): the command is not queued or delivered again. Retries with the same id are
+therefore safe, but a command that expired unexecuted is not re-queued by a retry with its old id;
+send it with a new id. `429 queue_full` when 200 commands are pending, `429 rate_limited` above the
+per-group limit (default 1/s, burst 20).
 
 ### 6.8 `GET /v2/commands?since=<cursor>` and `POST /v2/commands/ack` (Mac)
 
@@ -642,7 +675,7 @@ result.
 - `GET /healthz`: `200 ok`.
 - Live Activity routes: section 6.10.
 - `GET /v2/debug/pushes`: only with `APNS_MODE=mock`; the recorded pushes. Unauthenticated, for local
-  development only.
+  development only, and answered only when the TCP peer is a loopback address (`404` otherwise).
 - `POST /v2/gateway/push`: only with `MODE=hosted`, section 9.
 - `PUT /v2/licence`: only with `MODE=hosted`, section 13.
 
@@ -705,7 +738,9 @@ Push targets:
   the group's activity tokens.
 - With an `update` whose `critical` is above 0, a phone with a start token and no running activity
   gets an `event: "start"` push (push-to-start), at most once per 8 h per phone (the started
-  activity may not get to register its token).
+  activity may not get to register its token). Once the phone registered an `update` token after
+  such a start (the activity came up), the next start may follow 1 h after the previous one; a
+  token registration no longer resets the limit at once, so a phone cannot trigger starts at will.
 - When the Mac goes offline or comes back (section 7a), the latest state is sent again with
   `mac_online` false / true.
 
@@ -737,6 +772,12 @@ body, the Mac's `device_id`). `URLSessionWebSocketTask` with a `URLRequest` carr
 works. Only Macs may connect; one stream per device: a new connection closes the previous one
 (close code 1000, reason `replaced`).
 
+Quotas, checked before the upgrade: streams per server (`WS_MAX_STREAMS`, `503 too_many_streams`),
+Mac streams per group (`WS_MAX_MACS_PER_GROUP`, default 3, `429 too_many_group_streams`) and per
+client IP (`WS_MAX_PER_IP`, default 20, `429 too_many_ip_streams`). A connection that replaces the
+device's own stream is never refused by the first two. A stream whose device (or group) is deleted
+while it is being opened is closed with 1008 right after the upgrade.
+
 Server to Mac, text frames:
 
 ```json
@@ -746,7 +787,9 @@ Server to Mac, text frames:
 
 On connect the server first sends every queued command (backlog), then `ready`. After `ready`, new
 commands arrive as they are posted. The same command can arrive more than once (backlog and live,
-reconnects, several Macs): dedupe by `id` (section 4.4).
+reconnects, several Macs): dedupe by `id` (section 4.4). If a Mac does not read its stream and 64
+frames are waiting, the server closes the stream with **1013** (`backlog`) instead of dropping
+further commands: on reconnect the backlog (every unacked command) is sent again.
 
 Mac to server, text frames:
 
@@ -774,7 +817,10 @@ The server tells the group's phones when alerts stop reaching them because no Ma
   with the same `apns-collapse-id`, so it replaces the offline one.
 - The server never sends the same state twice in a row, and never announces a Mac's first connect.
   The state is kept in memory: after a server restart nothing is pending and a reconnecting Mac is
-  not announced.
+  not announced. Deleting the group (or the last trace of it) drops that state.
+- At most 6 presence pushes per group and hour: beyond that the state still changes and the Live
+  Activity's `mac_online` is still updated (silent, coalesced), but no presence notification is
+  sent, so a connect / `bye` loop cannot page the phones without limit.
 
 APNs payload (built by the server; `apns-collapse-id: mc-presence`, `apns-expiration` = now + 1 h,
 `apns-priority` 10 offline / 5 back online):
@@ -951,18 +997,29 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 | Devices per group | 10 | no |
 | Mailbox | 24 h, 500 per group | no |
 | Command queue | 1 h, 200 per group | no |
+| Duplicate window: message ids | 24 h 10 min, newest 5000 per group | no |
+| Duplicate window: command ids | 25 h | no |
+| Signed requests per group (all routes) | 5/s, burst 60 | `RATE_GROUP_*` |
+| Anonymous work (registrations, failed auth) | 20/s, burst 60 | `RATE_ANON_GLOBAL_*` |
+| Body arrival | 3 s (snapshot 10 s), then `408` | no |
+| Wait for a request slot | 1 s (256 slots), then `503` | no |
+| Open connections | 8192 | `MAX_CONNECTIONS` |
+| Rate-limited answers before a ban | 100 in 60 s, ban 15 min | `AUTH_ABUSE_*` |
+| Replay cache | 100 000 signatures | `REPLAY_CAP` |
+| Presence pushes per group | 6 per hour (state still updated) | no |
+| Licence attaches without `appTransactionId` per IP | 10 per day | no |
 | Messages per group | 2/s, burst 60 | `RATE_V2_MESSAGES_*` |
 | Commands per group | 1/s, burst 20 | `RATE_V2_COMMANDS_*` |
-| Gateway pushes per group | 5/s, burst 50 | `RATE_V2_GATEWAY_*` |
+| Gateway pushes per group | 1/s, burst 30 | `RATE_V2_GATEWAY_*` |
 | `POST /v2/activity-state` per group | 1 per 5 s, burst 10 | no |
 | `POST /v2/snapshot` per group | 1 per 5 s, burst 5 | no |
 | `POST /v2/heartbeat` per group | 1 per 10 min, burst 3 | no |
 | Snapshot `sealed` | 192 KB (196 608 base64 characters); body + 1 KB | `V2_SNAPSHOT_MAX_BYTES` |
 | Live Activity pushes per group | at most 1 per 5 s (coalesced; `end` immediate) | no |
-| Push-to-start per phone | 1 per 8 h | no |
+| Push-to-start per phone | 1 per 8 h; 1 per hour once a start was followed by an `update` token | no |
 | Group registrations per IP | 6/h, burst 3 | `RATE_V2_GROUPS_*` |
 | Groups per App Store purchase (hosted) | 3 | `LICENCE_MAX_GROUPS` |
-| Streams per server | 1024 | no |
+| Streams per server / per group / per IP | 1024 / 3 / 20 | `WS_MAX_STREAMS`, `WS_MAX_MACS_PER_GROUP`, `WS_MAX_PER_IP` |
 | Mac offline grace (lost stream, no `bye`) | 120 s | `MAC_OFFLINE_GRACE_SECS` |
 | Per-IP, global, auth-failure bans | as v1 | as v1 |
 
@@ -970,9 +1027,10 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 
 `unauthorized` (401), `unknown_device`, `wrong_device_kind`, `licence_invalid` (with `reason`),
 `licence_in_use`, `group_suspended` (403), `not_found` (404), `group_exists`, `device_limit` (409),
-`licence_required` (402), `payload_too_large` (413),
-`rate_limited`, `queue_full` (429), `invalid_request` (400, with `detail`), `storage_error` (500),
-`gateway_error`, `upstream_error` (502), `too_many_streams` (503).
+`licence_required` (402), `request_timeout` (408), `payload_too_large` (413),
+`rate_limited`, `queue_full`, `too_many_group_streams`, `too_many_ip_streams` (429),
+`invalid_request` (400, with `detail`), `storage_error` (500), `gateway_error`, `upstream_error`
+(502), `too_many_streams`, `busy` (503, `Retry-After: 1`).
 
 `group_suspended`: the operator suspended the group (admin panel). Every signed request of the group,
 including `GET /v2/stream` and `POST /v2/gateway/push`, gets it after a valid signature, and so does
@@ -1047,7 +1105,10 @@ A purchase is identified by `appTransactionId`. If the payload has none (older O
 `sha256:` + hex SHA-256 of `"{originalPurchaseDate}|{appAppleId}|{originalPlatform}"` (missing values
 as `0` / empty). One purchase may be attached to at most `LICENCE_MAX_GROUPS` (default 3) groups;
 another group gets `403 licence_in_use`, as does a fourth new attach of one purchase within 24 h
-(deleting a group frees a slot, not an attach). Purchase ids on the operator's revocation list
+(deleting a group frees a slot, not an attach). A `sha256:` stand-in id can be shared by unrelated
+buyers (same purchase time and platform, TestFlight), so it is not counted against these limits;
+instead at most 10 such attaches per client IP and day are accepted (`429 rate_limited` beyond in
+`app_transaction` mode; in `open` mode the licence is ignored). Purchase ids on the operator's revocation list
 (`LICENCE_REVOKED_TX`, or revoked in the admin panel) are refused with `403 licence_invalid`,
 `reason: revoked`. A revocation also applies at once to groups the purchase is already attached to:
 they count as unlicensed (`402 licence_required` on sending routes in `app_transaction` mode,

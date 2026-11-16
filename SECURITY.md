@@ -24,7 +24,14 @@ content; leaking APNs tokens, sealed blobs or keys in responses or logs;
 abuse of the gateway to send notifications with arbitrary text (including
 Live Activity text), to push to a token that belongs to a hosted user or to
 another gateway user's active phone, or to exhaust quotas shared with hosted
-users; client IP spoofing through an over-broad `CF_IPS_EXTRA`.
+users; client IP spoofing through an over-broad `CF_IPS_EXTRA`; getting the
+server to queue or push the same command or message id twice within its
+duplicate window (25 h for commands, 24 h 10 min for messages), or to accept
+a signature from before a restart; one group, IP or anonymous client starving
+other tenants of streams, request slots or the authenticated rate bucket
+(slow bodies, stream floods, registration floods) or sustaining rate-limited
+floods without being banned; reaching `/v2/debug/pushes` from a non-loopback
+peer.
 For the admin panel: reaching it past the allowlist or Cloudflare Access check,
 performing a management action (ban, unban, gateway unbind or removal, group
 suspension, licence revocation or restore, limit override) without a session,
@@ -41,3 +48,10 @@ or secrets in panel pages.
 Out of scope: volumetric DDoS against an origin exposed without a proxy
 (put Cloudflare or a Tunnel in front, see README), and issues that require
 access to the relay's environment or `RELAY_SECRETS`.
+
+Known limits (by design, see PROTOCOL.md 4.4): the server's duplicate window
+stops other holders of a group's `auth_key` from re-queueing a command, but
+not a malicious server operator replaying a stream frame; only the receiver's
+own id memory and timestamp window (recommended: 3900 s for commands, ids kept
+25 h on disk) protect against that. Deleting a device or group is not key
+rotation: a device that kept the group secret can register again.
