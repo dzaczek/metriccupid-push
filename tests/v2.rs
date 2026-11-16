@@ -3864,3 +3864,46 @@ async fn before_boot_requests_draw_from_the_anonymous_bucket() {
         "signed users unaffected"
     );
 }
+
+/// Review (cloudflared keep-alive): an idle keep-alive connection from a
+/// trusted proxy survives past HEADER_READ_TIMEOUT_SECS (10 s) and still
+/// serves a request (TRUSTED_PROXY_IDLE_TIMEOUT_SECS, 120 s, is above
+/// cloudflared's 90 s); one from an untrusted peer is closed.
+#[tokio::test]
+async fn trusted_proxy_keep_alive_outlives_the_header_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_d1, trusted) = server(&[("TRUST_PROXY", "xff:127.0.0.1/32")]).await;
+    let (_d2, plain) = server(&[]).await;
+    let request = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+    // One request each, then idle on the same connection.
+    let open = |base: String| async move {
+        let mut t = tokio::net::TcpStream::connect(base.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        t.write_all(request).await.unwrap();
+        let mut buf = [0u8; 256];
+        let n = t.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"));
+        t
+    };
+    let (mut a, mut b) = tokio::join!(open(trusted.base.clone()), open(plain.base.clone()));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    // Trusted proxy: the idle connection is still usable.
+    a.write_all(request).await.unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(5), read_status_line(&mut a))
+        .await
+        .unwrap();
+    assert!(line.starts_with("HTTP/1.1 200"), "trusted: {line:?}");
+    // Untrusted peer: closed after 10 s idle.
+    let _ = b.write_all(request).await;
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), b.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(
+        n == 0 || head.starts_with("HTTP/1.1 408"),
+        "untrusted: {head:?}"
+    );
+}

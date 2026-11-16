@@ -1018,7 +1018,7 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 | Presence pushes per group | online 6/h (then skipped), offline 12/h (then deferred) | no |
 | Pre-signature work (signed routes) | 200/s, burst 400 | `RATE_PRE_AUTH_*` |
 | Unknown group ids cached | 60 s, 100 000 | no |
-| Request headers | 10 s | `HEADER_READ_TIMEOUT_SECS` |
+| Request headers (also idle keep-alive) | 10 s; trusted proxies 120 s | `HEADER_READ_TIMEOUT_SECS`, `TRUSTED_PROXY_IDLE_TIMEOUT_SECS` |
 | Connections per TCP peer (trusted proxies exempt) | 64 | `MAX_CONNECTIONS_PER_IP` |
 | Licence attaches without `appTransactionId` per IP | 10 per day | no |
 | Messages per group | 2/s, burst 60 | `RATE_V2_MESSAGES_*` |

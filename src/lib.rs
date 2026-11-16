@@ -263,31 +263,83 @@ fn set_keepalive(io: &tokio::net::TcpStream) {
     }
 }
 
+/// Connection rules of [`serve_router`].
+pub struct ConnRules {
+    pub max_connections: usize,
+    pub max_per_peer: usize,
+    /// Untrusted peers: complete request headers within this time, also
+    /// between keep-alive requests (hyper's header read timeout covers both).
+    pub header_read_timeout: Duration,
+    /// The same for trusted proxy peers, which keep idle connections open
+    /// for reuse (cloudflared: 90 s). Longer than the proxy's own idle
+    /// timeout, so the proxy always closes first and never sends a request
+    /// on a socket the server is closing.
+    pub trusted_idle_timeout: Duration,
+    /// A TCP peer is a trusted proxy (`TRUST_PROXY`): exempt from
+    /// `max_per_peer`, and gets `trusted_idle_timeout`.
+    pub is_trusted: Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>,
+}
+
+impl ConnRules {
+    /// The public API's rules (`MAX_CONNECTIONS*`, `HEADER_READ_TIMEOUT_SECS`,
+    /// `TRUSTED_PROXY_IDLE_TIMEOUT_SECS`, `TRUST_PROXY`).
+    pub fn for_app(state: &AppState) -> Self {
+        let resolver = state.resolver().clone();
+        Self {
+            max_connections: state.max_connections(),
+            max_per_peer: state.max_connections_per_ip(),
+            header_read_timeout: state.header_read_timeout(),
+            trusted_idle_timeout: state.trusted_proxy_idle_timeout(),
+            is_trusted: Arc::new(move |ip| resolver.is_trusted_proxy(ip)),
+        }
+    }
+}
+
+/// Admin listener: at most this many open connections.
+pub const ADMIN_MAX_CONNECTIONS: usize = 256;
+
 /// Serve the API on `listener` until `shutdown` resolves: HTTP/1.1 with
-/// WebSocket upgrades, at most `MAX_CONNECTIONS` open connections
-/// (`MAX_CONNECTIONS_PER_IP` per untrusted peer), and complete request
-/// headers within `HEADER_READ_TIMEOUT_SECS` (slowloris). On shutdown, open
-/// connections finish their current request; upgraded streams end with the
-/// process.
+/// WebSocket upgrades and the [`ConnRules`] of the configuration.
 pub async fn serve(
     listener: TcpListener,
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    let rules = ConnRules::for_app(&state);
+    serve_router(listener, router(state), rules, shutdown).await
+}
+
+/// The connection loop of [`serve`] for any router (the admin panel too):
+/// at most `max_connections` open connections (`max_per_peer` per untrusted
+/// peer), complete request headers within the peer's timeout (slowloris;
+/// trusted proxies get the longer idle timeout). On shutdown, open
+/// connections finish their current request; upgraded streams end with the
+/// process.
+pub async fn serve_router(
+    listener: TcpListener,
+    app: axum::Router,
+    rules: ConnRules,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
     use tower::ServiceExt;
 
-    let exempt_state = state.clone();
+    let trusted = rules.is_trusted.clone();
     let mut listener = LimitedListener::new(
         listener,
-        state.max_connections(),
-        state.max_connections_per_ip(),
-        move |ip| exempt_state.is_trusted_proxy(ip),
+        rules.max_connections,
+        rules.max_per_peer,
+        move |ip| trusted(ip),
     );
-    let mut http = hyper::server::conn::http1::Builder::new();
-    http.timer(TokioTimer::new())
-        .header_read_timeout(state.header_read_timeout());
-    let app = router(state);
+    let builder = |timeout: Duration| {
+        let mut b = hyper::server::conn::http1::Builder::new();
+        b.timer(TokioTimer::new()).header_read_timeout(timeout);
+        b
+    };
+    let (http, http_trusted) = (
+        builder(rules.header_read_timeout),
+        builder(rules.trusted_idle_timeout),
+    );
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -306,6 +358,11 @@ pub async fn serve(
                     req
                 });
         let svc = hyper_util::service::TowerToHyperService::new(svc);
+        let http = if (rules.is_trusted)(addr.ip().to_canonical()) {
+            &http_trusted
+        } else {
+            &http
+        };
         let conn = http.serve_connection(TokioIo::new(io), svc).with_upgrades();
         let mut stop = stop_rx.clone();
         tokio::spawn(async move {

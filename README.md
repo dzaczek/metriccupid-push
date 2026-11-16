@@ -93,7 +93,8 @@ none of them set, `/v1/notify` returns `404` and only v2 runs. The v2 variables 
 | `REPLAY_CAP` | `100000` | Signatures the replay cache holds (10 min each). When it is full of live entries, signed requests get `503 busy` (`Retry-After: 1`) instead of evicting one that could still be replayed. Keep it above `RATE_GLOBAL_PER_SEC × 600 + RATE_GLOBAL_BURST` (a startup warning says so). |
 | `MAX_CONNECTIONS` | `8192` | Open TCP connections on the API listener, WebSocket streams included. At the cap the server stops accepting; new clients wait in the listen backlog. Accepted connections get TCP keepalive (60 s idle, 15 s interval). |
 | `MAX_CONNECTIONS_PER_IP` | `64` | Open connections per TCP peer (IPv6 /64); more are closed at once. Keyed on the TCP peer, not a forwarded header, so trusted proxies (`TRUST_PROXY`: Cloudflare's ranges, `CF_IPS_EXTRA`, `xff:` networks) are exempt: behind cloudflared every connection comes from the tunnel's address, and the per-client limits then apply to the forwarded client IP. Without `TRUST_PROXY`, a reverse proxy in front counts as one peer. |
-| `HEADER_READ_TIMEOUT_SECS` | `10` | A connection must deliver complete request headers within this time (also between keep-alive requests), else it is closed (slowloris). Bodies have their own deadline (below). |
+| `HEADER_READ_TIMEOUT_SECS` | `10` | A connection must deliver complete request headers within this time (also between keep-alive requests), else it is closed (slowloris). Bodies have their own deadline (below). Applies to the API and the admin listener. |
+| `TRUSTED_PROXY_IDLE_TIMEOUT_SECS` | `120` | The same timeout for connections from a trusted proxy (`TRUST_PROXY`: Cloudflare's ranges, `CF_IPS_EXTRA`, `xff:` networks). Must be above 90: cloudflared keeps idle origin connections for 90 s, so the server must never close one first (cloudflared would send a request on a closing socket and answer `502`). |
 | `LOG_FORMAT` | `text` | `text` or `json`. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace`. |
 | `PUSHOVER_API_URL` | `https://api.pushover.net/1/messages.json` | Override for tests only. Must be `https://`; `http://` only to `127.0.0.1`, `::1` or `localhost`. |
@@ -618,7 +619,8 @@ blocks the API.
 - **Resource limits**: 8 KB body (v1) / 16 KB (v2), bodies read within 3 s (10 s for the snapshot)
   before any work, headers within `HEADER_READ_TIMEOUT_SECS`, 10 s request timeout, 256 request
   slots shared by all routes with a 1 s wait (then `503`), `MAX_CONNECTIONS` open connections
-  (`MAX_CONNECTIONS_PER_IP` per untrusted peer), WebSocket streams capped per server, group and
+  (`MAX_CONNECTIONS_PER_IP` per untrusted peer; the admin listener: 256 in total, same per-peer and
+  header rules), WebSocket streams capped per server, group and
   IP (`WS_MAX_*`), 8 s Pushover / 5 s APNs timeout, Compose limits of 64 MB RAM and 0.5 CPU.
 - **Logging**: status, client IP, latency and an outcome label only. Secrets, the Pushover token/user
   key and message contents are never logged.

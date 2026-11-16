@@ -284,6 +284,11 @@ pub struct Config {
     /// `HEADER_READ_TIMEOUT_SECS`: a client must send complete request
     /// headers within this time, else the connection is closed.
     pub header_read_timeout: Duration,
+    /// `TRUSTED_PROXY_IDLE_TIMEOUT_SECS`: the same timeout for connections
+    /// from a trusted proxy (`TRUST_PROXY`). Above cloudflared's 90 s origin
+    /// keep-alive, so the proxy closes idle connections first and never
+    /// reuses one the server is closing (502).
+    pub trusted_proxy_idle_timeout: Duration,
     pub pushover_app_token: String,
     pub pushover_user_key: String,
     pub pushover_api_url: String,
@@ -309,6 +314,10 @@ impl fmt::Debug for Config {
             .field("max_connections", &self.max_connections)
             .field("max_connections_per_ip", &self.max_connections_per_ip)
             .field("header_read_timeout", &self.header_read_timeout)
+            .field(
+                "trusted_proxy_idle_timeout",
+                &self.trusted_proxy_idle_timeout,
+            )
             .field("pushover_app_token", &"<redacted>")
             .field("pushover_user_key", &"<redacted>")
             .field("pushover_api_url", &self.pushover_api_url)
@@ -465,6 +474,18 @@ impl Config {
             .get()
             .into(),
         );
+        let trusted_idle: u32 = parse_num(
+            "TRUSTED_PROXY_IDLE_TIMEOUT_SECS",
+            get("TRUSTED_PROXY_IDLE_TIMEOUT_SECS"),
+            120,
+        )?;
+        if trusted_idle <= 90 {
+            return err(
+                "TRUSTED_PROXY_IDLE_TIMEOUT_SECS must be above 90 (cloudflared keeps idle origin \
+                 connections for 90 s)",
+            );
+        }
+        let trusted_proxy_idle_timeout = Duration::from_secs(trusted_idle.into());
 
         let log_format = match get("LOG_FORMAT").as_deref() {
             None | Some("text") => LogFormat::Text,
@@ -485,6 +506,7 @@ impl Config {
             max_connections,
             max_connections_per_ip,
             header_read_timeout,
+            trusted_proxy_idle_timeout,
             pushover_app_token,
             pushover_user_key,
             pushover_api_url,
@@ -1395,6 +1417,14 @@ mod tests {
         );
         assert_eq!(c.max_connections_per_ip, 64);
         assert_eq!(c.header_read_timeout, Duration::from_secs(10));
+        assert_eq!(c.trusted_proxy_idle_timeout, Duration::from_secs(120));
+        assert!(cfg(&[("TRUSTED_PROXY_IDLE_TIMEOUT_SECS", "90")]).is_err());
+        assert_eq!(
+            cfg(&[("TRUSTED_PROXY_IDLE_TIMEOUT_SECS", "91")])
+                .unwrap()
+                .trusted_proxy_idle_timeout,
+            Duration::from_secs(91)
+        );
         assert_eq!(c.limits.replay_cap, 100_000);
         assert_eq!(c.max_connections, 8192);
         assert_eq!(

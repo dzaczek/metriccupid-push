@@ -73,6 +73,8 @@ pub struct AppState {
     max_connections_per_ip: usize,
     /// `HEADER_READ_TIMEOUT_SECS` (see `crate::serve`).
     header_read_timeout: Duration,
+    /// `TRUSTED_PROXY_IDLE_TIMEOUT_SECS` (see `crate::serve`).
+    trusted_proxy_idle_timeout: Duration,
 }
 
 /// The replay cut-off is this long before the process started: a client
@@ -160,6 +162,7 @@ impl AppState {
             max_connections: config.max_connections,
             max_connections_per_ip: config.max_connections_per_ip,
             header_read_timeout: config.header_read_timeout,
+            trusted_proxy_idle_timeout: config.trusted_proxy_idle_timeout,
         };
         for key in loaded.overrides {
             tracing::info!(
@@ -208,6 +211,16 @@ impl AppState {
     /// `HEADER_READ_TIMEOUT_SECS`.
     pub fn header_read_timeout(&self) -> Duration {
         self.header_read_timeout
+    }
+
+    /// `TRUSTED_PROXY_IDLE_TIMEOUT_SECS`.
+    pub fn trusted_proxy_idle_timeout(&self) -> Duration {
+        self.trusted_proxy_idle_timeout
+    }
+
+    /// The client IP resolver (`TRUST_PROXY`).
+    pub fn resolver(&self) -> &ClientIpResolver {
+        &self.resolver
     }
 
     /// `peer` (a TCP peer) is a proxy trusted by `TRUST_PROXY`: Cloudflare,

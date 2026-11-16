@@ -307,12 +307,13 @@ pub async fn serve(
     state: Arc<AdminState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    // Same connection protections as the public API (header timeout,
+    // per-peer cap with trusted proxies exempt), with a smaller total.
+    let rules = crate::ConnRules {
+        max_connections: crate::ADMIN_MAX_CONNECTIONS,
+        ..crate::ConnRules::for_app(&state.app)
+    };
+    crate::serve_router(listener, router(state), rules, shutdown).await
 }
 
 /// Expire sessions and lockouts once a minute; refresh the Cloudflare
