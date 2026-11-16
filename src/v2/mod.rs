@@ -48,7 +48,9 @@ use self::presence::Presence;
 use self::store::{
     Attach, Bind, CreateGroup, Device, GroupLicence, Insert, NewMessage, Store, StoreError, Upsert,
 };
-use self::stream::{CommandFrame, Hub, MAX_CLIENT_FRAME};
+use self::stream::{
+    CommandFrame, Hub, MAX_CLIENT_FRAME, WS_MAX_WRITE_BUFFER, WS_READ_BUFFER, WS_WRITE_BUFFER,
+};
 use crate::api::{
     check_signed_global, error, invalid, json_error, precheck, too_many, AppState, GlobalClass,
     Outcome,
@@ -388,16 +390,25 @@ fn finish(
         group: group.map(str::to_string),
     });
     // Never log sealed blobs, tokens or keys.
-    tracing::info!(
-        route,
-        client_ip = %ip,
-        group = group.unwrap_or("-"),
-        status = response.status().as_u16(),
-        outcome,
-        latency_ms = started.elapsed().as_millis() as u64,
-        "v2"
-    );
+    let status = response.status().as_u16();
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let group = group.unwrap_or("-");
+    // Successful phone polls are most of the traffic (one line per request
+    // filled the 30 MB log rotation in minutes in load tests); they stay in
+    // the metrics tables and at debug level.
+    if is_quiet_poll(route, status) {
+        tracing::debug!(route, client_ip = %ip, group, status, outcome, latency_ms, "v2");
+    } else {
+        tracing::info!(route, client_ip = %ip, group, status, outcome, latency_ms, "v2");
+    }
     response
+}
+
+fn is_quiet_poll(route: &str, status: u16) -> bool {
+    matches!(
+        route,
+        "messages.get" | "snapshot.get" | "status" | "devices.list" | "commands.get"
+    ) && (200..400).contains(&status)
 }
 
 fn ok(status: StatusCode, body: serde_json::Value, outcome: &'static str) -> Outcome {
@@ -2289,6 +2300,13 @@ async fn open_stream(State(state): State<Arc<AppState>>, req: Request) -> Respon
         let resp = ws
             .max_message_size(MAX_CLIENT_FRAME)
             .max_frame_size(MAX_CLIENT_FRAME)
+            // tungstenite reserves 128 KiB per stream for reading by default,
+            // which made ~160 KiB RSS per stream in load tests. Client frames
+            // are at most 4 KiB and server frames are bounded by the 8 KiB
+            // request body that produced them.
+            .read_buffer_size(WS_READ_BUFFER)
+            .write_buffer_size(WS_WRITE_BUFFER)
+            .max_write_buffer_size(WS_MAX_WRITE_BUFFER)
             .on_upgrade(move |socket| async move {
                 let v2 = st.v2();
                 let close = |code: u16, reason: &'static str| {
@@ -2632,6 +2650,17 @@ async fn debug_pushes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_successful_polls_are_quiet() {
+        assert!(is_quiet_poll("messages.get", 200));
+        assert!(is_quiet_poll("snapshot.get", 204));
+        assert!(is_quiet_poll("status", 304));
+        assert!(!is_quiet_poll("messages.get", 401), "refusals stay at info");
+        assert!(!is_quiet_poll("messages.get", 429));
+        assert!(!is_quiet_poll("messages.post", 200), "writes stay at info");
+        assert!(!is_quiet_poll("stream", 101));
+    }
 
     #[test]
     fn id_validation() {

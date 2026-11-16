@@ -27,6 +27,11 @@ pub const MAX_PER_IP: u32 = 20;
 pub const STREAM_BUFFER: usize = 64;
 /// Largest frame accepted from a client (acks are tiny).
 pub const MAX_CLIENT_FRAME: usize = 4096;
+/// Per-stream WebSocket buffers (see the upgrade in `v2::mod`).
+pub const WS_READ_BUFFER: usize = 8 * 1024;
+pub const WS_WRITE_BUFFER: usize = 8 * 1024;
+/// Must exceed the write buffer plus the largest server frame.
+pub const WS_MAX_WRITE_BUFFER: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandFrame {
