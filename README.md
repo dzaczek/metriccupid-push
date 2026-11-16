@@ -263,6 +263,8 @@ same-host proxy that is reachable from outside.
 |---|---|---|
 | `MODE` | `selfhosted` | `hosted` enables App Store licences (`LICENCE_MODE`), `PUT /v2/licence` and the gateway endpoint `POST /v2/gateway/push`. |
 | `APNS_MODE` | `gateway` (`direct` in hosted) | `direct`, `gateway` or `mock`. `gateway` is not allowed with `MODE=hosted`. |
+| `MOCK_APNS_LATENCY_MS` | `0` | `APNS_MODE=mock` only (load tests): each push waits a uniform random time in `min..max` ms (or one number). |
+| `MOCK_APNS_FAIL_PPM` | `0` | `APNS_MODE=mock` only: pushes per million that fail like an APNs `500` (the token is kept). |
 | `APNS_KEY_P8` | required for `direct` | Path to the `.p8` file, or the PEM itself (a one-line PEM with literal `\n` works). |
 | `APNS_KEY_ID` | required for `direct` | 10-character key id. |
 | `APNS_TEAM_ID` | required for `direct` | 10-character team id. |

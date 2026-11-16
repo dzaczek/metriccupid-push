@@ -83,6 +83,12 @@ pub struct HourlyRate {
 pub struct V2Config {
     pub data_dir: PathBuf,
     pub apns_mode: ApnsMode,
+    /// `MOCK_APNS_LATENCY_MS` (`min..max`, or one number): each mock push
+    /// waits a uniform random time in this range. Default `0..0` (instant).
+    pub mock_apns_latency_ms: (u64, u64),
+    /// `MOCK_APNS_FAIL_PPM`: mock pushes failing like an APNs 500, per
+    /// million. Default 0.
+    pub mock_apns_fail_ppm: u32,
     pub apns_key: Option<ApnsKey>,
     pub apns_topic: String,
     pub apns_production_url: String,
@@ -764,6 +770,11 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
     Ok(V2Config {
         data_dir: PathBuf::from(get("DATA_DIR").unwrap_or_else(|| "/data".to_string())),
         apns_mode,
+        mock_apns_latency_ms: parse_latency_range(get("MOCK_APNS_LATENCY_MS"))?,
+        mock_apns_fail_ppm: match parse_num::<u32>("MOCK_APNS_FAIL_PPM", get("MOCK_APNS_FAIL_PPM"), 0)? {
+            n if n <= 1_000_000 => n,
+            _ => return err("MOCK_APNS_FAIL_PPM must be 0..=1000000"),
+        },
         apns_key,
         apns_topic,
         apns_production_url: parse_url(
@@ -865,6 +876,26 @@ fn parse_v2(get: &impl Fn(&str) -> Option<String>, mode: Mode) -> Result<V2Confi
         mac_offline_grace: parse_num("MAC_OFFLINE_GRACE_SECS", get("MAC_OFFLINE_GRACE_SECS"), 120)?,
         snapshot_max_bytes: parse_snapshot_max(get("V2_SNAPSHOT_MAX_BYTES"))?,
     })
+}
+
+/// `MOCK_APNS_LATENCY_MS`: `min..max` or a single number of milliseconds.
+fn parse_latency_range(v: Option<String>) -> Result<(u64, u64), ConfigError> {
+    let Some(v) = v else { return Ok((0, 0)) };
+    let bad = || ConfigError("MOCK_APNS_LATENCY_MS must be `min..max` or one number (ms)".into());
+    let (lo, hi) = match v.split_once("..") {
+        Some((a, b)) => (
+            a.trim().parse().map_err(|_| bad())?,
+            b.trim().parse().map_err(|_| bad())?,
+        ),
+        None => {
+            let n: u64 = v.parse().map_err(|_| bad())?;
+            (n, n)
+        }
+    };
+    if lo > hi || hi > 60_000 {
+        return Err(bad());
+    }
+    Ok((lo, hi))
 }
 
 /// `LICENCE_MODE`, with `HOSTED_OPEN_REGISTRATION=true` kept as an alias for
@@ -1191,6 +1222,35 @@ mod tests {
         assert!(cfg(&[("GATEWAY_URL", "ftp://x")]).is_err());
         assert!(cfg(&[("APNS_TOPIC", "bad topic")]).is_err());
         assert!(cfg(&[("WS_PING_SECS", "0")]).is_err());
+    }
+
+    #[test]
+    fn mock_apns_faults() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!(
+            (c.v2.mock_apns_latency_ms, c.v2.mock_apns_fail_ppm),
+            ((0, 0), 0)
+        );
+        let c = cfg(&[
+            ("MOCK_APNS_LATENCY_MS", "30..80"),
+            ("MOCK_APNS_FAIL_PPM", "500"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (c.v2.mock_apns_latency_ms, c.v2.mock_apns_fail_ppm),
+            ((30, 80), 500)
+        );
+        assert_eq!(
+            cfg(&[("MOCK_APNS_LATENCY_MS", "5")])
+                .unwrap()
+                .v2
+                .mock_apns_latency_ms,
+            (5, 5)
+        );
+        for bad in ["80..30", "x", "1..", "0..70000"] {
+            assert!(cfg(&[("MOCK_APNS_LATENCY_MS", bad)]).is_err(), "{bad}");
+        }
+        assert!(cfg(&[("MOCK_APNS_FAIL_PPM", "1000001")]).is_err());
     }
 
     #[test]

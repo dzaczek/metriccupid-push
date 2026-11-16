@@ -545,11 +545,41 @@ pub struct MockApns {
     pushes: Mutex<Vec<RecordedPush>>,
     unregistered: Mutex<HashSet<String>>,
     rejected: Mutex<std::collections::HashMap<String, (u16, String)>>,
+    /// Simulated APNs answer time, uniform in `min..=max` ms (load tests).
+    latency_ms: (u64, u64),
+    /// Pushes failing like an APNs 500, per million (load tests).
+    fail_ppm: u32,
+    /// State of the cheap PRNG behind `latency_ms` and `fail_ppm`.
+    rng: std::sync::atomic::AtomicU64,
 }
 
 impl MockApns {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A mock that answers after `latency_ms` (`min..=max`) and fails
+    /// `fail_ppm` pushes per million with a 500 (`MOCK_APNS_LATENCY_MS`,
+    /// `MOCK_APNS_FAIL_PPM`).
+    pub fn with_faults(latency_ms: (u64, u64), fail_ppm: u32) -> Self {
+        Self {
+            latency_ms,
+            fail_ppm,
+            rng: std::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+            ..Self::default()
+        }
+    }
+
+    /// splitmix64 over a shared counter: not cryptographic, only spreads
+    /// simulated latencies and failures.
+    fn next_rand(&self) -> u64 {
+        let mut z = self
+            .rng
+            .fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 
     /// Make every later push to `token` fail like APNs 410 Unregistered.
@@ -587,6 +617,12 @@ impl MockApns {
 impl ApnsSender for MockApns {
     fn send<'a>(&'a self, job: &'a PushJob) -> BoxFuture<'a, Result<(), PushError>> {
         Box::pin(async move {
+            let (lo, hi) = self.latency_ms;
+            if hi > 0 {
+                let ms = lo + self.next_rand() % (hi - lo + 1);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            let fail = self.fail_ppm > 0 && self.next_rand() % 1_000_000 < u64::from(self.fail_ppm);
             let gone = self
                 .unregistered
                 .lock()
@@ -597,7 +633,8 @@ impl ApnsSender for MockApns {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&job.device_token)
-                .cloned();
+                .cloned()
+                .or_else(|| fail.then(|| (500, "InternalServerError".to_string())));
             let payload: Value = serde_json::from_str(&job.payload()).unwrap_or(Value::Null);
             let mut pushes = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
             if pushes.len() >= MOCK_CAP {

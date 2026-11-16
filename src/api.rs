@@ -465,7 +465,10 @@ fn build_v2(
             )?)
         }
         ApnsMode::Mock => {
-            let m = Arc::new(MockApns::new());
+            let m = Arc::new(MockApns::with_faults(
+                c.mock_apns_latency_ms,
+                c.mock_apns_fail_ppm,
+            ));
             mock = Some(m.clone());
             m
         }
