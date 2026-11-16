@@ -1060,6 +1060,8 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "rcgen",
  "reqwest",

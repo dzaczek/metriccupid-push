@@ -80,17 +80,20 @@ none of them set, `/v1/notify` returns `404` and only v2 runs. The v2 variables 
 | `DEDUP_WINDOW_SECS` | `300` | A second request with the same `dedup_key` inside this window is answered `deduplicated` and not sent. `0` disables. |
 | `QUOTA_RESERVE` | `500` | When Pushover's `X-Limit-App-Remaining` drops below this, only priority `>= 1` is sent; lower priorities get `503`. |
 | `RATE_GLOBAL_PER_SEC` / `RATE_GLOBAL_BURST` | `50` / `100` | Token bucket for authenticated requests. v2 checks it only after the signature has verified, so anonymous or failing traffic cannot drain it; v1 checks it before authentication. |
-| `RATE_ANON_GLOBAL_PER_SEC` / `RATE_ANON_GLOBAL_BURST` | `20` / `60` | Token bucket for anonymous work: `POST /v2/groups` and requests that fail authentication (those get `429` instead of `401` while it is empty). |
+| `RATE_ANON_GLOBAL_PER_SEC` / `RATE_ANON_GLOBAL_BURST` | `20` / `60` | Token bucket for anonymous work: `POST /v2/groups` and requests that fail authentication or are signed before the boot cut-off (those get `429` instead of `401` while it is empty). |
+| `RATE_PRE_AUTH_PER_SEC` / `RATE_PRE_AUTH_BURST` | `200` / `400` | Cheap ceiling on all pre-signature work of signed routes (group-key lookup and HMAC), checked right after the per-IP bucket. Group ids found unknown are remembered in memory for 60 s (up to 100 000), so floods of random group ids do not reach SQLite; `POST /v2/groups` clears an id. |
 | `RATE_IP_PER_SEC` / `RATE_IP_BURST` | `5` / `20` | Token bucket per client IP (IPv6 grouped by /64). Checked before authentication. |
 | `RATE_SECRET_PER_SEC` / `RATE_SECRET_BURST` | `2` / `30` | Token bucket per relay secret (after authentication). |
 | `AUTH_BAN_THRESHOLD` | `10` | Auth failures from one IP within the window that trigger a ban. |
 | `AUTH_BAN_WINDOW_SECS` | `900` | Window for counting auth failures. |
 | `AUTH_BAN_SECS` | `900` | Ban length. Banned IPs get `429` with `Retry-After`. |
-| `AUTH_ABUSE_THRESHOLD` | `100` | IP-keyed `429` answers (per-IP bucket, anonymous bucket, group registration) to one IP (IPv6 /64) within the abuse window that ban it, like auth failures. Group-keyed limits and `POST /v2/gateway/push` never count. |
+| `AUTH_ABUSE_THRESHOLD` | `100` | Anonymous `429` answers to one IP (IPv6 /64) within the abuse window that ban it, like auth failures: the registration limits of `POST /v2/groups` (its per-IP and anonymous buckets) and the anonymous bucket hit by failed authentication. The per-IP bucket of signed routes never counts (many legitimate clients can share one NAT address), nor do group-keyed limits or `POST /v2/gateway/push`. |
 | `AUTH_ABUSE_WINDOW_SECS` | `60` | Window for counting those answers. |
-| `AUTH_ABUSE_BAN_SECS` | `900` | Ban length after sustained rate limiting. |
+| `AUTH_ABUSE_BAN_SECS` | `300` | Ban length after sustained rate limiting. |
 | `REPLAY_CAP` | `100000` | Signatures the replay cache holds (10 min each). When it is full of live entries, signed requests get `503 busy` (`Retry-After: 1`) instead of evicting one that could still be replayed. Keep it above `RATE_GLOBAL_PER_SEC × 600 + RATE_GLOBAL_BURST` (a startup warning says so). |
 | `MAX_CONNECTIONS` | `8192` | Open TCP connections on the API listener, WebSocket streams included. At the cap the server stops accepting; new clients wait in the listen backlog. Accepted connections get TCP keepalive (60 s idle, 15 s interval). |
+| `MAX_CONNECTIONS_PER_IP` | `64` | Open connections per TCP peer (IPv6 /64); more are closed at once. Keyed on the TCP peer, not a forwarded header, so trusted proxies (`TRUST_PROXY`: Cloudflare's ranges, `CF_IPS_EXTRA`, `xff:` networks) are exempt: behind cloudflared every connection comes from the tunnel's address, and the per-client limits then apply to the forwarded client IP. Without `TRUST_PROXY`, a reverse proxy in front counts as one peer. |
+| `HEADER_READ_TIMEOUT_SECS` | `10` | A connection must deliver complete request headers within this time (also between keep-alive requests), else it is closed (slowloris). Bodies have their own deadline (below). |
 | `LOG_FORMAT` | `text` | `text` or `json`. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace`. |
 | `PUSHOVER_API_URL` | `https://api.pushover.net/1/messages.json` | Override for tests only. Must be `https://`; `http://` only to `127.0.0.1`, `::1` or `localhost`. |
@@ -248,7 +251,10 @@ self-hosted server for the App Store app needs the gateway. In gateway mode the 
 and WebSocket stay on your server; the gateway only receives, per push, the device token and the
 ciphertext (PROTOCOL.md section 9). `APNS_MODE=mock` records pushes in memory for development and
 exposes them at `GET /v2/debug/pushes` to loopback clients only (the TCP peer, never a forwarded
-header). `MODE=hosted` with `APNS_MODE=mock` logs a `SECURITY` error at startup.
+header). `MODE=hosted` with `APNS_MODE=mock` logs a `SECURITY` error at startup. Caveat: a reverse
+proxy (nginx, Caddy, cloudflared on the host network) on the same host connects from `127.0.0.1`,
+so through it the route is reachable by anyone who can reach the proxy; never run mock mode behind a
+same-host proxy that is reachable from outside.
 
 ### v2 configuration
 
@@ -292,8 +298,9 @@ header). `MODE=hosted` with `APNS_MODE=mock` logs a `SECURITY` error at startup.
 
 The v1 per-IP, global and auth-ban limits apply to every v2 route too. Fixed limits: 16 KB v2 body,
 10 devices per group, mailbox 24 h / 500 messages, command queue 1 h / 200, command ids remembered
-25 h and message ids 24 h 10 min (up to 5000 per group) after their first post, 6 presence pushes
-per group and hour, 10 attaches per client IP and day for a licence without `appTransactionId`.
+25 h (up to 20 000 per group) and message ids 24 h 10 min (up to 5000 per group) after their first
+post, 6 "back online" and 12 "Mac offline" presence pushes per group and hour (an offline notice
+beyond that waits and is retried, never dropped), 10 attaches per client IP and day for a licence without `appTransactionId`.
 Every request body must arrive within 3 s (10 s for `POST /v2/snapshot`), else `408`; then it waits
 at most 1 s for one of 256 request slots shared by all routes, else `503 busy` with `Retry-After: 1`.
 
@@ -537,7 +544,7 @@ window** on the server-side session: for 5 minutes, and at most 10 actions, the 
 left empty. The window is bound to the session, the admin's /24 or /48 and the Cloudflare Access
 identity, is shown in the page header, and ends with logout. These always need a fresh code:
 licence revoke / restore, changes of `GATEWAY_OPEN`, `GATEWAY_REQUIRE_LICENCE`,
-`RATE_GLOBAL_*`, `RATE_ANON_GLOBAL_*` and `WS_MAX_STREAMS`, and bans broader than IPv4 /24 or IPv6 /48. Wrong or reused codes count toward the
+`RATE_GLOBAL_*`, `RATE_ANON_GLOBAL_*`, `RATE_PRE_AUTH_*` and `WS_MAX_STREAMS`, and bans broader than IPv4 /24 or IPv6 /48. Wrong or reused codes count toward the
 login lockout (5 per IP in 15 min lock logins *and* actions). Each action, each refused code and
 each refused input is written to the **audit log** (`/admin/audit`: time, admin user plus
 Cloudflare Access e-mail, /24 or /48, action, target, detail with `stepup=fresh` or
@@ -550,7 +557,7 @@ delete it. Rows are kept 90 days, at most 100 000.
 | **Gateway** | Gateway groups with licence state, join date, token count, last use, pushes sent in the last hour, refusals (`token_bound`, `not_gateway_group`, `token_limit`, ...). Per group: unbind one token (tokens are shown as a SHA-256 fingerprint only), remove the group from the gateway (membership deleted, tokens unbound). Removal is a **reset**, not a block: the group can register again while the gateway is open. Suspension is the block. |
 | **Groups** (detail page) | Suspend / unsuspend with a reason. A suspended group gets `403 group_suspended` on every signed route and on `POST /v2/groups` (no re-registration, licence attach or gateway re-add), its streams are closed, nothing is pushed to its phones; its data is kept. |
 | **Licences** | Revoke / restore an App Store purchase by its `appTransactionId`. Takes effect at once for groups already using it: hosted groups count as unlicensed (per `LICENCE_MODE`), gateway groups lose the licensed quotas and, with `GATEWAY_REQUIRE_LICENCE=true`, get `402` at push. Purchase ids are never shown, only a fingerprint (first 12 hex digits of the SHA-256). `LICENCE_REVOKED_TX` entries are listed but can only be removed in the environment. |
-| **Limits** | Effective values of `RATE_GLOBAL_*`, `RATE_ANON_GLOBAL_*`, `RATE_IP_*`, `RATE_GROUP_*` (burst at least 10), `WS_MAX_STREAMS` (16 to 100 000), `WS_MAX_MACS_PER_GROUP` (1 to 10), `WS_MAX_PER_IP`, `RATE_V2_GATEWAY_*`, `GATEWAY_GROUP_*`, `GATEWAY_GLOBAL_*`, `GATEWAY_MAX_TOKENS_PER_GROUP`, `GATEWAY_MAX_GROUPS`, `GATEWAY_OPEN` (kill switch) and `GATEWAY_REQUIRE_LICENCE`, with a per-key override applied without a restart (a changed rate replaces its limiter, whose buckets start full) and kept across restarts until **reset to config**. Overrides must stay within fixed ranges (shown on the page; `RATE_GLOBAL_*` cannot go below 20, so the panel cannot throttle the whole public API). |
+| **Limits** | Effective values of `RATE_GLOBAL_*`, `RATE_ANON_GLOBAL_*`, `RATE_PRE_AUTH_*` (at least 20), `RATE_IP_*`, `RATE_GROUP_*` (burst at least 10), `WS_MAX_STREAMS` (16 to 100 000), `WS_MAX_MACS_PER_GROUP` (1 to 10), `WS_MAX_PER_IP`, `RATE_V2_GATEWAY_*`, `GATEWAY_GROUP_*`, `GATEWAY_GLOBAL_*`, `GATEWAY_MAX_TOKENS_PER_GROUP`, `GATEWAY_MAX_GROUPS`, `GATEWAY_OPEN` (kill switch) and `GATEWAY_REQUIRE_LICENCE`, with a per-key override applied without a restart (a changed rate replaces its limiter, whose buckets start full) and kept across restarts until **reset to config**. Overrides must stay within fixed ranges (shown on the page; `RATE_GLOBAL_*` cannot go below 20, so the panel cannot throttle the whole public API). |
 
 The management state lives in SQLite tables added like the 0.2.1 gateway tables (`CREATE TABLE IF
 NOT EXISTS`, schema version stays 6): `admin_audit`, `manual_bans`, `group_suspensions`,
@@ -597,18 +604,21 @@ blocks the API.
 
 - **Authentication**: HMAC-SHA256 over timestamp, method, path and body; 300 s clock window; replay
   cache of accepted signatures (10 min, up to `REPLAY_CAP` entries; when full, signed requests get
-  `503` rather than an entry being evicted). Timestamps from before the process started are refused
-  (the cache is in memory, so nothing signed before a restart can be replayed after it); a client
-  whose clock is a little behind sees one `401` that does not count toward a ban. Failed checks
-  return the same generic `401`.
-- **Abuse**: the per-IP bucket (and, for v1, the global one) is checked *before* the HMAC work; v2
-  checks the per-group and authenticated global buckets after the signature, so failed or
-  anonymous requests (which draw from `RATE_ANON_GLOBAL_*`) never starve signed users. 10 auth
-  failures from one IP within 15 min ban it for 15 min, and so do 100 IP-keyed `429`s within 60 s
-  (`AUTH_ABUSE_*`). All maps are bounded and swept every 30 s.
+  `503` rather than an entry being evicted). Timestamps more than 60 s before the process started
+  are refused (the cache is in memory, so only the last minute before a restart can be replayed
+  once after it); a client whose clock lags by more than 60 s gets `401` for at most (lag - 60) s,
+  not counted toward a ban but drawn from the anonymous bucket. Failed checks return the same
+  generic `401`.
+- **Abuse**: the per-IP bucket, then (v2 signed routes) the `RATE_PRE_AUTH_*` ceiling and the
+  unknown-group cache, or (v1) the global bucket, are checked *before* the HMAC work; v2 checks the
+  per-group and authenticated global buckets after the signature, so failed or anonymous requests
+  (which draw from `RATE_ANON_GLOBAL_*`) never starve signed users. 10 auth failures from one IP
+  within 15 min ban it for 15 min; 100 anonymous `429`s (registration floods) within 60 s ban it for
+  5 min (`AUTH_ABUSE_*`). All maps are bounded and swept every 30 s.
 - **Resource limits**: 8 KB body (v1) / 16 KB (v2), bodies read within 3 s (10 s for the snapshot)
-  before any work, 10 s request timeout, 256 request slots shared by all routes with a 1 s wait
-  (then `503`), `MAX_CONNECTIONS` open connections, WebSocket streams capped per server, group and
+  before any work, headers within `HEADER_READ_TIMEOUT_SECS`, 10 s request timeout, 256 request
+  slots shared by all routes with a 1 s wait (then `503`), `MAX_CONNECTIONS` open connections
+  (`MAX_CONNECTIONS_PER_IP` per untrusted peer), WebSocket streams capped per server, group and
   IP (`WS_MAX_*`), 8 s Pushover / 5 s APNs timeout, Compose limits of 64 MB RAM and 0.5 CPU.
 - **Logging**: status, client IP, latency and an outcome label only. Secrets, the Pushover token/user
   key and message contents are never logged.

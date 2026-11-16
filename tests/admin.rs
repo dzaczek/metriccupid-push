@@ -280,6 +280,8 @@ async fn servers_opts(
         ("RATE_IP_BURST".into(), "10000".into()),
         ("RATE_GLOBAL_PER_SEC".into(), "1000".into()),
         ("RATE_GLOBAL_BURST".into(), "10000".into()),
+        ("RATE_PRE_AUTH_PER_SEC".into(), "10000".into()),
+        ("RATE_PRE_AUTH_BURST".into(), "100000".into()),
         ("ADMIN_BIND".into(), "127.0.0.1:0".into()),
         ("ADMIN_USER".into(), "admin".into()),
         ("ADMIN_PASSWORD_HASH".into(), hash),
@@ -2482,6 +2484,8 @@ async fn phase1_limits_are_live_and_bounded() {
         ("WS_MAX_MACS_PER_GROUP", "11"),
         ("WS_MAX_PER_IP", "0"),
         ("RATE_ANON_GLOBAL_PER_SEC", "0"),
+        ("RATE_PRE_AUTH_PER_SEC", "19"),
+        ("RATE_PRE_AUTH_BURST", "19"),
     ] {
         let (st, body) = s
             .act(
@@ -2496,6 +2500,8 @@ async fn phase1_limits_are_live_and_bounded() {
     for key in [
         "RATE_ANON_GLOBAL_PER_SEC",
         "RATE_ANON_GLOBAL_BURST",
+        "RATE_PRE_AUTH_PER_SEC",
+        "RATE_PRE_AUTH_BURST",
         "RATE_GROUP_PER_SEC",
         "RATE_GROUP_BURST",
         "WS_MAX_STREAMS",
@@ -2510,6 +2516,7 @@ async fn phase1_limits_are_live_and_bounded() {
         ("WS_MAX_PER_IP", "7"),
         ("RATE_GROUP_PER_SEC", "1"),
         ("RATE_GROUP_BURST", "10"),
+        ("RATE_PRE_AUTH_PER_SEC", "500"),
     ] {
         let (st, body) = s
             .act(&session, "/admin/limits/set", &[("key", k), ("value", v)])

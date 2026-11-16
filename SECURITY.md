@@ -29,7 +29,8 @@ server to queue or push the same command or message id twice within its
 duplicate window (25 h for commands, 24 h 10 min for messages), or to accept
 a signature from before a restart; one group, IP or anonymous client starving
 other tenants of streams, request slots or the authenticated rate bucket
-(slow bodies, stream floods, registration floods) or sustaining rate-limited
+(slow headers or bodies, connection or stream floods, registration
+floods, random group ids) or sustaining rate-limited
 floods without being banned; reaching `/v2/debug/pushes` from a non-loopback
 peer.
 For the admin panel: reaching it past the allowlist or Cloudflare Access check,

@@ -88,6 +88,10 @@ async fn server_at(data: &Path, overrides: &[(&str, &str)], clock: Arc<TestClock
         ("RATE_IP_BURST".into(), "10000".into()),
         ("RATE_GLOBAL_PER_SEC".into(), "1000".into()),
         ("RATE_GLOBAL_BURST".into(), "10000".into()),
+        ("RATE_PRE_AUTH_PER_SEC".into(), "10000".into()),
+        ("RATE_PRE_AUTH_BURST".into(), "100000".into()),
+        // Every test client connects from 127.0.0.1.
+        ("MAX_CONNECTIONS_PER_IP".into(), "100000".into()),
         ("RATE_V2_GROUPS_BURST".into(), "20".into()),
         ("RATE_V2_MESSAGES_BURST".into(), "100".into()),
         ("RATE_V2_COMMANDS_BURST".into(), "100".into()),
@@ -1051,6 +1055,9 @@ async fn gateway_rejects_unknown_groups_licence_and_rate() {
         .call(move |conn| store::create_group(conn, &g, &key, T0))
         .await
         .unwrap();
+    // Created behind the API: clear the unknown-group cache like
+    // `POST /v2/groups` does.
+    hosted.state.v2().forget_unknown(&c.group_id);
     // A plain hosted group is not a gateway group.
     let mut j0 = job.clone();
     j0["message"]["id"] = json!("j0");
@@ -3347,13 +3354,18 @@ async fn boot_cut_off_is_not_banned_and_full_replay_cache_is_503() {
     let (_d, s) = server(&[("REPLAY_CAP", "8"), ("AUTH_BAN_THRESHOLD", "3")]).await;
     let (mac, phone) = setup(&s, 186).await; // 2 signatures remembered
     let mut early = phone.clone();
-    early.now = Arc::new(|| T0 - 10);
+    // Behind by more than the 60 s boot grace.
+    early.now = Arc::new(|| T0 - 70);
     for _ in 0..5 {
         assert_eq!(early.get("/v2/status").await.status, 401);
     }
     assert_eq!(phone.get("/v2/status").await.status, 200, "not banned");
+    // Within the 60 s boot grace: accepted.
+    let mut lagging = phone.clone();
+    lagging.now = Arc::new(|| T0 - 50);
+    assert_eq!(lagging.get("/v2/status").await.status, 200, "grace");
     let mut last = 200;
-    for _ in 0..5 {
+    for _ in 0..4 {
         last = mac.get("/v2/devices").await.status;
     }
     let r = phone.get("/v2/status").await;
@@ -3594,32 +3606,75 @@ async fn deleted_group_leaves_no_presence_or_activity_state() {
     assert!(v2.activities.is_empty());
 }
 
-/// Hardening: at most 6 presence pushes per group and hour.
+fn presence_counts(s: &Server) -> (usize, usize) {
+    let p = s.mock().pushes();
+    let n = |state: &str| {
+        p.iter()
+            .filter(|p| p.payload["mc_presence"]["state"] == state)
+            .count()
+    };
+    (n("offline"), n("online"))
+}
+
+/// One connect + `bye` cycle of a flapping Mac at time `t`.
+async fn flap(s: &Server, mac: &Client, t: u64) {
+    s.set_time(t);
+    let mut ws = open_ws(mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    ws.send(WsMessage::Text(r#"{"type":"bye","reason":"sleep"}"#.into()))
+        .await
+        .unwrap();
+    wait_offline(s, &mac.group_id).await;
+    tick(s).await;
+}
+
+/// Hardening: "back online" pushes are limited to 6 per group and hour,
+/// but a flapping Mac can never suppress the critical "Mac offline" push.
 #[tokio::test]
-async fn presence_pushes_are_limited_per_group() {
-    let (_d, s) = server(&[]).await;
+async fn flapping_mac_cannot_suppress_a_real_offline_push() {
+    let (_d, s) = server(&[("MAC_OFFLINE_GRACE_SECS", "0")]).await;
     let (mac, _) = setup(&s, 200).await;
-    let mut t = T0;
-    for _ in 0..5 {
-        t += 10;
-        s.set_time(t);
-        let mut ws = open_ws(&mac).await.unwrap();
-        wait_ready(&mut ws).await;
-        ws.send(WsMessage::Text(r#"{"type":"bye","reason":"sleep"}"#.into()))
-            .await
-            .unwrap();
-        wait_offline(&s, &mac.group_id).await;
-        tick(&s).await;
+    for i in 0..8 {
+        flap(&s, &mac, T0 + 10 * (i + 1)).await;
     }
-    // 5 offline + 4 online notices would be 9 pushes; the bucket allows 6.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let n = s
-        .mock()
-        .pushes()
-        .iter()
-        .filter(|p| p.collapse_id.as_deref() == Some("mc-presence"))
-        .count();
-    assert_eq!(n, 6);
+    assert_eq!(
+        presence_counts(&s),
+        (8, 6),
+        "online capped at 6, offline all sent"
+    );
+    // A real outage: the stream drops without a bye.
+    s.set_time(T0 + 100);
+    let mut ws = open_ws(&mac).await.unwrap();
+    wait_ready(&mut ws).await;
+    drop(ws);
+    wait_offline(&s, &mac.group_id).await;
+    tick(&s).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(presence_counts(&s).0, 9, "the outage is announced");
+}
+
+/// Hardening: beyond the offline bucket (12/h) the notice is deferred, not
+/// dropped: it stays pending for the next presence tick.
+#[tokio::test]
+async fn offline_push_beyond_its_bucket_stays_pending() {
+    let (_d, s) = server(&[("MAC_OFFLINE_GRACE_SECS", "0")]).await;
+    let (mac, _) = setup(&s, 202).await;
+    for i in 0..13 {
+        flap(&s, &mac, T0 + 10 * (i + 1)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(presence_counts(&s).0, 12);
+    let v2 = s.state.v2();
+    assert!(
+        v2.presence.is_pending(&mac.group_id),
+        "13th kept for a retry"
+    );
+    tick(&s).await;
+    assert!(
+        v2.presence.is_pending(&mac.group_id),
+        "still waiting for the bucket"
+    );
 }
 
 fn fallback_licence() -> Value {
@@ -3647,4 +3702,165 @@ async fn fallback_id_licences_are_limited_per_ip_not_per_purchase() {
         .create_group_with(json!({ "licence": lic }))
         .await;
     assert_eq!(r.status, 429, "{:?}", r.json);
+}
+
+/// Review #1: legitimate clients behind one NAT address that keep hitting
+/// the per-IP bucket on signed routes are not banned.
+#[tokio::test]
+async fn rate_limited_signed_requests_from_a_nat_address_are_not_banned() {
+    let (_d, s) = server(&[
+        ("TRUST_PROXY", "xff:127.0.0.1/32"),
+        ("RATE_IP_PER_SEC", "1"),
+        ("RATE_IP_BURST", "5"),
+        ("RATE_GROUP_PER_SEC", "10000"),
+        ("RATE_GROUP_BURST", "10000"),
+    ])
+    .await;
+    let nat = "198.51.100.77";
+    let mac = from_ip(&s.group(220), "198.51.100.76");
+    assert_eq!(mac.create_group().await.status, 201);
+    assert_eq!(mac.register("mac", "Mac", None).await.status, 201);
+    let phone = from_ip(&mac, nat);
+    let mut limited = 0;
+    for _ in 0..200 {
+        if phone.get("/v2/devices").await.status == 429 {
+            limited += 1;
+        }
+    }
+    assert!(limited >= 150, "{limited}");
+    assert!(
+        s.state.auth_bans().active(s.state.now()).is_empty(),
+        "no ban for a busy NAT"
+    );
+}
+
+/// Review #3: a cheap ceiling on pre-signature work, and unknown group ids
+/// answered from memory.
+#[tokio::test]
+async fn pre_auth_ceiling_and_unknown_group_cache() {
+    let (_d, s) = server(&[("RATE_PRE_AUTH_PER_SEC", "1"), ("RATE_PRE_AUTH_BURST", "4")]).await;
+    let (mac, _) = setup(&s, 222).await; // 2 signed requests
+    assert_eq!(mac.get("/v2/devices").await.status, 200);
+    let stranger = s.group(224);
+    assert_eq!(
+        stranger.get("/v2/status").await.status,
+        401,
+        "unknown group"
+    );
+    let r = mac.get("/v2/devices").await;
+    assert_eq!(
+        (r.status, r.headers.contains_key("retry-after")),
+        (429, true),
+        "pre-auth ceiling"
+    );
+    // Registration is anonymous work, not pre-auth work.
+    assert_eq!(s.group(226).create_group().await.status, 201);
+
+    let (_d, s) = server(&[]).await;
+    let ghost = s.group(228);
+    assert_eq!(ghost.get("/v2/status").await.status, 401);
+    let v2 = s.state.v2();
+    assert!(v2.is_known_unknown(&ghost.group_id, T0));
+    // Created behind the API's back: still answered from the cache.
+    let (g, key) = (ghost.group_id.clone(), ghost.keys.auth);
+    v2.store
+        .call(move |c| store::create_group(c, &g, &key, T0))
+        .await
+        .unwrap();
+    assert_eq!(ghost.get("/v2/status").await.status, 401, "cached for 60 s");
+    s.set_time(T0 + 61);
+    assert!(!v2.is_known_unknown(&ghost.group_id, T0 + 61));
+    // Created through the API: usable at once.
+    let other = s.group(230);
+    s.set_time(T0 + 62);
+    assert_eq!(other.get("/v2/status").await.status, 401);
+    assert_eq!(other.create_group().await.status, 201);
+    assert_eq!(other.register("mac", "Mac", None).await.status, 201);
+}
+
+/// Review #4: headers must arrive in time (slowloris), and one TCP peer
+/// gets at most MAX_CONNECTIONS_PER_IP connections unless it is a trusted
+/// proxy.
+#[tokio::test]
+async fn header_timeout_and_per_peer_connection_cap() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_d, s) = server(&[
+        ("HEADER_READ_TIMEOUT_SECS", "1"),
+        ("MAX_CONNECTIONS_PER_IP", "2"),
+    ])
+    .await;
+    let addr = s.base.trim_start_matches("http://").to_string();
+    let started = std::time::Instant::now();
+    let mut slow = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    slow.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut buf))
+        .await
+        .expect("closed by the header timeout")
+        .unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(n == 0 || head.starts_with("HTTP/1.1 408"), "{head}");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    drop(slow);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _a = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let _b = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let _ = c
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await;
+    let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+        .await
+        .expect("closed at once")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "third connection from one peer is closed");
+
+    // A trusted proxy (here 127.0.0.1 via TRUST_PROXY) is exempt.
+    let (_d2, t) = server(&[
+        ("MAX_CONNECTIONS_PER_IP", "2"),
+        ("TRUST_PROXY", "xff:127.0.0.1/32"),
+    ])
+    .await;
+    let addr = t.base.trim_start_matches("http://").to_string();
+    let _a = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let _b = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    c.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(5), read_status_line(&mut c))
+        .await
+        .unwrap();
+    assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+}
+
+/// Review #5: requests before the boot cut-off are anonymous work.
+#[tokio::test]
+async fn before_boot_requests_draw_from_the_anonymous_bucket() {
+    let (_d, s) = server(&[
+        ("RATE_ANON_GLOBAL_BURST", "3"),
+        ("RATE_ANON_GLOBAL_PER_SEC", "1"),
+    ])
+    .await;
+    let (_mac, phone) = setup(&s, 232).await;
+    let mut early = phone.clone();
+    early.now = Arc::new(|| T0 - 120);
+    let codes: Vec<u16> = {
+        let mut v = Vec::new();
+        for _ in 0..4 {
+            v.push(early.get("/v2/status").await.status);
+        }
+        v
+    };
+    // Burst 3, one used by the group registration in `setup`.
+    assert_eq!(codes, [401, 401, 429, 429], "{codes:?}");
+    assert_eq!(
+        phone.get("/v2/status").await.status,
+        200,
+        "signed users unaffected"
+    );
 }

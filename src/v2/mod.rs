@@ -82,6 +82,43 @@ pub struct V2State {
     pub snapshot_max: usize,
     /// Gateway pushes in flight to APNs ([`GATEWAY_MAX_IN_FLIGHT`]).
     pub gateway_sends: tokio::sync::Semaphore,
+    /// Group ids recently found unknown: a flood of random group ids is
+    /// answered from memory instead of SQLite. Cleared for an id when the
+    /// group is created.
+    pub unknown_groups: std::sync::Mutex<crate::limits::ExpiringSet<String>>,
+}
+
+/// How long an unknown group id is remembered ([`V2State::unknown_groups`]).
+pub const UNKNOWN_GROUP_TTL: Duration = Duration::from_secs(60);
+/// At most this many unknown group ids are remembered (oldest dropped).
+pub const UNKNOWN_GROUP_CAP: usize = 100_000;
+
+impl V2State {
+    fn unknown_groups(&self) -> std::sync::MutexGuard<'_, crate::limits::ExpiringSet<String>> {
+        self.unknown_groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `group` was looked up and not found within [`UNKNOWN_GROUP_TTL`].
+    pub fn is_known_unknown(&self, group: &str, now: u64) -> bool {
+        self.unknown_groups().contains(&group.to_string(), now)
+    }
+
+    fn remember_unknown(&self, group: &str, now: u64) {
+        self.unknown_groups()
+            .insert_if_absent(group.to_string(), now);
+    }
+
+    /// Drop `group` from the unknown-group cache (it was just created).
+    pub fn forget_unknown(&self, group: &str) {
+        self.unknown_groups().remove(&group.to_string());
+    }
+
+    /// Drop expired entries (periodic cleanup).
+    pub fn purge_unknown_groups(&self, now: u64) {
+        self.unknown_groups().purge(now);
+    }
 }
 
 /// At most this many gateway pushes wait on APNs at once; more get `503`
@@ -250,10 +287,16 @@ async fn authenticate(
         return Err(state.auth_failed(ip, now, "bad_device_header"));
     }
     let v2 = state.v2();
+    if v2.is_known_unknown(group, now) {
+        return Err(state.auth_failed(ip, now, "unknown_group"));
+    }
     let g = group.to_string();
     let key = match v2.store.call(move |c| store::group_key(c, &g)).await {
         Ok(Some(k)) => k,
-        Ok(None) => return Err(state.auth_failed(ip, now, "unknown_group")),
+        Ok(None) => {
+            v2.remember_unknown(group, now);
+            return Err(state.auth_failed(ip, now, "unknown_group"));
+        }
         Err(e) => return Err(storage_error(e)),
     };
     let device_for_sig = if rule == DeviceRule::None {
@@ -595,6 +638,8 @@ async fn handle_create_group(state: &AppState, ip: IpAddr, body: &[u8]) -> Outco
             Ok(Some((created, attached)))
         })
         .await;
+    // Whatever the outcome, the id may exist now: no stale negative cache.
+    v2.forget_unknown(&req.group_id);
     let (created, attached) = match stored {
         Ok(None) => {
             return (
@@ -1361,11 +1406,22 @@ pub async fn push_presence(state: &AppState, group: &str, note: PresenceNote) {
         }
     };
     let online = matches!(note, PresenceNote::Online { .. });
-    // At most 6 presence pushes per group and hour: beyond that the state
+    let limits = &state.v2().limits;
+    // "Mac offline" (critical) has its own bucket (12/h), never used up by
+    // online notices, and is never dropped: beyond it the notice stays
+    // pending and the next presence tick retries it.
+    if let PresenceNote::Offline { reason, since } = note {
+        if limits.check_presence_offline(group).is_err() {
+            tracing::info!(group = %group, "offline push deferred (per-group limit)");
+            state.v2().presence.retry(group, reason, since, state.now());
+            return;
+        }
+    }
+    // "Back online" (silent): at most 6 per hour; beyond that the state
     // still changes and the Live Activity (silent, coalesced) is still
-    // updated, but no presence notification is pushed.
-    if state.v2().limits.check_presence(group).is_err() {
-        tracing::info!(group = %group, "presence push skipped (per-group limit)");
+    // updated, but no notification is pushed.
+    if online && limits.check_presence(group).is_err() {
+        tracing::info!(group = %group, "online push skipped (per-group limit)");
         state
             .metrics()
             .record(Event::new("presence").group(group).outcome("rate_limited"));
@@ -2242,6 +2298,12 @@ async fn open_stream(State(state): State<Arc<AppState>>, req: Request) -> Respon
                     }))
                 };
                 let mut socket = socket;
+                // Before registering: a refusal must not replace (and so
+                // close) the device's healthy stream.
+                if let Err((code, reason)) = stream_allowed(&st, &a.group, &device, false).await {
+                    let _ = socket.send(close(code, reason)).await;
+                    return;
+                }
                 let reg = match v2.hub.register(&a.group, &device, ip) {
                     Ok(reg) => reg,
                     Err(_) => {
@@ -2262,41 +2324,59 @@ async fn open_stream(State(state): State<Arc<AppState>>, req: Request) -> Respon
     finish("stream", ip, started, group.as_deref(), r)
 }
 
+/// Whether a Mac stream of `device` may run: the group is not suspended and
+/// the device still exists. `storage_error_ok`: a database error counts as
+/// admitted (used for the re-check after registering, when the same check
+/// just passed); otherwise it refuses with 1011.
+async fn stream_allowed(
+    state: &AppState,
+    group: &str,
+    device: &str,
+    storage_error_ok: bool,
+) -> Result<(), (u16, &'static str)> {
+    if state.controls().is_suspended(group) {
+        return Err((1008, "group suspended"));
+    }
+    let (g, d) = (group.to_string(), device.to_string());
+    match state
+        .v2()
+        .store
+        .call(move |c| store::device(c, &g, &d))
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err((1008, "unknown device")),
+        Err(e) if storage_error_ok => {
+            tracing::warn!(error = %e, "stream: cannot re-check device, keeping the stream");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "stream: cannot check device");
+            Err((1011, "storage error"))
+        }
+    }
+}
+
 /// Re-check a stream right after it registered in the hub; on refusal it
 /// is unregistered and the close code and reason are returned.
 ///
-/// Suspended between `authenticate` and the upgrade: the admin sets the flag
-/// before dropping the group's streams, so either that drop sees this
-/// registration or this check sees the flag. Likewise a device (or group)
-/// deleted meanwhile: the delete removes the stream after deleting the row,
-/// so either it sees this registration or this lookup misses the row.
+/// The upgrade checks first ([`stream_allowed`] before registering, so a
+/// refused or failing check never replaces a healthy stream of the device),
+/// then again here, for the race: suspended between `authenticate` and the
+/// registration (the admin sets the flag before dropping the group's
+/// streams, so either that drop sees this registration or this check sees
+/// the flag), or the device or group deleted meanwhile (the delete removes
+/// the stream after deleting the row, so either it sees this registration
+/// or this lookup misses the row). A database error here keeps the stream.
 pub async fn admit_stream(
     state: &AppState,
     group: &str,
     device: &str,
     conn_id: u64,
 ) -> Result<(), (u16, &'static str)> {
-    let v2 = state.v2();
-    let refused = if state.controls().is_suspended(group) {
-        Some((1008, "group suspended"))
-    } else {
-        let (g, d) = (group.to_string(), device.to_string());
-        match v2.store.call(move |c| store::device(c, &g, &d)).await {
-            Ok(Some(_)) => None,
-            Ok(None) => Some((1008, "unknown device")),
-            Err(e) => {
-                tracing::error!(error = %e, "stream: cannot check device");
-                Some((1011, "storage error"))
-            }
-        }
-    };
-    match refused {
-        Some(r) => {
-            v2.hub.unregister(group, device, conn_id);
-            Err(r)
-        }
-        None => Ok(()),
-    }
+    stream_allowed(state, group, device, true)
+        .await
+        .inspect_err(|_| state.v2().hub.unregister(group, device, conn_id))
 }
 
 /// 403 for gateway registrations while `GATEWAY_OPEN` is off.

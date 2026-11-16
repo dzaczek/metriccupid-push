@@ -99,20 +99,39 @@ pub fn spawn_metrics(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>
 pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Connections per TCP peer (rate-limit key, IPv6 /64), shared with the
+/// [`LimitedIo`]s that release them.
+type PeerCounts = Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>;
+
 /// A listener that holds one of `MAX_CONNECTIONS` permits per open
 /// connection (WebSocket streams included). At the cap it stops accepting,
 /// so new clients wait in the kernel backlog instead of exhausting file
-/// descriptors and memory.
+/// descriptors and memory. A TCP peer (IPv6 per /64) may hold at most
+/// `MAX_CONNECTIONS_PER_IP`; further connections from it are closed at
+/// once. Trusted proxies are exempt: behind cloudflared or a reverse proxy
+/// every connection comes from the proxy's address, and the per-client
+/// limits then apply to the forwarded client IP instead.
 pub struct LimitedListener {
     inner: TcpListener,
     permits: Arc<tokio::sync::Semaphore>,
+    per_peer: PeerCounts,
+    max_per_peer: usize,
+    exempt: Box<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>,
 }
 
 impl LimitedListener {
-    pub fn new(inner: TcpListener, max_connections: usize) -> Self {
+    pub fn new(
+        inner: TcpListener,
+        max_connections: usize,
+        max_per_peer: usize,
+        exempt: impl Fn(std::net::IpAddr) -> bool + Send + Sync + 'static,
+    ) -> Self {
         Self {
             inner,
             permits: Arc::new(tokio::sync::Semaphore::new(max_connections.max(1))),
+            per_peer: Default::default(),
+            max_per_peer: max_per_peer.max(1),
+            exempt: Box::new(exempt),
         }
     }
 
@@ -120,12 +139,73 @@ impl LimitedListener {
     pub fn available(&self) -> usize {
         self.permits.available_permits()
     }
+
+    /// Accept the next connection that fits both caps.
+    pub async fn accept(&mut self) -> (LimitedIo, SocketAddr) {
+        loop {
+            let permit = self
+                .permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the connection semaphore is never closed");
+            let (io, addr) = match self.inner.accept().await {
+                Ok(c) => c,
+                // Back off on errors such as EMFILE instead of spinning.
+                Err(e) => {
+                    tracing::error!(error = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let peer = addr.ip().to_canonical();
+            let slot = if (self.exempt)(peer) {
+                None
+            } else {
+                let key = limits::ip_key(peer);
+                let mut map = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
+                let n = map.entry(key).or_default();
+                if *n >= self.max_per_peer {
+                    drop(map);
+                    tracing::debug!(peer = %peer, "connection refused: MAX_CONNECTIONS_PER_IP");
+                    continue; // drops `io`: the connection is closed
+                }
+                *n += 1;
+                Some((self.per_peer.clone(), key))
+            };
+            set_keepalive(&io);
+            return (
+                LimitedIo {
+                    io,
+                    _permit: permit,
+                    slot,
+                },
+                addr,
+            );
+        }
+    }
 }
 
-/// An accepted connection and its permit (released when it closes).
+/// An accepted connection and its permit and per-peer slot (released when
+/// it closes).
 pub struct LimitedIo {
     io: tokio::net::TcpStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    slot: Option<(PeerCounts, std::net::IpAddr)>,
+}
+
+impl Drop for LimitedIo {
+    fn drop(&mut self) {
+        if let Some((map, key)) = &self.slot {
+            let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = map.get_mut(key) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    map.remove(key);
+                }
+            }
+        }
+    }
 }
 
 impl tokio::io::AsyncRead for LimitedIo {
@@ -183,58 +263,70 @@ fn set_keepalive(io: &tokio::net::TcpStream) {
     }
 }
 
-impl axum::serve::Listener for LimitedListener {
-    type Io = LimitedIo;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the connection semaphore is never closed");
-        loop {
-            match self.inner.accept().await {
-                Ok((io, addr)) => {
-                    set_keepalive(&io);
-                    return (
-                        LimitedIo {
-                            io,
-                            _permit: permit,
-                        },
-                        addr,
-                    );
-                }
-                // Like axum's own listener: back off on errors such as
-                // EMFILE instead of spinning.
-                Err(e) => {
-                    tracing::error!(error = %e, "accept failed");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
-    }
-}
-
-/// Serve the API on `listener` until `shutdown` resolves, with at most
-/// `MAX_CONNECTIONS` open connections.
+/// Serve the API on `listener` until `shutdown` resolves: HTTP/1.1 with
+/// WebSocket upgrades, at most `MAX_CONNECTIONS` open connections
+/// (`MAX_CONNECTIONS_PER_IP` per untrusted peer), and complete request
+/// headers within `HEADER_READ_TIMEOUT_SECS` (slowloris). On shutdown, open
+/// connections finish their current request; upgraded streams end with the
+/// process.
 pub async fn serve(
     listener: TcpListener,
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    use axum::serve::ListenerExt;
-    let listener = LimitedListener::new(listener, state.max_connections());
-    axum::serve(
-        // `tap_io` gives the wrapped listener axum's `ConnectInfo<SocketAddr>`.
-        listener.tap_io(|_| {}),
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use tower::ServiceExt;
+
+    let exempt_state = state.clone();
+    let mut listener = LimitedListener::new(
+        listener,
+        state.max_connections(),
+        state.max_connections_per_ip(),
+        move |ip| exempt_state.is_trusted_proxy(ip),
+    );
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(state.header_read_timeout());
+    let app = router(state);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        let (io, addr) = tokio::select! {
+            c = listener.accept() => c,
+            _ = &mut shutdown => break,
+        };
+        // `ConnectInfo<SocketAddr>` for the extractors, like
+        // `into_make_service_with_connect_info`.
+        let svc =
+            app.clone()
+                .map_request(move |req: axum::http::Request<hyper::body::Incoming>| {
+                    let mut req = req.map(axum::body::Body::new);
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(addr));
+                    req
+                });
+        let svc = hyper_util::service::TowerToHyperService::new(svc);
+        let conn = http.serve_connection(TokioIo::new(io), svc).with_upgrades();
+        let mut stop = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut conn = std::pin::pin!(conn);
+            tokio::select! {
+                r = conn.as_mut() => {
+                    if let Err(e) = r {
+                        tracing::trace!(error = %e, "connection ended");
+                    }
+                    return;
+                }
+                _ = stop.wait_for(|v| *v) => conn.as_mut().graceful_shutdown(),
+            }
+            let _ = conn.await;
+        });
+    }
+    let _ = stop_tx.send(true);
+    // Give in-flight requests a moment, like axum's graceful shutdown.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while stop_tx.receiver_count() > 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
 }

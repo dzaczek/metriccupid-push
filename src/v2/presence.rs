@@ -69,6 +69,26 @@ impl Presence {
         g.pending = Some(Pending { due, reason, since });
     }
 
+    /// An offline notice returned by [`Presence::due`] could not be sent
+    /// now (rate limit): make it pending again, due at once, so the next
+    /// tick retries it. Nothing happens if a Mac reconnected meanwhile.
+    pub fn retry(&self, group: &str, reason: OfflineReason, since: u64, now: u64) {
+        let mut map = self.lock();
+        if let Some(g) = map.get_mut(group) {
+            g.notified_offline = false;
+            g.pending = Some(Pending {
+                due: now,
+                reason,
+                since,
+            });
+        }
+    }
+
+    /// An offline notice for `group` is waiting (tests, diagnostics).
+    pub fn is_pending(&self, group: &str) -> bool {
+        self.lock().get(group).is_some_and(|g| g.pending.is_some())
+    }
+
     /// The group was deleted: drop its state (a pending or sent notice).
     pub fn forget(&self, group: &str) {
         self.lock().remove(group);
@@ -135,6 +155,30 @@ mod tests {
             )]
         );
         assert!(p.due(10_000, OFF).is_empty(), "sent once");
+    }
+
+    #[test]
+    fn retried_offline_notice_is_due_again_unless_back_online() {
+        let p = Presence::new(0);
+        p.disconnected("g", Some(OfflineReason::Quit), 10, 10);
+        assert_eq!(p.due(10, OFF).len(), 1);
+        p.retry("g", OfflineReason::Quit, 10, 11);
+        assert!(p.is_pending("g"));
+        assert_eq!(
+            p.due(15, OFF),
+            vec![(
+                "g".to_string(),
+                PresenceNote::Offline {
+                    reason: OfflineReason::Quit,
+                    since: 10
+                }
+            )]
+        );
+        // Back online before the retry: nothing to retry.
+        p.retry("g", OfflineReason::Quit, 10, 16);
+        assert_eq!(p.connected("g", 17), None, "never announced offline");
+        p.retry("g", OfflineReason::Quit, 10, 18);
+        assert!(p.is_empty());
     }
 
     #[test]

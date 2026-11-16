@@ -69,7 +69,18 @@ pub struct AppState {
     permits: Arc<tokio::sync::Semaphore>,
     /// `MAX_CONNECTIONS` (see `crate::serve`).
     max_connections: usize,
+    /// `MAX_CONNECTIONS_PER_IP` (see `crate::serve`).
+    max_connections_per_ip: usize,
+    /// `HEADER_READ_TIMEOUT_SECS` (see `crate::serve`).
+    header_read_timeout: Duration,
 }
+
+/// The replay cut-off is this long before the process started: a client
+/// whose clock lags by less never notices a restart, one that lags more
+/// gets `401` for (lag - grace) seconds at most. Signatures from the last
+/// minute before a restart can therefore be replayed once after it, which
+/// is accepted for a restart.
+pub const BOOT_GRACE_SECS: u64 = 60;
 
 impl AppState {
     pub fn new(
@@ -104,13 +115,17 @@ impl AppState {
                  GET /v2/debug/pushes answers loopback clients only. Never run this in production."
             );
         }
-        let replay_need = u64::from(l.global.per_sec.get()) * crate::auth::REPLAY_TTL.as_secs()
-            + u64::from(l.global.burst.get());
+        // Signed hosted requests and gateway pushes both fill the cache.
+        let gw = &config.v2.gateway_global;
+        let replay_need = (u64::from(l.global.per_sec.get()) + u64::from(gw.per_sec.get()))
+            * crate::auth::REPLAY_TTL.as_secs()
+            + u64::from(l.global.burst.get())
+            + u64::from(gw.burst.get());
         if replay_need > l.replay_cap as u64 {
             tracing::warn!(
                 replay_cap = l.replay_cap,
                 needed = replay_need,
-                "REPLAY_CAP is below RATE_GLOBAL_PER_SEC x 600 + burst: signed requests get 503 when the replay cache is full"
+                "REPLAY_CAP is below (RATE_GLOBAL_PER_SEC + GATEWAY_GLOBAL_PER_SEC) x 600 + bursts: signed requests get 503 when the replay cache is full"
             );
         }
         let loaded = v2
@@ -128,7 +143,11 @@ impl AppState {
             resolver,
             // Timestamps from before this start are refused: the replay
             // cache is in memory only.
-            auth: Authenticator::with_replay(config.secrets.clone(), now, l.replay_cap),
+            auth: Authenticator::with_replay(
+                config.secrets.clone(),
+                now.saturating_sub(BOOT_GRACE_SECS),
+                l.replay_cap,
+            ),
             limits: RateLimits::new(l, config.secrets.len()),
             bans: AuthBans::with_abuse(l.ban_threshold, l.ban_window, l.ban_duration, l.abuse),
             dedup: Mutex::new(ExpiringSet::new(config.dedup_window, DEDUP_CAP)),
@@ -139,6 +158,8 @@ impl AppState {
             controls,
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY)),
             max_connections: config.max_connections,
+            max_connections_per_ip: config.max_connections_per_ip,
+            header_read_timeout: config.header_read_timeout,
         };
         for key in loaded.overrides {
             tracing::info!(
@@ -179,6 +200,23 @@ impl AppState {
         self.max_connections
     }
 
+    /// `MAX_CONNECTIONS_PER_IP`.
+    pub fn max_connections_per_ip(&self) -> usize {
+        self.max_connections_per_ip
+    }
+
+    /// `HEADER_READ_TIMEOUT_SECS`.
+    pub fn header_read_timeout(&self) -> Duration {
+        self.header_read_timeout
+    }
+
+    /// `peer` (a TCP peer) is a proxy trusted by `TRUST_PROXY`: Cloudflare,
+    /// `CF_IPS_EXTRA` or an `xff:` network. All clients behind it share its
+    /// address, so per-peer connection caps exempt it.
+    pub fn is_trusted_proxy(&self, peer: IpAddr) -> bool {
+        self.resolver.is_trusted_proxy(peer)
+    }
+
     pub fn v2(&self) -> &V2State {
         &self.v2
     }
@@ -214,6 +252,9 @@ impl AppState {
             "RATE_GLOBAL_PER_SEC" | "RATE_GLOBAL_BURST" => self
                 .limits
                 .set_global(rate("RATE_GLOBAL_PER_SEC", "RATE_GLOBAL_BURST")),
+            "RATE_PRE_AUTH_PER_SEC" | "RATE_PRE_AUTH_BURST" => self
+                .limits
+                .set_pre_auth(rate("RATE_PRE_AUTH_PER_SEC", "RATE_PRE_AUTH_BURST")),
             "RATE_ANON_GLOBAL_PER_SEC" | "RATE_ANON_GLOBAL_BURST" => self
                 .limits
                 .set_anon(rate("RATE_ANON_GLOBAL_PER_SEC", "RATE_ANON_GLOBAL_BURST")),
@@ -298,12 +339,16 @@ impl AppState {
     pub fn auth_error(&self, ip: IpAddr, now: u64, e: crate::auth::AuthError) -> Outcome {
         use crate::auth::AuthError;
         match e {
-            // Signed before this process started: refused, but not held
-            // against the client (its clock may just be a little behind).
-            AuthError::BeforeBoot => (
-                error(StatusCode::UNAUTHORIZED, "unauthorized"),
-                "before_boot",
-            ),
+            // Signed before the boot cut-off: refused, not held against the
+            // client (its clock may just lag), but anonymous work: it draws
+            // from the anonymous bucket like any failed authentication.
+            AuthError::BeforeBoot => match self.limits.check_anon() {
+                Err(ra) => (too_many(ra), "rate_limited_anon"),
+                Ok(()) => (
+                    error(StatusCode::UNAUTHORIZED, "unauthorized"),
+                    "before_boot",
+                ),
+            },
             AuthError::ReplayCacheFull => {
                 tracing::warn!("replay cache full: refusing signed requests (REPLAY_CAP)");
                 let mut r = error(StatusCode::SERVICE_UNAVAILABLE, "busy");
@@ -315,18 +360,19 @@ impl AppState {
         }
     }
 
-    /// A `429` with `outcome` on `route` went to `ip`: IP-keyed refusals
-    /// count toward an abuse ban (`AUTH_ABUSE_*`). Group-keyed and
-    /// server-wide limits do not, so one group cannot get a shared address
-    /// (NAT) banned; nor does the gateway push, where one self-hosted relay
-    /// speaks for all its users.
+    /// A `429` with `outcome` on `route` went to `ip`: only anonymous abuse
+    /// counts toward a ban (`AUTH_ABUSE_*`): the registration limits of
+    /// `POST /v2/groups` (its per-IP bucket included) and the anonymous
+    /// bucket (failed authentication). The per-IP bucket of signed routes
+    /// does not: many legitimate clients can share one address (NAT), and
+    /// they must not be locked out for polling a little too fast.
     pub fn note_rate_limited(&self, ip: IpAddr, route: &str, outcome: &str) {
-        if route == "gateway.push"
-            || !matches!(
-                outcome,
-                "rate_limited_ip" | "rate_limited_anon" | "rate_limited_registration"
-            )
-        {
+        let anonymous = match outcome {
+            "rate_limited_anon" | "rate_limited_registration" => true,
+            "rate_limited_ip" => route == "groups",
+            _ => false,
+        };
+        if !anonymous || route == "gateway.push" {
             return;
         }
         if self.bans.record_abuse(ip_key(ip), self.clock.now()) {
@@ -374,6 +420,7 @@ impl AppState {
         self.bans.cleanup(now);
         self.controls.cleanup(now);
         self.auth.cleanup(now);
+        self.v2.purge_unknown_groups(now);
         self.dedup
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -427,6 +474,10 @@ fn build_v2(
     Ok(V2State {
         store,
         hub: Hub::with_limits(c.ws_max_streams, c.ws_max_macs_per_group, c.ws_max_per_ip),
+        unknown_groups: std::sync::Mutex::new(ExpiringSet::new(
+            v2::UNKNOWN_GROUP_TTL,
+            v2::UNKNOWN_GROUP_CAP,
+        )),
         limits: V2Limits::new(c),
         sender,
         mock,
@@ -790,7 +841,9 @@ async fn handle_notify(
 pub(crate) enum GlobalClass {
     /// `POST /v2/groups`: the anonymous bucket (`RATE_ANON_GLOBAL_*`).
     Anonymous,
-    /// Signed v2 routes: no global bucket before the signature; once it
+    /// Signed v2 routes: only the cheap `RATE_PRE_AUTH_*` ceiling before
+    /// the signature (no tenant can starve it alone: per-IP buckets apply
+    /// first, and unknown group ids are cached); once it
     /// verifies, `authenticate` charges the group's and the authenticated
     /// (`RATE_GLOBAL_*`) buckets. Failed requests draw from the anonymous
     /// bucket ([`AppState::auth_failed`]), so a flood of them cannot starve
@@ -835,7 +888,13 @@ pub(crate) fn precheck(
                 return Err((too_many(ra), "rate_limited_global"));
             }
         }
-        GlobalClass::Signed | GlobalClass::Gateway => {}
+        // A cheap ceiling on the group-key lookups and HMAC checks that
+        // follow, before either is done.
+        GlobalClass::Signed | GlobalClass::Gateway => {
+            if let Err(ra) = state.limits.check_pre_auth() {
+                return Err((too_many(ra), "rate_limited_pre_auth"));
+            }
+        }
     }
     Ok(())
 }

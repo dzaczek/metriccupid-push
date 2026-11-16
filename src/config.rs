@@ -165,6 +165,8 @@ pub struct Limits {
     pub global: Rate,
     /// `RATE_ANON_GLOBAL_*`: group registrations and failed authentications.
     pub anon_global: Rate,
+    /// `RATE_PRE_AUTH_*`: all pre-signature work of signed routes.
+    pub pre_auth: Rate,
     pub per_ip: Rate,
     pub per_secret: Rate,
     /// Auth failures from one IP within `ban_window` that trigger a ban.
@@ -276,6 +278,12 @@ pub struct Config {
     /// `MAX_CONNECTIONS`: open TCP connections on the public listener
     /// (WebSocket streams included); further clients wait in the backlog.
     pub max_connections: usize,
+    /// `MAX_CONNECTIONS_PER_IP`: open connections per TCP peer (IPv6 /64);
+    /// trusted proxies (`TRUST_PROXY`) are exempt.
+    pub max_connections_per_ip: usize,
+    /// `HEADER_READ_TIMEOUT_SECS`: a client must send complete request
+    /// headers within this time, else the connection is closed.
+    pub header_read_timeout: Duration,
     pub pushover_app_token: String,
     pub pushover_user_key: String,
     pub pushover_api_url: String,
@@ -299,6 +307,8 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("max_connections", &self.max_connections)
+            .field("max_connections_per_ip", &self.max_connections_per_ip)
+            .field("header_read_timeout", &self.header_read_timeout)
             .field("pushover_app_token", &"<redacted>")
             .field("pushover_user_key", &"<redacted>")
             .field("pushover_api_url", &self.pushover_api_url)
@@ -414,6 +424,7 @@ impl Config {
         let limits = Limits {
             global: rate("GLOBAL", 50, 100)?,
             anon_global: rate("ANON_GLOBAL", 20, 60)?,
+            pre_auth: rate("PRE_AUTH", 200, 400)?,
             per_ip: rate("IP", 5, 20)?,
             per_secret: rate("SECRET", 2, 30)?,
             ban_threshold: parse_nonzero("AUTH_BAN_THRESHOLD", get("AUTH_BAN_THRESHOLD"), 10)?
@@ -434,7 +445,7 @@ impl Config {
                 window: parse_nonzero("AUTH_ABUSE_WINDOW_SECS", get("AUTH_ABUSE_WINDOW_SECS"), 60)?
                     .get()
                     .into(),
-                duration: parse_nonzero("AUTH_ABUSE_BAN_SECS", get("AUTH_ABUSE_BAN_SECS"), 900)?
+                duration: parse_nonzero("AUTH_ABUSE_BAN_SECS", get("AUTH_ABUSE_BAN_SECS"), 300)?
                     .get()
                     .into(),
             },
@@ -442,6 +453,18 @@ impl Config {
         };
         let max_connections =
             parse_nonzero("MAX_CONNECTIONS", get("MAX_CONNECTIONS"), 8192)?.get() as usize;
+        let max_connections_per_ip =
+            parse_nonzero("MAX_CONNECTIONS_PER_IP", get("MAX_CONNECTIONS_PER_IP"), 64)?.get()
+                as usize;
+        let header_read_timeout = Duration::from_secs(
+            parse_nonzero(
+                "HEADER_READ_TIMEOUT_SECS",
+                get("HEADER_READ_TIMEOUT_SECS"),
+                10,
+            )?
+            .get()
+            .into(),
+        );
 
         let log_format = match get("LOG_FORMAT").as_deref() {
             None | Some("text") => LogFormat::Text,
@@ -460,6 +483,8 @@ impl Config {
 
         Ok(Config {
             max_connections,
+            max_connections_per_ip,
+            header_read_timeout,
             pushover_app_token,
             pushover_user_key,
             pushover_api_url,
@@ -1359,8 +1384,17 @@ mod tests {
                 c.limits.abuse.window,
                 c.limits.abuse.duration
             ),
-            (100, 60, 900)
+            (100, 60, 300)
         );
+        assert_eq!(
+            (
+                c.limits.pre_auth.per_sec.get(),
+                c.limits.pre_auth.burst.get()
+            ),
+            (200, 400)
+        );
+        assert_eq!(c.max_connections_per_ip, 64);
+        assert_eq!(c.header_read_timeout, Duration::from_secs(10));
         assert_eq!(c.limits.replay_cap, 100_000);
         assert_eq!(c.max_connections, 8192);
         assert_eq!(
@@ -1411,6 +1445,9 @@ mod tests {
             "REPLAY_CAP",
             "AUTH_ABUSE_THRESHOLD",
             "RATE_GROUP_PER_SEC",
+            "RATE_PRE_AUTH_BURST",
+            "MAX_CONNECTIONS_PER_IP",
+            "HEADER_READ_TIMEOUT_SECS",
         ] {
             assert!(cfg(&[(zero, "0")]).is_err(), "{zero}");
         }

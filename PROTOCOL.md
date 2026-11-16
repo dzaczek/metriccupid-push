@@ -354,20 +354,26 @@ string_to_sign = "{timestamp}\n{METHOD}\n{target}\n{group_id}\n{device_id}\n{raw
 - `raw body` is the exact bytes sent; empty for GET and DELETE and for the WebSocket upgrade.
 - There is no newline after the body.
 
-The server rejects: a timestamp more than 300 s from its clock; a timestamp from before the server
-process started (its replay cache is in memory; such a request is not counted toward a ban); an
-unknown group; a bad signature; and any signature it has already accepted in the last 10 minutes
+The server rejects: a timestamp more than 300 s from its clock; a timestamp more than 60 s before
+the server process started (its replay cache is in memory; such a request is not counted toward a
+ban, so a client lagging by more than 60 s sees `401` for at most its lag minus 60 s); an unknown
+group; a bad signature; and any signature it has already accepted in the last 10 minutes
 (replay). All of these return the same `401 {"error":"unauthorized"}`. Ten failures from one IP
-within 15 minutes ban that IP for 15 minutes (`429`), and so do 100 rate-limited answers to one IP
-within 60 s (`AUTH_ABUSE_*`). If the replay cache is full the server answers `503 busy` with
+within 15 minutes ban that IP for 15 minutes (`429`), and 100 anonymous rate-limited answers to one
+IP within 60 s (registration floods, failed authentication beyond the anonymous bucket) ban it for 5
+minutes (`AUTH_ABUSE_*`); rate-limited signed requests never lead to a ban. If the replay cache is full the server answers `503 busy` with
 `Retry-After: 1` rather than forget a signature that is still valid.
 
-Rate limits around the signature: the per-IP bucket comes first; once the signature has verified,
+Rate limits around the signature: the per-IP bucket comes first, then a server-wide ceiling on
+pre-signature work (`RATE_PRE_AUTH_*`, default 200/s, burst 400); group ids found unknown are
+remembered for 60 s and answered without a lookup (creating the group clears that). Once the
+signature has verified,
 the group's bucket over all signed routes (`RATE_GROUP_*`, default 5/s, burst 60) and the
 authenticated global bucket (`RATE_GLOBAL_*`). Requests that fail authentication, and `POST
 /v2/groups`, draw from a separate anonymous bucket (`RATE_ANON_GLOBAL_*`) instead, so they cannot
 starve signed clients. A request body must arrive within 3 s (10 s for `POST /v2/snapshot`), else
-`408`; if the server is saturated a request waits at most 1 s and then gets `503 busy` with
+`408`; request headers within 10 s, else the connection is closed; if the server is saturated a
+request waits at most 1 s and then gets `503 busy` with
 `Retry-After: 1`. Clients SHOULD honour `Retry-After` on `429` and `503`.
 
 Consequences for clients:
@@ -652,7 +658,7 @@ Mac in the group:
 `delivered: true` means a Mac stream took the frame (it may still fail to execute it; wait for the
 `result`). `queued` means no Mac is online: show "Mac offline, queued". Queued commands expire after
 1 h. A repeated id returns `{"status":"duplicate","delivered":false,"cursor":7}` with the cursor it
-was first queued under, for **25 h** after the first post, also after the Mac acked it or it
+was first queued under, for **25 h** after the first post (newest 20 000 ids per group), also after the Mac acked it or it
 expired (section 4.4): the command is not queued or delivered again. Retries with the same id are
 therefore safe, but a command that expired unexecuted is not re-queued by a retry with its old id;
 send it with a new id. `429 queue_full` when 200 commands are pending, `429 rate_limited` above the
@@ -675,7 +681,8 @@ result.
 - `GET /healthz`: `200 ok`.
 - Live Activity routes: section 6.10.
 - `GET /v2/debug/pushes`: only with `APNS_MODE=mock`; the recorded pushes. Unauthenticated, for local
-  development only, and answered only when the TCP peer is a loopback address (`404` otherwise).
+  development only, and answered only when the TCP peer is a loopback address (`404` otherwise);
+  a reverse proxy on the same host makes every request loopback, so never put mock mode behind one.
 - `POST /v2/gateway/push`: only with `MODE=hosted`, section 9.
 - `PUT /v2/licence`: only with `MODE=hosted`, section 13.
 
@@ -818,9 +825,11 @@ The server tells the group's phones when alerts stop reaching them because no Ma
 - The server never sends the same state twice in a row, and never announces a Mac's first connect.
   The state is kept in memory: after a server restart nothing is pending and a reconnecting Mac is
   not announced. Deleting the group (or the last trace of it) drops that state.
-- At most 6 presence pushes per group and hour: beyond that the state still changes and the Live
-  Activity's `mac_online` is still updated (silent, coalesced), but no presence notification is
-  sent, so a connect / `bye` loop cannot page the phones without limit.
+- At most 6 "back online" pushes per group and hour: beyond that the state still changes and the
+  Live Activity's `mac_online` is still updated (silent, coalesced), but no notification is sent.
+  "Mac offline" has its own bucket (12 per hour) that online notices never use; an offline notice
+  beyond it is never dropped but stays pending and is retried on the next presence tick (5 s). A
+  connect / `bye` loop therefore cannot page the phones without limit, nor hide a real outage.
 
 APNs payload (built by the server; `apns-collapse-id: mc-presence`, `apns-expiration` = now + 1 h,
 `apns-priority` 10 offline / 5 back online):
@@ -998,15 +1007,19 @@ APNs or activity tokens, the licence JWS or purchase id, request bodies.
 | Mailbox | 24 h, 500 per group | no |
 | Command queue | 1 h, 200 per group | no |
 | Duplicate window: message ids | 24 h 10 min, newest 5000 per group | no |
-| Duplicate window: command ids | 25 h | no |
+| Duplicate window: command ids | 25 h, newest 20 000 per group | no |
 | Signed requests per group (all routes) | 5/s, burst 60 | `RATE_GROUP_*` |
 | Anonymous work (registrations, failed auth) | 20/s, burst 60 | `RATE_ANON_GLOBAL_*` |
 | Body arrival | 3 s (snapshot 10 s), then `408` | no |
 | Wait for a request slot | 1 s (256 slots), then `503` | no |
 | Open connections | 8192 | `MAX_CONNECTIONS` |
-| Rate-limited answers before a ban | 100 in 60 s, ban 15 min | `AUTH_ABUSE_*` |
+| Anonymous rate-limited answers before a ban | 100 in 60 s, ban 5 min | `AUTH_ABUSE_*` |
 | Replay cache | 100 000 signatures | `REPLAY_CAP` |
-| Presence pushes per group | 6 per hour (state still updated) | no |
+| Presence pushes per group | online 6/h (then skipped), offline 12/h (then deferred) | no |
+| Pre-signature work (signed routes) | 200/s, burst 400 | `RATE_PRE_AUTH_*` |
+| Unknown group ids cached | 60 s, 100 000 | no |
+| Request headers | 10 s | `HEADER_READ_TIMEOUT_SECS` |
+| Connections per TCP peer (trusted proxies exempt) | 64 | `MAX_CONNECTIONS_PER_IP` |
 | Licence attaches without `appTransactionId` per IP | 10 per day | no |
 | Messages per group | 2/s, burst 60 | `RATE_V2_MESSAGES_*` |
 | Commands per group | 1/s, burst 20 | `RATE_V2_COMMANDS_*` |

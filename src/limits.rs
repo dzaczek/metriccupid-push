@@ -94,6 +94,12 @@ impl<K: Eq + Hash + Clone> ExpiringSet<K> {
         Ok(true)
     }
 
+    /// `key` is present and not expired.
+    pub fn contains(&mut self, key: &K, now: u64) -> bool {
+        self.purge(now);
+        self.map.contains_key(key)
+    }
+
     pub fn remove(&mut self, key: &K) {
         // The stale `order` entry is skipped later because its timestamp no
         // longer matches the map.
@@ -165,7 +171,7 @@ impl Default for AbuseRule {
         Self {
             threshold: 100,
             window: 60,
-            duration: 900,
+            duration: 300,
         }
     }
 }
@@ -340,6 +346,9 @@ pub struct RateLimits {
     /// Anonymous work (`RATE_ANON_GLOBAL_*`): `POST /v2/groups` and requests
     /// that failed authentication.
     anon: Live<DefaultDirectRateLimiter>,
+    /// All pre-signature work of signed routes (`RATE_PRE_AUTH_*`): a cheap
+    /// ceiling on group-key lookups and HMAC checks, before either.
+    pre_auth: Live<DefaultDirectRateLimiter>,
     per_ip: Live<DefaultKeyedRateLimiter<IpAddr>>,
     per_secret: Vec<DefaultDirectRateLimiter>,
 }
@@ -358,6 +367,7 @@ impl RateLimits {
         Self {
             global: Live::new(RateLimiter::direct(quota(limits.global))),
             anon: Live::new(RateLimiter::direct(quota(limits.anon_global))),
+            pre_auth: Live::new(RateLimiter::direct(quota(limits.pre_auth))),
             per_ip: Live::new(RateLimiter::keyed(quota(limits.per_ip))),
             per_secret: (0..secret_count)
                 .map(|_| RateLimiter::direct(quota(limits.per_secret)))
@@ -375,6 +385,15 @@ impl RateLimits {
 
     pub fn check_anon(&self) -> Result<(), RetryAfter> {
         self.anon.get().check().map_err(retry_after)
+    }
+
+    pub fn check_pre_auth(&self) -> Result<(), RetryAfter> {
+        self.pre_auth.get().check().map_err(retry_after)
+    }
+
+    /// Replace the pre-auth bucket (`RATE_PRE_AUTH_*` live override).
+    pub fn set_pre_auth(&self, r: Rate) {
+        self.pre_auth.set(RateLimiter::direct(quota(r)));
     }
 
     /// Replace the anonymous bucket (`RATE_ANON_GLOBAL_*` live override).
@@ -431,17 +450,27 @@ pub struct V2Limits {
     groups: DefaultKeyedRateLimiter<IpAddr>,
     /// Every signed request of a group (`RATE_GROUP_*`).
     per_group: Live<DefaultKeyedRateLimiter<String>>,
-    /// Presence pushes per group ([`presence_quota`]).
+    /// "Back online" presence pushes per group ([`presence_quota`]).
     presence: DefaultKeyedRateLimiter<String>,
+    /// "Mac offline" presence pushes per group ([`presence_offline_quota`]).
+    presence_offline: DefaultKeyedRateLimiter<String>,
     /// Attaches of licences with a fallback purchase id, per client IP.
     fallback_attach: DefaultKeyedRateLimiter<IpAddr>,
 }
 
-/// Presence pushes per group: 6 per hour, burst 6. Beyond that the state
-/// still changes but no push is sent (a connect / bye loop must not page
-/// the phones without limit).
+/// "Back online" (silent) presence pushes per group: 6 per hour, burst 6.
+/// Beyond that the state still changes but no push is sent (a connect / bye
+/// loop must not page the phones without limit).
 pub fn presence_quota() -> Quota {
     let n = std::num::NonZeroU32::new(6).expect("non-zero");
+    Quota::per_hour(n).allow_burst(n)
+}
+
+/// "Mac offline" (critical) presence pushes per group: 12 per hour, burst
+/// 12, a bucket of its own so online notices never use it up. An offline
+/// notice beyond it is not dropped but retried on the next presence tick.
+pub fn presence_offline_quota() -> Quota {
+    let n = std::num::NonZeroU32::new(12).expect("non-zero");
     Quota::per_hour(n).allow_burst(n)
 }
 
@@ -534,6 +563,7 @@ impl V2Limits {
             groups: RateLimiter::keyed(hourly(c.rate_groups)),
             per_group: Live::new(RateLimiter::keyed(quota(c.rate_group))),
             presence: RateLimiter::keyed(presence_quota()),
+            presence_offline: RateLimiter::keyed(presence_offline_quota()),
             fallback_attach: RateLimiter::keyed(fallback_attach_quota()),
         }
     }
@@ -551,9 +581,16 @@ impl V2Limits {
         self.per_group.set(RateLimiter::keyed(quota(r)));
     }
 
-    /// One more presence push for `group`.
+    /// One more "back online" presence push for `group`.
     pub fn check_presence(&self, group: &str) -> Result<(), RetryAfter> {
         self.presence
+            .check_key(&group.to_string())
+            .map_err(retry_after)
+    }
+
+    /// One more "Mac offline" presence push for `group`.
+    pub fn check_presence_offline(&self, group: &str) -> Result<(), RetryAfter> {
+        self.presence_offline
             .check_key(&group.to_string())
             .map_err(retry_after)
     }
@@ -644,6 +681,7 @@ impl V2Limits {
         for l in [
             &*pg,
             &self.presence,
+            &self.presence_offline,
             &self.messages,
             &self.commands,
             &gw[0],
@@ -745,6 +783,7 @@ mod tests {
             ban_window: Duration::from_secs(900),
             ban_duration: Duration::from_secs(900),
             anon_global: r(100, 100),
+            pre_auth: r(100, 100),
             abuse: AbuseRule::default(),
             replay_cap: 10,
         };
@@ -853,6 +892,10 @@ mod tests {
             assert!(v2.check_presence("g").is_ok());
         }
         assert!(v2.check_presence("g").is_err(), "6 per hour");
+        for _ in 0..12 {
+            assert!(v2.check_presence_offline("g").is_ok(), "own bucket");
+        }
+        assert!(v2.check_presence_offline("g").is_err(), "12 per hour");
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         for _ in 0..FALLBACK_ATTACHES_PER_DAY {
             assert!(v2.check_fallback_attach(ip).is_ok());
@@ -899,6 +942,7 @@ mod tests {
             ban_window: Duration::from_secs(900),
             ban_duration: Duration::from_secs(900),
             anon_global: r,
+            pre_auth: r,
             abuse: AbuseRule::default(),
             replay_cap: 10,
         };

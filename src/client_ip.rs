@@ -114,6 +114,15 @@ impl ClientIpResolver {
             .then(|| v.to_ascii_uppercase())
     }
 
+    /// `peer` is a proxy whose forwarded client address is trusted.
+    pub fn is_trusted_proxy(&self, peer: IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        match self {
+            Self::Peer => false,
+            Self::Cloudflare(nets) | Self::Xff(nets) => contains(nets, peer),
+        }
+    }
+
     pub fn resolve(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
         let peer = peer.to_canonical();
         match self {

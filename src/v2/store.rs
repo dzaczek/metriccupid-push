@@ -239,6 +239,7 @@ CREATE TABLE IF NOT EXISTS command_ids (
     PRIMARY KEY (group_id, cmd_id)
 );
 CREATE INDEX IF NOT EXISTS command_ids_seen ON command_ids(first_seen);
+CREATE INDEX IF NOT EXISTS command_ids_group_seq ON command_ids(group_id, seq);
 CREATE TABLE IF NOT EXISTS message_ids (
     group_id   TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
     msg_id     TEXT NOT NULL,
@@ -268,6 +269,9 @@ pub const COMMAND_ID_RETENTION_SECS: u64 = 25 * 3600;
 pub const MESSAGE_ID_RETENTION_SECS: u64 = MESSAGE_RETENTION_SECS + 600;
 /// Message id tombstones kept per group (the oldest are dropped first).
 pub const MAX_MESSAGE_IDS: usize = 5000;
+/// Command id tombstones kept per group (the oldest are dropped first);
+/// 25 h at the default 1 command/s would be 90 000.
+pub const MAX_COMMAND_IDS: usize = 20_000;
 /// Rows deleted per table and statement by [`cleanup_step`].
 pub const CLEANUP_BATCH: usize = 5000;
 
@@ -980,6 +984,10 @@ pub fn insert_command(
         params![group_id, seq as i64, id, sealed, now as i64],
     )?;
     put_tombstone(&tx, "command_ids", "cmd_id", group_id, id, seq, now)?;
+    tx.execute(
+        "DELETE FROM command_ids WHERE group_id = ?1 AND seq <= ?2",
+        params![group_id, seq as i64 - MAX_COMMAND_IDS as i64],
+    )?;
     tx.commit()?;
     Ok(Insert::Stored(seq))
 }
@@ -2022,6 +2030,45 @@ mod tests {
                 Insert::Stored(_)
             ),
             "beyond the cap an id is forgotten (accepted trade-off)"
+        );
+    }
+
+    #[test]
+    fn command_id_tombstones_are_capped_per_group() {
+        let (_d, mut c) = store();
+        create_group(&mut c, "g", &[1; 32], 0).unwrap();
+        let tx = c.transaction().unwrap();
+        for i in 0..(MAX_COMMAND_IDS + 10) {
+            put_tombstone(
+                &tx,
+                "command_ids",
+                "cmd_id",
+                "g",
+                &format!("x{i}"),
+                i as u64 + 1,
+                5,
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE groups SET next_cmd_seq = ?1",
+            [(MAX_COMMAND_IDS + 10) as i64],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        insert_command(&mut c, "g", "new", "AAAA", 10).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM command_ids WHERE group_id = 'g'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n as usize, MAX_COMMAND_IDS, "the oldest are dropped");
+        assert_eq!(
+            insert_command(&mut c, "g", "x20009", "AAAA", 11).unwrap(),
+            Insert::Duplicate(20_010),
+            "the newest are kept"
         );
     }
 

@@ -201,6 +201,18 @@ pub const LIMIT_KEYS: &[LimitKey] = &[
         "Anonymous bucket, burst",
     ),
     num(
+        "RATE_PRE_AUTH_PER_SEC",
+        20,
+        100_000,
+        "Pre-auth ceiling, per second: signed requests before their group key and signature are checked",
+    ),
+    num(
+        "RATE_PRE_AUTH_BURST",
+        20,
+        1_000_000,
+        "Pre-auth ceiling, burst",
+    ),
+    num(
         "RATE_GROUP_PER_SEC",
         1,
         1_000,
@@ -299,6 +311,8 @@ pub fn limit_needs_fresh(key: &str) -> bool {
             | "RATE_GLOBAL_BURST"
             | "RATE_ANON_GLOBAL_PER_SEC"
             | "RATE_ANON_GLOBAL_BURST"
+            | "RATE_PRE_AUTH_PER_SEC"
+            | "RATE_PRE_AUTH_BURST"
             | "WS_MAX_STREAMS"
     )
 }
@@ -317,6 +331,8 @@ fn config_values(c: &Config) -> HashMap<&'static str, u32> {
         ("RATE_IP_BURST", l.per_ip.burst.get()),
         ("RATE_ANON_GLOBAL_PER_SEC", l.anon_global.per_sec.get()),
         ("RATE_ANON_GLOBAL_BURST", l.anon_global.burst.get()),
+        ("RATE_PRE_AUTH_PER_SEC", l.pre_auth.per_sec.get()),
+        ("RATE_PRE_AUTH_BURST", l.pre_auth.burst.get()),
         ("RATE_GROUP_PER_SEC", v.rate_group.per_sec.get()),
         ("RATE_GROUP_BURST", v.rate_group.burst.get()),
         ("WS_MAX_STREAMS", v.ws_max_streams),
